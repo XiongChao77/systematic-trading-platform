@@ -3,6 +3,7 @@
     "report":"../../output/reports.jsonl",
     "telegram_token": "../notification/telegram/main",
     "monitoring": {
+        "enable": true,
         "publish_url": "http://127.0.0.1:8000/internal/live/snapshots",
         "publish_interval_seconds": 1,
         "request_timeout_seconds": 0.5

@@ -29,6 +29,11 @@ EQUITY_SCALE = "log"  # Supported values: "linear", "log", or "both".
 MAX_LOG_END_VALUE_RATIO = 3.0
 RISK_COMPARISON_KEYS = ("risk_per_trade_pct", "max_daily_loss_pct")
 KEY_STRATEGY_INDICATORS_FILE = "key_strategy_indicators.png"
+KEY_STRATEGY_INDICATORS_ADDITIONAL_INFO = {
+    "risk": "risk_per_trade_pct",
+    "daily_loss": "max_daily_loss_pct",
+    "avg_pct_gross": "forward.avg_pct_gross",
+}
 
 
 def clean_output_dir_except(output_dir_path, preserved_path):
@@ -1287,15 +1292,13 @@ def plot_key_strategy_indicators(
     return output_path
 
 
-def show_performance(
+def show_key_strategy_indicators(
     all_results,
     output_dir,
-    batch_size=5,
-    equity_scale=EQUITY_SCALE,
     addition_info=None,
-    plot_ood=False,
     strategy_num_start=1,
 ):
+    """Print and render indicators without regenerating equity or correlation plots."""
     strategy_numbers = [strategy_num_start + index for index in range(len(all_results))]
     model_numbers = _model_group_numbers(all_results)
     strategy_labels = [
@@ -1309,7 +1312,7 @@ def show_performance(
         len("Num"),
         max((len(label) for label in strategy_labels), default=0),
     )
-    additional_columns = list((addition_info or {}).items())
+    additional_columns = list({**KEY_STRATEGY_INDICATORS_ADDITIONAL_INFO, **(addition_info or {})}.items())
     additional_values = [
         [
             _format_additional_info_value(
@@ -1398,11 +1401,34 @@ def show_performance(
                 *additional_values[i],
             ]
         )
-    plot_key_strategy_indicators(
+    return plot_key_strategy_indicators(
         column_labels,
         table_rows,
         output_dir,
     )
+
+
+def show_performance(
+    all_results,
+    output_dir,
+    batch_size=5,
+    equity_scale=EQUITY_SCALE,
+    addition_info=None,
+    plot_ood=False,
+    strategy_num_start=1,
+):
+    show_key_strategy_indicators(
+        all_results,
+        output_dir,
+        addition_info=addition_info,
+        strategy_num_start=strategy_num_start,
+    )
+    strategy_numbers = [strategy_num_start + index for index in range(len(all_results))]
+    model_numbers = _model_group_numbers(all_results)
+    strategy_labels = [
+        f"M{model_number}-S{strategy_number}"
+        for model_number, strategy_number in zip(model_numbers, strategy_numbers)
+    ]
     detailed_results = [attach_report_details(row) for row in all_results]
     for model_number, strategy_number, strategy_label, row in zip(
         model_numbers,
@@ -1473,15 +1499,21 @@ def build_return_series(report):
     return df["ret"].dropna()
 
 
-def compute_correlation(all_results, output_dir):
+def compute_correlation(all_results, output_dir, strategy_numbers=None):
     """
     Dynamically compute figure size for correlation heatmap to keep cell size fixed and text clear.
     """
     save_path = os.path.join(output_dir, "correlation_heatmap_fixed_cell.png")
+    if strategy_numbers is None:
+        strategy_numbers = list(range(1, len(all_results) + 1))
+    else:
+        strategy_numbers = list(strategy_numbers)
+    if len(strategy_numbers) != len(all_results) or len(set(strategy_numbers)) != len(strategy_numbers):
+        raise ValueError("Strategy numbers must be unique and match the report count")
 
     # ===== 1. Build return series =====
     returns_dict = {}
-    for strategy_number, r in enumerate(all_results, start=1):
+    for strategy_number, r in zip(strategy_numbers, all_results):
         # Use build_return_series
         ret = build_return_series(r)
         returns_dict[f"S{strategy_number}"] = ret
@@ -1527,6 +1559,7 @@ def compute_correlation(all_results, output_dir):
     )
 
     plt.title(f"Strategy Correlation Matrix (N={num_strategies})", fontsize=16, pad=20)
+    ax.tick_params(axis="x", top=True, bottom=True, labeltop=True, labelbottom=True)
     plt.xticks(rotation=45, ha="right")
     plt.yticks(rotation=0)
 
@@ -1796,6 +1829,7 @@ def main():
             "risk": "risk_per_trade_pct",
             "daily_loss": "max_daily_loss_pct",
             "avg_pct_gross": "forward.avg_pct_gross",
+            "stride":"stride"
             # "hold_bars": "fixed_hold_bars",
         },
         plot_ood=True,

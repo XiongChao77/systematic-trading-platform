@@ -46,7 +46,7 @@ class LiveMonitoringConfig:
         if not self.publish_url.startswith(("http://", "https://")):
             raise ValueError("monitoring.publish_url must be an HTTP(S) URL")
         if not self.runner_id.strip():
-            raise ValueError("monitoring.runner_id must not be empty")
+            raise ValueError("runner_id must not be empty")
         if self.publish_interval_seconds <= 0:
             raise ValueError("monitoring.publish_interval_seconds must be positive")
         if self.request_timeout_seconds <= 0:
@@ -365,10 +365,17 @@ def monitoring_config_from_mapping(
     if value is not None and not isinstance(value, Mapping):
         raise TypeError("monitoring must be a JSON object")
     raw = dict(value or {})
+    if "runner_id" in raw:
+        raise ValueError("runner_id belongs at the configuration root, not inside monitoring")
+    enable = raw.get("enable", True)
+    if not isinstance(enable, bool):
+        raise TypeError("monitoring.enable must be a JSON boolean")
+    if not enable:
+        return None
     final_url = str(publish_url or raw.get("publish_url") or "").strip()
     if not final_url:
         return None
-    final_runner_id = str(runner_id or raw.get("runner_id") or "").strip()
+    final_runner_id = str(runner_id or "").strip()
     return LiveMonitoringConfig(
         publish_url=final_url,
         runner_id=final_runner_id,

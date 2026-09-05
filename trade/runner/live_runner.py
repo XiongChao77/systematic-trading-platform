@@ -553,8 +553,9 @@ def _runner_identity_from_payload(
     raw_monitoring = payload.get("monitoring")
     if raw_monitoring is not None and not isinstance(raw_monitoring, Mapping):
         raise TypeError("monitoring must be a JSON object")
-    monitoring_runner_id = raw_monitoring.get("runner_id") if isinstance(raw_monitoring, Mapping) else None
-    final_runner_id = _validate_runner_id(runner_id or os.environ.get("LIVE_RUNNER_ID") or payload.get("runner_id") or monitoring_runner_id)
+    if isinstance(raw_monitoring, Mapping) and "runner_id" in raw_monitoring:
+        raise ValueError("runner_id belongs at the configuration root, not inside monitoring")
+    final_runner_id = _validate_runner_id(runner_id or os.environ.get("LIVE_RUNNER_ID") or payload.get("runner_id"))
     output_dir = os.path.abspath(
         os.path.join(
             common.PERSISTENCE_DIR,

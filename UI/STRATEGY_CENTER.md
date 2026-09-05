@@ -50,19 +50,29 @@ runner-level destination once in the live configuration:
 
 ```json
 {
+  "runner_id": "runner-main",
   "monitoring": {
+    "enable": true,
     "publish_url": "http://127.0.0.1:8000/internal/live/snapshots",
-    "runner_id": "runner-main",
     "publish_interval_seconds": 1,
     "request_timeout_seconds": 0.5
   }
 }
 ```
 
+`runner_id` belongs only at the configuration root, not inside `monitoring`.
+It identifies the runner for output directories, execution records, and monitoring.
+The resolution order is `--runner-id`, `LIVE_RUNNER_ID`, the top-level
+`runner_id`, then the default `live-runner`.
+
 `--publish-url`, `--runner-id`, `LIVE_MONITORING_PUBLISH_URL`, and
-`LIVE_RUNNER_ID` can override deployment-specific values. Monitoring runs in a
-separate daemon thread. Dashboard or HTTP failures never enter the strategy
-execution path, and failed snapshots are discarded rather than retried.
+`LIVE_RUNNER_ID` can override deployment-specific values. Set
+`monitoring.enable` to `false` to disable dashboard collection and publishing,
+even when a publish URL is supplied through the CLI or environment. The value
+must be a JSON boolean and defaults to `true`; without a publish URL, monitoring
+is disabled. Monitoring runs in a separate daemon thread. Dashboard or HTTP
+failures are caught, and failed snapshots are discarded rather than retried.
+Dashboard collection can still contend with trading for venue request locks.
 
 For multiple machines, give every logical runner a stable, unique `runner_id`
 and point all runners at the same backend URL. Every process start also receives

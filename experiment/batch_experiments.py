@@ -129,7 +129,17 @@ def _replace_snapshot_directory(staging_dir: str, snapshot_dir: str) -> None:
     os.replace(staging_dir, snapshot_dir)
 
 
+def _is_debugging() -> bool:
+    """Detect tracing debuggers and Python 3.12+ monitoring debuggers."""
+    if sys.gettrace() is not None:
+        return True
+    monitoring = getattr(sys, "monitoring", None)
+    return monitoring is not None and monitoring.get_tool(monitoring.DEBUGGER_ID) is not None
+
+
 def _clean_check_requested(argv: List[str]) -> bool:
+    if _is_debugging():
+        return False
     require_clean = True
     for argument in argv:
         if argument == "--check-git-clean":
@@ -140,6 +150,9 @@ def _clean_check_requested(argv: List[str]) -> bool:
 
 
 def _restart_from_source_snapshot() -> None:
+    if _is_debugging():
+        print("Debugger detected: running in the current source tree without Git clean checks or a source snapshot.", flush=True)
+        return
     if os.environ.get(SNAPSHOT_PATH_ENV) or any(argument in {"-h", "--help"} for argument in sys.argv[1:]):
         return
 
@@ -1465,10 +1478,12 @@ def main():
         "--check-git-clean",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help=("Require a clean Git working tree when creating the source snapshot " "(disable with --no-check-git-clean)"),
+        help=("Require a clean Git working tree when creating the source snapshot " "(disable with --no-check-git-clean; always disabled under a debugger)"),
     )
 
     args = parser.parse_args()
+    if _is_debugging():
+        args.check_git_clean = False
     experiment_context = ExperimentContext(
         git_commit=common.git_revision(require_clean=args.check_git_clean),
     )
