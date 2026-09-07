@@ -35,6 +35,12 @@ those requests to port 8000. After `npm run build`, FastAPI serves the SPA from
   latest snapshot in process memory and serves the Strategy List and detail
   views from `/api/live`. No live monitoring data is persisted.
 
+Live strategy snapshots require `model_type`, sourced from the runner's
+`train_config.model_cfg.model_type`. The list displays its abbreviation between
+Strategy ID and Venue using the same labels as `experiment/reports_view.py`;
+the full type is available in the cell tooltip. Restart runners and the backend
+together when applying this snapshot schema change.
+
 All user-selected experiment paths and derived artifacts must remain below
 `REPORTS_ROOT`. Dataset registrations are disposable in-memory references; a
 backend restart requires loading the selected folders again.
@@ -73,6 +79,16 @@ must be a JSON boolean and defaults to `true`; without a publish URL, monitoring
 is disabled. Monitoring runs in a separate daemon thread. Dashboard or HTTP
 failures are caught, and failed snapshots are discarded rather than retried.
 Dashboard collection can still contend with trading for venue request locks.
+
+The Strategy List and Account detail card show margin utilization as occupied
+position margin divided by account equity, formatted as a percentage. The Account
+card also shows the used margin amount. These values cover the venue account,
+including positions outside the current strategy. Unknown margin or non-positive
+equity produces an unavailable ratio; a known zero margin displays as 0.00%.
+cTrader aggregates position margins per symbol using the account's MAX, SUM or
+NET rule. Binance and Bybit report position initial margin, and Bitget combines
+cross and isolated position margin. This metric does not represent a venue's
+maintenance-margin risk ratio or liquidation threshold.
 
 For multiple machines, give every logical runner a stable, unique `runner_id`
 and point all runners at the same backend URL. Every process start also receives

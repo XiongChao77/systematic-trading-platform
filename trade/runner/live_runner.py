@@ -638,13 +638,10 @@ def load_live_runner_configuration(
     final_run_id = run_id or _new_live_run_id()
     output_dir = _live_run_output_dir(runner_output_dir, final_run_id)
 
-    report_path = _resolve_path(config_path, payload.get("report"))
-    if not report_path.lower().endswith(".jsonl"):
-        raise ValueError(f"Live configuration report must be a JSONL file: {report_path}")
-
     raw_strategy_entries = _strategy_entries(payload)
     telegram_token_path = payload.get("telegram_token")
     strategy_entries: list[LiveStrategySpec] = []
+    strategies_by_report: dict[str, list[LiveStrategySpec]] = {}
     for raw_id, raw_entry in raw_strategy_entries.items():
         strategy_id = str(raw_id).strip()
         entry = dict(raw_entry)
@@ -660,6 +657,9 @@ def load_live_runner_configuration(
         if not isinstance(enable, bool):
             raise TypeError(f"Live strategy {strategy_id!r} enable must be a JSON boolean")
         hash_id = entry["hash"]
+        report_path = _resolve_path(config_path, entry["config_path"])
+        if not report_path.lower().endswith(".jsonl"):
+            raise ValueError(f"Strategy config_path must be a JSONL file: {report_path}")
         model_path = _resolve_path(config_path, entry["model_path"])
         if not os.path.isdir(model_path):
             raise FileNotFoundError(f"Model artifact directory not found: {model_path}")
@@ -681,10 +681,13 @@ def load_live_runner_configuration(
             )
         )
 
+        strategies_by_report.setdefault(report_path, []).append(strategy_entries[-1])
+
     if not strategy_entries:
         raise ValueError("Live configuration contains no run_live strategies")
 
-    load_params_from_report(strategy_entries, report_path)
+    for report_path, specs in strategies_by_report.items():
+        load_params_from_report(specs, report_path)
 
     monitoring = monitoring_config_from_mapping(
         payload.get("monitoring"),

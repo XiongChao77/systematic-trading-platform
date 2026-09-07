@@ -346,7 +346,13 @@ class BitgetVenue(VenueBase, AccountDashboard):
         balance = equity - float(account["unrealizedPL"] or 0)
         if not all(math.isfinite(value) for value in (equity, balance)):
             raise RuntimeError("Bitget returned invalid dashboard balance")
-        return AccountBalance(balance=balance, equity=equity)
+        margins = [account.get("crossedMargin"), account.get("isolatedMargin")]
+        used_margin = (
+            None
+            if any(value in (None, "") for value in margins)
+            else sum(float(value) for value in margins)
+        )
+        return AccountBalance(balance=balance, equity=equity, used_margin=used_margin)
 
     def get_current_state(self) -> PositionView:
         with self._operation_lock:

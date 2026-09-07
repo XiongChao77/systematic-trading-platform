@@ -25,7 +25,7 @@ class MockVenue(VenueBase, AccountDashboard):
         return PositionView()
 
     def get_dashboard_balance(self) -> AccountBalance:
-        return AccountBalance(balance=self._equity, equity=self._equity)
+        return AccountBalance(balance=self._equity, equity=self._equity, used_margin=0.0)
 
     def get_dashboard_position(self):
         return None

@@ -37,10 +37,12 @@ function mountList(container, context) {
             <thead>
               <tr>
                 <th>Strategy ID</th>
+                <th>Model</th>
                 <th>Venue</th>
                 <th>Symbol</th>
                 <th>Interval</th>
                 <th>Balance</th>
+                <th title="Used position margin / account equity">Margin utilization</th>
                 <th>Unrealized PnL</th>
                 <th>Status</th>
               </tr>
@@ -86,6 +88,7 @@ function mountList(container, context) {
         && item.unrealized_pnl !== undefined
         && Number.isFinite(Number(item.unrealized_pnl));
       const pnl = pnlAvailable ? formatMoney(item.unrealized_pnl, true) : "—";
+      const margin = available ? formatPercent(item.margin_utilization) : "—";
       const tone = pnlAvailable && Number(item.unrealized_pnl) > 0
         ? "positive"
         : pnlAvailable && Number(item.unrealized_pnl) < 0
@@ -94,10 +97,12 @@ function mountList(container, context) {
       return `
         <tr class="live-strategy-row${available ? "" : " unavailable"}" tabindex="0" data-strategy-id="${escapeHtml(item.strategy_id)}">
           <td class="strategy-id-cell">${escapeHtml(item.strategy_id)}</td>
+          <td title="${escapeHtml(item.model_type)}">${escapeHtml(shortModelType(item.model_type))}</td>
           <td>${escapeHtml(formatVenue(item.venue))}</td>
           <td>${escapeHtml(item.symbol)}</td>
           <td>${escapeHtml(item.interval)}</td>
           <td class="${balanceAvailable ? "" : "value-unavailable"}">${balanceAvailable ? formatMoney(item.balance) : "—"}</td>
+          <td class="${margin === "—" ? "value-unavailable" : ""}">${margin}</td>
           <td class="${pnlAvailable ? tone : "value-unavailable"}">${pnl}</td>
           <td>${renderStatus(item.status, available)}</td>
         </tr>
@@ -206,6 +211,13 @@ function mountDetail(container, context, strategyId) {
     renderCard(container, "account", accountAvailable, [
       ["Balance", formatMoney(payload.account?.balance)],
       ["Equity", formatMoney(payload.account?.equity)],
+      ["Used margin", formatMoney(accountAvailable ? payload.account?.used_margin : null)],
+      [
+        "Margin utilization",
+        formatPercent(accountAvailable ? payload.account?.margin_utilization : null),
+        "",
+        "Used position margin / account equity",
+      ],
     ]);
 
     const positionAvailable = payload.available && payload.availability?.position;
@@ -279,14 +291,14 @@ function detailCard(name, title) {
 function renderCard(container, name, available, fields) {
   const card = container.querySelector(`[data-card="${name}"]`);
   card.classList.toggle("unavailable", !available);
-  card.querySelector("dl").innerHTML = fields.map(([label, value, tone = ""]) => {
+  card.querySelector("dl").innerHTML = fields.map(([label, value, tone = "", description = ""]) => {
     const unavailable = value === null || value === undefined || value === "—";
     const classes = [unavailable ? "value-unavailable" : "", unavailable ? "" : tone]
       .filter(Boolean)
       .join(" ");
     return `
       <div>
-        <dt>${escapeHtml(label)}</dt>
+        <dt${description ? ` title="${escapeHtml(description)}"` : ""}>${escapeHtml(label)}</dt>
         <dd class="${classes}">${escapeHtml(value ?? "—")}</dd>
       </div>
     `;
@@ -351,6 +363,24 @@ function pnlTone(value) {
   const number = Number(value);
   if (!Number.isFinite(number) || number === 0) return "";
   return number > 0 ? "positive" : "negative";
+}
+
+function shortModelType(value) {
+  const names = {
+    conv_lstm: "ConvLSTM",
+    logistic_regression: "LogReg",
+    logistic_regression_sklearn: "LogRegSK",
+    transformer: "Trans",
+    xgboost: "XGB",
+    lstm: "LSTM",
+    mamba: "Mamba",
+    tcn: "TCN",
+    cnn: "CNN",
+    svc: "SVC",
+  };
+  if (value === null || value === undefined) return "-";
+  const modelType = String(value);
+  return Object.hasOwn(names, modelType) ? names[modelType] : modelType.slice(0, 8);
 }
 
 function formatVenue(value) {

@@ -185,10 +185,12 @@ class LiveSnapshotStore:
                 "items": [
                     {
                         "strategy_id": item["strategy_id"],
+                        "model_type": item["model_type"],
                         "venue": item["venue"],
                         "symbol": item["symbol"],
                         "interval": item["interval"],
                         "balance": self._balance(item),
+                        "margin_utilization": self._margin_utilization(item),
                         "unrealized_pnl": self._unrealized_pnl(item),
                         "status": item["status"],
                         "available": item["available"],
@@ -213,6 +215,13 @@ class LiveSnapshotStore:
             return None
         account = item["account"]
         return None if account is None else account["balance"]
+
+    @staticmethod
+    def _margin_utilization(item: dict[str, Any]) -> float | None:
+        if not item["available"] or not item["availability"]["account"]:
+            return None
+        account = item["account"]
+        return None if account is None else account["margin_utilization"]
 
     @staticmethod
     def _unrealized_pnl(item: dict[str, Any]) -> float | None:

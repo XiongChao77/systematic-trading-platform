@@ -1092,7 +1092,42 @@ class CTraderVenue(VenueBase, AccountDashboard):
         equity = balance + unrealized_pnl
         if not all(math.isfinite(value) for value in (balance, equity)):
             raise RuntimeError("cTrader returned invalid dashboard balance data")
-        return AccountBalance(balance=balance, equity=equity)
+        return AccountBalance(
+            balance=balance,
+            equity=equity,
+            used_margin=self._dashboard_used_margin(trader),
+        )
+
+    def _dashboard_used_margin(self, trader) -> float | None:
+        """Aggregate account margin per symbol using the broker's hedge rule."""
+        response = self.api.request(
+            "ProtoOAReconcileReq",
+            ctidTraderAccountId=self.account_id,
+        )
+        margins_by_symbol: dict[int, dict[int, float]] = {}
+        for position in response.position:
+            if not CTraderOpenApiConnection._message_has_field(position, "usedMargin"):
+                return None
+            margin = self._money(position.usedMargin, position.moneyDigits)
+            if not math.isfinite(margin) or margin < 0:
+                return None
+            sides = margins_by_symbol.setdefault(
+                int(position.tradeData.symbolId), {self.BUY: 0.0, self.SELL: 0.0}
+            )
+            sides[int(position.tradeData.tradeSide)] += margin
+
+        total = 0.0
+        for sides in margins_by_symbol.values():
+            long_margin, short_margin = sides[self.BUY], sides[self.SELL]
+            if trader.totalMarginCalculationType == 0:  # MAX
+                total += max(long_margin, short_margin)
+            elif trader.totalMarginCalculationType == 1:  # SUM
+                total += long_margin + short_margin
+            elif trader.totalMarginCalculationType == 2:  # NET
+                total += abs(long_margin - short_margin)
+            else:
+                return None
+        return total
 
     def _aggregate_protection_price(
         self,

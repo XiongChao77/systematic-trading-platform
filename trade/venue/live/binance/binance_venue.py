@@ -763,7 +763,12 @@ class BinanceVenue(VenueBase, AccountDashboard):
         equity = float(account.get("totalMarginBalance", 0.0))
         if not all(math.isfinite(value) for value in (balance, equity)):
             raise RuntimeError("Binance returned invalid dashboard balance data")
-        return AccountBalance(balance=balance, equity=equity)
+        margin = account.get("totalPositionInitialMargin")
+        return AccountBalance(
+            balance=balance,
+            equity=equity,
+            used_margin=None if margin in (None, "") else float(margin),
+        )
 
     def get_dashboard_position(self) -> AccountPosition | None:
         position = self._position()

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, computed_field
 
 
 class StrictModel(BaseModel):
@@ -18,6 +19,16 @@ class StrictModel(BaseModel):
 class AccountSnapshot(StrictModel):
     balance: float
     equity: float
+    used_margin: float | None = Field(ge=0.0)
+
+    @computed_field
+    @property
+    def margin_utilization(self) -> float | None:
+        """Occupied position margin divided by account equity, as a fraction."""
+        if self.used_margin is None or self.equity <= 0:
+            return None
+        ratio = self.used_margin / self.equity
+        return ratio if math.isfinite(ratio) else None
 
 
 class PositionComponentSnapshot(StrictModel):
@@ -71,6 +82,7 @@ class SnapshotError(StrictModel):
 
 class StrategySnapshot(StrictModel):
     strategy_id: str = Field(min_length=1)
+    model_type: str = Field(min_length=1)
     venue: str = Field(min_length=1)
     symbol: str = Field(min_length=1)
     interval: str = Field(min_length=1)

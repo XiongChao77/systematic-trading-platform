@@ -1332,6 +1332,220 @@ def write_jsonl(
             )
 
 
+LIVE_REPRODUCTION_METRICS = (
+    "performance.gross_return",
+    "performance.cagr",
+    "performance.end_value",
+    "performance.sharpe",
+    "performance.calmar",
+    "drawdown.max_dd_pct",
+)
+
+
+def build_live_reproduction_jobs(live_config_path, strategy_ids=None, settings="original"):
+    """Resolve each configured hash in its own report without connecting to venues."""
+    from pathlib import Path
+
+    if settings not in {"original", "live"}:
+        raise ValueError("settings must be original or live")
+    config_path = Path(live_config_path).resolve()
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    requested = set(strategy_ids or [])
+    entries = payload["strategy"]
+    unknown = requested - entries.keys()
+    if unknown:
+        raise ValueError(f"Unknown strategy IDs: {sorted(unknown)}")
+    records_by_path = {}
+    jobs = []
+    for strategy_id, entry in entries.items():
+        if requested and strategy_id not in requested:
+            continue
+        if not isinstance(entry["run_live"], bool):
+            raise TypeError(f"run_live must be boolean: {strategy_id}")
+        if not requested and not entry["run_live"]:
+            continue
+        source = (config_path.parent / entry["config_path"]).resolve()
+        if source.suffix.lower() != ".jsonl":
+            raise ValueError(f"config_path must reference JSONL: {source}")
+        if source not in records_by_path:
+            records_by_path[source] = load_jsonl(str(source))
+        matches = [record for record in records_by_path[source] if record["params"]["hash"] == entry["hash"]]
+        if len(matches) != 1:
+            raise ValueError(f"Expected one report for {strategy_id}, hash={entry['hash']}, found={len(matches)} in {source}")
+        original = matches[0]
+        params = validate_record(original)
+        model_path = (config_path.parent / entry["model_path"]).resolve()
+        for filename in ("model.pt", "meta.json", "train_config.json"):
+            file_path = model_path / filename
+            if not file_path.is_file() or file_path.stat().st_size == 0:
+                raise FileNotFoundError(f"Missing model artifact: {file_path}")
+        saved_train = json.loads((model_path / "train_config.json").read_text())
+        saved_meta = json.loads((model_path / "meta.json").read_text())
+        for key in ("model_cfg", "feature_conf_list"):
+            if saved_train[key] != params["train"][key]:
+                raise ValueError(f"Model/report {key} mismatch: {strategy_id}")
+        if saved_meta["model_type"] != params["train"]["model_cfg"]["model_type"]:
+            raise ValueError(f"Model/report type mismatch: {strategy_id}")
+        live_broker = entry["broker_config"]
+        compound = entry.get("compound", True)
+        if not isinstance(compound, bool):
+            raise TypeError(f"compound must be boolean: {strategy_id}")
+        strategy = copy.deepcopy(params["strategy"])
+        if settings == "live":
+            strategy["compound"] = compound
+        differences = {
+            f"broker.{key}": {"original": params["broker"].get(key), "live": value}
+            for key, value in live_broker.items() if params["broker"].get(key) != value
+        }
+        if compound != params["strategy"].get("compound"):
+            differences["strategy.compound"] = {"original": params["strategy"].get("compound"), "live": compound}
+        jobs.append({
+            "strategy_id": strategy_id,
+            "hash": entry["hash"],
+            "config_path": str(source),
+            "model_path": str(model_path),
+            "device": entry.get("device", "auto"),
+            "settings": settings,
+            "configuration_differences": differences,
+            "broker": copy.deepcopy(params["broker"] if settings == "original" else live_broker),
+            "strategy": strategy,
+            "original": original,
+        })
+    if not jobs:
+        raise ValueError("No live-config strategies selected for reproduction")
+    return jobs
+
+
+def compare_reproduction_metrics(original, reproduced, period, *, rtol=1e-6, atol=1e-8):
+    """Compare fixed return/risk metrics; absent or nonfinite numbers do not pass."""
+    import math
+    import pandas as pd
+
+    if not all(math.isfinite(value) and value >= 0 for value in (rtol, atol)):
+        raise ValueError("Comparison tolerances must be finite and non-negative")
+    expected = original["results"][period]
+    actual = reproduced["results"][period]
+    comparisons = {}
+    for path in LIVE_REPRODUCTION_METRICS:
+        section, name = path.split(".")
+        old, new = expected.get(section, {}).get(name), actual.get(section, {}).get(name)
+        finite = all(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+                     for value in (old, new))
+        comparisons[path] = {
+            "original": old,
+            "reproduced": new,
+            "delta": new - old if finite else None,
+            "matches": finite and math.isclose(old, new, rel_tol=rtol, abs_tol=atol),
+        }
+    times = [(pd.to_datetime(expected.get("time", {}).get(key), utc=True, errors="coerce"),
+              pd.to_datetime(actual.get("time", {}).get(key), utc=True, errors="coerce"))
+             for key in ("start", "end")]
+    same_range = all(not pd.isna(old) and not pd.isna(new) and old == new for old, new in times)
+    return {"matches": same_range and all(item["matches"] for item in comparisons.values()),
+            "period_range_matches": same_range, "metrics": comparisons}
+
+
+def run_live_reproduction(jobs, output_dir, logger, experiment_context, *, periods=("long", "forward"), rtol=1e-6, atol=1e-8):
+    """Replay configured model artifacts offline and persist per-strategy comparisons.
+
+    Original mode keeps original broker/compound settings for a like-for-like
+    reproduction. Live mode applies live broker/compound overrides and reports
+    differences; neither mode connects to a broker or retrains the model.
+    Preparation and prediction caches are owned by this output directory.
+    """
+    import hashlib
+    import math
+    from trade.runner import backtest_runner
+
+    if not periods or any(period not in {"long", "forward"} for period in periods):
+        raise ValueError("periods must contain long and/or forward")
+    if not all(math.isfinite(value) and value >= 0 for value in (rtol, atol)):
+        raise ValueError("Comparison tolerances must be finite and non-negative")
+    os.makedirs(output_dir, exist_ok=True)
+    prepared = {}
+    source_hashes = {}
+    executions = {}
+    comparisons = []
+    for index, job in enumerate(jobs, start=1):
+        params = job["original"]["params"]
+        result = {key: job[key] for key in ("strategy_id", "hash", "config_path", "model_path", "settings", "configuration_differences")}
+        result.update(periods={}, status="error", rtol=rtol, atol=atol)
+        try:
+            pre_para = common.BaseDefine(**params["common"])
+            source_path = common.market_data_path(pre_para)
+            if source_path not in source_hashes:
+                source_hashes[source_path] = common.sha256_file(source_path)
+            if source_hashes[source_path] != params["data_manifest"]["sha256"]:
+                raise ValueError(f"Market data differs from the original report: {source_path}")
+            prep_key = TaskIdentity.prep_hash_for(asdict(pre_para))
+            prep_dir = os.path.join(output_dir, "preparation", prep_key)
+            if prep_key not in prepared:
+                if not os.path.isfile(common.get_data_manifest_path_in_dir(prep_dir)):
+                    preparation.main(logger, para=pre_para, prep_output_dir=prep_dir)
+                validate_preparation(pre_para, prep_dir)
+                prepared[prep_key] = prep_dir
+            for period in periods:
+                # Reuse identical backtests across venues without losing strategy IDs.
+                execution_key = hashlib.sha256(json.dumps(
+                    {"prep": prep_key, "model": job["model_path"], "broker": job["broker"],
+                     "strategy": job["strategy"], "period": period, "device": job["device"]},
+                    sort_keys=True, default=str,
+                ).encode()).hexdigest()[:20]
+                if execution_key not in executions:
+                    run_dir = os.path.join(output_dir, "backtests", execution_key)
+                    os.makedirs(run_dir, exist_ok=True)
+                    data_config = backtest_runner.ModelDataConfig(
+                        prep_output_dir=prep_dir, train_output_dir=job["model_path"],
+                        prediction_cache_dir=os.path.join(output_dir, "prediction_cache", prep_key,
+                                                          hashlib.sha256(job["model_path"].encode()).hexdigest()[:20]),
+                        device=job["device"], use_prediction_cache=True,
+                    )
+                    backtest_runner.precompute_prediction_cache(
+                        logger, data_config, config_from_dict_train(params["train"]), period,
+                        inference_batch_size=INFERENCE_BATCH_SIZE,
+                    )
+                    runner_config = backtest_runner.RunnerConfig(
+                        strategy_config=backtest_runner.strategy_config_from_dict(job["strategy"]),
+                        broker_config=backtest_runner.BrokerConfig(**job["broker"]),
+                        data_config=data_config, save_dir=run_dir, experiment_context=experiment_context,
+                    )
+                    logger.info("Replaying %d/%d | strategy=%s period=%s model=%s", index, len(jobs), job["strategy_id"], period, job["model_path"])
+                    output = backtest_runner.main(logger, runner_config, period)
+                    report = output["report"]
+                    validate_report_market(report, pre_para.symbol, pre_para.interval)
+                    validate_report_period(report, period)
+                    report_path = os.path.join(run_dir, "report.json")
+                    write_json(report_path, report)
+                    write_json(os.path.join(run_dir, REPORT_DETAILS_FILE), output["report_details"])
+                    executions[execution_key] = (report, report_path)
+                report, report_path = executions[execution_key]
+                comparison = compare_reproduction_metrics(job["original"], report, period, rtol=rtol, atol=atol)
+                comparison["report_path"] = report_path
+                result["periods"][period] = comparison
+                logger.info("Comparison | strategy=%s period=%s matches=%s", job["strategy_id"], period, comparison["matches"])
+            result["status"] = "matched" if all(item["matches"] for item in result["periods"].values()) else "mismatch"
+        except Exception as exc:
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            logger.exception("Reproduction failed: %s", job["strategy_id"])
+        comparisons.append(result)
+        write_jsonl(os.path.join(output_dir, "live_reproduction_comparisons.jsonl"), comparisons)
+    summary = {status: sum(item["status"] == status for item in comparisons) for status in ("matched", "mismatch", "error")}
+    summary.update(total=len(comparisons), settings=jobs[0]["settings"])
+    write_json(os.path.join(output_dir, "live_reproduction_summary.json"), summary)
+    import csv
+
+    with open(os.path.join(output_dir, "live_reproduction_metrics.csv"), "w", newline="", encoding="utf-8") as output:
+        writer = csv.DictWriter(output, fieldnames=["strategy_id", "hash", "settings", "status", "period", "metric", "original", "reproduced", "delta", "matches"])
+        writer.writeheader()
+        for result in comparisons:
+            for period, comparison in result["periods"].items():
+                for metric, values in comparison["metrics"].items():
+                    writer.writerow({**{key: result[key] for key in ("strategy_id", "hash", "settings", "status")},
+                                     "period": period, "metric": metric, **values})
+    logger.info("Reproduction summary: %s", summary)
+    return comparisons
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1359,11 +1573,38 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Require a clean Git working tree",
     )
+    parser.add_argument("--live-config", help="Replay strategies and model paths from a live_config.json instead of cross-testing")
+    parser.add_argument("--strategy-id", action="append", help="Select a live strategy ID; repeat to select several")
+    parser.add_argument("--settings", choices=("original", "live"), default="original",
+                        help="Keep original broker/compound settings for reproduction, or apply live overrides")
+    parser.add_argument("--periods", nargs="+", choices=("long", "forward"), default=["long", "forward"])
+    parser.add_argument("--rtol", type=float, default=1e-6)
+    parser.add_argument("--atol", type=float, default=1e-8)
+    parser.add_argument("--dry-run", action="store_true", help="Validate live sources and model metadata without running backtests")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.live_config:
+        jobs = build_live_reproduction_jobs(args.live_config, args.strategy_id, args.settings)
+        if args.dry_run:
+            for job in jobs:
+                print(json.dumps({key: job[key] for key in ("strategy_id", "hash", "config_path", "model_path", "settings", "configuration_differences")}))
+            print(f"Validated {len(jobs)} live reproduction jobs; no backtests executed")
+            return
+        output_dir = os.path.abspath(args.output_dir or os.path.join(
+            common.PERSISTENCE_DIR, "live_reproduction", time.strftime("%Y%m%d_%H%M%S")))
+        logger = setup_logger(output_dir)
+        context = ExperimentContext(git_commit=common.git_revision(require_clean=args.check_git_clean))
+        results = run_live_reproduction(jobs, output_dir, logger, context,
+                                       periods=tuple(dict.fromkeys(args.periods)), rtol=args.rtol, atol=args.atol)
+        if any(item["status"] != "matched" for item in results):
+            raise SystemExit(1)
+        return
+    if args.dry_run or args.strategy_id:
+        raise ValueError("--dry-run and --strategy-id require --live-config")
 
     if not os.path.isfile(args.selected_configs):
         raise FileNotFoundError(f"Selected config file not found: {args.selected_configs}")

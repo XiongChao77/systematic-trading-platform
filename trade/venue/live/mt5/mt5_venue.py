@@ -170,6 +170,7 @@ class MT5Venue(VenueBase, AccountDashboard):
         return AccountBalance(
             balance=float(account.balance),
             equity=float(account.equity),
+            used_margin=float(account.margin),
         )
 
     def _strategy_positions(self):

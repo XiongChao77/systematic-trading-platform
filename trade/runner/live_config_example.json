@@ -1,6 +1,5 @@
 {
     "runner_id": "runner-main",
-    "report":"../../output/reports.jsonl",
     "telegram_token": "../notification/telegram/main",
     "monitoring": {
         "enable": true,
@@ -16,6 +15,7 @@
             "enable": true,
             "compound": false,
             "hash": "ctrader-report-hash",
+            "config_path": "../../output/reports.jsonl",
             "model_path": "../../quant_output/experiment/valid_train_out/ctrader-report-hash",
             "device": "cpu",
             "broker_config":{
@@ -40,6 +40,7 @@
             "run_live": false,
             "enable": true,
             "compound": true,
+            "config_path": "../../output/reports.jsonl",
             "model_path": "../../quant_output/experiment/valid_train_out/bitget-report-hash",
             "device": "cpu",
             "broker_config": {
@@ -59,6 +60,7 @@
             "run_live": true,
             "enable": true,
             "compound": true,
+            "config_path": "../../output/reports.jsonl",
             "model_path":"./model",
             "broker_config":{
                 "initial_equity": 200000,

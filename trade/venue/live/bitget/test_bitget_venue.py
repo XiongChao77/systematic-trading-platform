@@ -96,6 +96,8 @@ class Session:
                 {
                     "accountEquity": "1001",
                     "unrealizedPL": "1",
+                    "crossedMargin": "200",
+                    "isolatedMargin": "50",
                     "marginMode": "crossed",
                     "posMode": "hedge_mode" if self.hedge else "one_way_mode",
                 }
@@ -304,6 +306,7 @@ def test_filters_account_and_dashboard(venue_factory):
     assert venue.normalize_order_quantity(0.0109) == 0.01
     assert venue.get_account_equity() == 1001
     assert venue.get_dashboard_balance().balance == 1000
+    assert venue.get_dashboard_balance().used_margin == 250
     assert venue.get_bid_ask() == (60000, 60001)
     assert venue.get_last_position_open_time() is None
     venue.session.positions = [venue.session.position()]

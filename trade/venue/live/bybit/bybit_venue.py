@@ -122,7 +122,12 @@ class BybitVenue(VenueBase, AccountDashboard):
         equity = float(coin.get("equity", 0.0))
         if not all(math.isfinite(value) for value in (balance, equity)):
             raise RuntimeError("Bybit returned invalid dashboard balance data")
-        return AccountBalance(balance=balance, equity=equity)
+        margin = coin.get("totalPositionIM")
+        return AccountBalance(
+            balance=balance,
+            equity=equity,
+            used_margin=None if margin in (None, "") else float(margin),
+        )
 
     def _dashboard_position_payload(self):
         response = self.engine.http.get_positions(

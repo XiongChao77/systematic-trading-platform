@@ -221,6 +221,7 @@ class LiveStateRegistry:
 
         return {
             "strategy_id": pipeline.spec.strategy_id,
+            "model_type": pipeline.spec.train_config.model_cfg.model_type,
             "venue": venue_name,
             "symbol": pipeline.spec.base_define.symbol,
             "interval": pipeline.spec.base_define.interval,

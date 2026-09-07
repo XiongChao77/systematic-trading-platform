@@ -30,6 +30,7 @@ MAX_LOG_END_VALUE_RATIO = 3.0
 RISK_COMPARISON_KEYS = ("risk_per_trade_pct", "max_daily_loss_pct")
 KEY_STRATEGY_INDICATORS_FILE = "key_strategy_indicators.png"
 KEY_STRATEGY_INDICATORS_ADDITIONAL_INFO = {
+    "Feature ID": "feature_conf_list",
     "risk": "risk_per_trade_pct",
     "daily_loss": "max_daily_loss_pct",
     "avg_pct_gross": "forward.avg_pct_gross",
@@ -1006,6 +1007,175 @@ def _annualized_return_for_region(daily_account, start, end):
     return (end_balance / start_balance) ** (1 / elapsed_years) - 1
 
 
+def _full_period_daily_equity(report):
+    """Chain all long and forward daily equity, rebasing each period's capital.
+
+    Internal missing days are rejected. Between-period calendar gaps retain the
+    previous equity (capital is assumed idle). Chronological partial segments on
+    the same boundary day are compounded into one daily observation. Other
+    overlaps are rejected to prevent double-counting returns.
+    """
+    if (
+        any(report.get(period, {}).get("raw_analyzer", {}).get("customize", {}).get("daily_account") is None for period in ("long", "forward"))
+        and "raw" in report
+        and "path" in report
+    ):
+        report = attach_report_details(report)
+    segments = []
+    current_equity = 1.0
+    previous_end = None
+    for period in ("long", "forward"):
+        period_report = report.get(period, {})
+        daily = period_report.get("raw_analyzer", {}).get("customize", {}).get("daily_account", [])
+        frame = pd.DataFrame(daily)
+        if frame.empty or not {"date", "start_equity", "end_equity"}.issubset(frame.columns):
+            raise ValueError(f"missing_{period}_daily_equity")
+        frame = frame[["date", "start_equity", "end_equity"]].copy()
+        frame["date"] = pd.to_datetime(frame["date"], utc=True, errors="coerce").dt.normalize()
+        if frame["date"].isna().any():
+            raise ValueError(f"invalid_{period}_daily_dates")
+        frame = frame.sort_values("date").set_index("date")
+        if frame.index.duplicated().any():
+            raise ValueError(f"duplicate_{period}_days")
+        if len(frame) != len(pd.date_range(frame.index[0], frame.index[-1], freq="D")):
+            raise ValueError(f"missing_{period}_days")
+        values = frame.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(values).all() or (values <= 0).any():
+            raise ValueError(f"invalid_{period}_equity")
+        initial = pd.to_numeric(period_report.get("performance", {}).get("start_value"), errors="coerce")
+        if initial is None or not np.isfinite(initial) or initial <= 0:
+            raise ValueError(f"invalid_{period}_starting_capital")
+        period_start = pd.to_datetime(period_report.get("time", {}).get("start"), utc=True, errors="coerce")
+        period_end = pd.to_datetime(period_report.get("time", {}).get("end"), utc=True, errors="coerce")
+        if segments and frame.index[0] <= segments[-1].index[-1]:
+            same_boundary_day = frame.index[0] == segments[-1].index[-1]
+            ordered_times = previous_end is not None and not pd.isna(previous_end) and not pd.isna(period_start) and period_start > previous_end
+            if not same_boundary_day or not ordered_times:
+                raise ValueError("overlapping_long_forward_periods")
+        with np.errstate(over="ignore", invalid="ignore"):
+            equity = pd.Series(values[:, 1] / float(initial) * current_equity, index=frame.index)
+        if not np.isfinite(equity).all() or (equity <= 0).any():
+            raise ValueError("invalid_chained_equity")
+        segments.append(equity)
+        current_equity = float(equity.iloc[-1])
+        previous_end = period_end
+    equity = pd.concat(segments)
+    equity = equity[~equity.index.duplicated(keep="last")]
+    calendar = pd.date_range(equity.index[0], equity.index[-1], freq="D")
+    gap_days = len(calendar) - len(equity)
+    equity = equity.reindex(calendar).ffill()
+    frame = pd.DataFrame({"date": calendar, "start_equity": equity.shift(1, fill_value=1.0).to_numpy(), "end_equity": equity.to_numpy()})
+    frame.attrs["gap_days"] = gap_days
+    return frame
+
+
+def filter_by_validation_stability(
+    reports,
+    window_days=90,
+    step_days=30,
+    min_windows=4,
+    max_cv=1.0,
+    max_decay=0.20,
+    zero_tolerance=1e-12,
+):
+    """Measure return consistency and deterioration across full long + forward.
+
+    Both periods are required and chained by their individual starting capital.
+
+    CV is the population standard deviation divided by mean window return.
+    Decay is (early_mean - late_mean) / (abs(early_mean) + abs(late_mean)).
+    Windows are ordered by end date; the first half receives the middle window
+    when their count is odd. At least two windows per half are required.
+    Returns are cumulative, not annualized. Overlap is not independent evidence.
+    Nonpositive and numerically near-zero mean returns cannot qualify by CV.
+    Set either maximum to None to disable that metric's threshold.
+    Attach metrics and failure reasons under ``validation_stability`` and return
+    (passed, failed), preserving input order. No CAGR or drawdown gate is used.
+    """
+    from collections import Counter
+
+    for value in (window_days, step_days, min_windows):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("window_days, step_days, and min_windows must be positive integers")
+    if min_windows < 4:
+        raise ValueError("min_windows must be at least 4")
+    if max_cv is not None and (not math.isfinite(max_cv) or max_cv < 0):
+        raise ValueError("max_cv must be finite and non-negative, or None")
+    if max_decay is not None and (not math.isfinite(max_decay) or not -1 <= max_decay <= 1):
+        raise ValueError("max_decay must be between -1 and 1, or None")
+    if not math.isfinite(zero_tolerance) or zero_tolerance <= 0:
+        raise ValueError("zero_tolerance must be finite and positive")
+
+    passed, failed = [], []
+    failure_counts = Counter()
+    for report in reports:
+        metrics = {
+            "region": "long+forward",
+            "window_days": window_days,
+            "step_days": step_days,
+            "window_count": 0,
+            "rolling_return_cv": None,
+            "return_decay": None,
+            "failure_reasons": [],
+        }
+        report["validation_stability"] = metrics
+        reasons = metrics["failure_reasons"]
+        try:
+            frame = _full_period_daily_equity(report)
+        except ValueError as error:
+            reasons.append(str(error))
+        else:
+            starts = frame["start_equity"].to_numpy(dtype=float)
+            ends = frame["end_equity"].to_numpy(dtype=float)
+            offsets = np.arange(0, max(0, len(frame) - window_days + 1), step_days)
+            metrics.update(
+                days=len(frame), window_count=len(offsets), gap_days=frame.attrs["gap_days"], start=str(frame.iloc[0]["date"]), end=str(frame.iloc[-1]["date"])
+            )
+            if len(offsets) < min_windows:
+                reasons.append("insufficient_windows")
+            else:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    returns = ends[offsets + window_days - 1] / starts[offsets] - 1
+                    mean_return = float(np.mean(returns))
+                    std_return = float(np.std(returns, ddof=0))
+                if not np.isfinite(returns).all() or not all(map(math.isfinite, (mean_return, std_return))):
+                    reasons.append("nonfinite_window_returns")
+                else:
+                    early, late = np.array_split(returns, 2)
+                    early_mean, late_mean = float(np.mean(early)), float(np.mean(late))
+                    metrics.update(
+                        mean_return=mean_return,
+                        early_mean_return=early_mean,
+                        late_mean_return=late_mean,
+                    )
+                    if mean_return <= 0:
+                        reasons.append("nonpositive_mean_return")
+                    elif mean_return <= zero_tolerance:
+                        reasons.append("near_zero_mean_return")
+                    else:
+                        cv = std_return / mean_return
+                        metrics["rolling_return_cv"] = cv
+                        if max_cv is not None and cv > max_cv:
+                            reasons.append("rolling_return_cv")
+                    denominator = abs(early_mean) + abs(late_mean)
+                    if denominator <= zero_tolerance:
+                        reasons.append("undefined_return_decay")
+                    else:
+                        decay = (early_mean - late_mean) / denominator
+                        metrics["return_decay"] = decay
+                        if max_decay is not None and decay > max_decay:
+                            reasons.append("return_decay")
+        metrics["passed"] = not reasons
+        (failed if reasons else passed).append(report)
+        failure_counts.update(reasons)
+
+    print(f"Full-period (long+forward) consistency/decay: {len(passed)}/{len(reports)} passed; {len(failed)} failed")
+    print(f"Window={window_days} days, step={step_days} days, min_windows={min_windows}, " f"max_cv={max_cv}, max_decay={max_decay}")
+    for reason, count in sorted(failure_counts.items()):
+        print(f"  {reason}: {count} reports (failure reasons may overlap)")
+    return passed, failed
+
+
 def filter_by_train_valid_test_cagr(reports, min_train_cagr, valid_test_ratio):
     """Filter reports by train CAGR and combined valid/test CAGR.
 
@@ -1095,7 +1265,7 @@ def filter_by_train_valid_test_cagr(reports, min_train_cagr, valid_test_ratio):
 def basic_filter(all_results):
     basic_filter_results, _ = filter_by_criteria(
         all_results,
-        criteria=["long.cagr>=0.4", "long.daily_freq>=0.3", "long.rc_pos_ratio>=0.6", "long.max_hwm_duration_days < 300"],
+        criteria=["long.cagr>=0.5", "long.daily_freq>=0.3", "long.rc_pos_ratio>=0.7", "long.max_hwm_duration_days < 270"],
     )
     print(f"After basic_filter: {len(basic_filter_results)}, " f"{len(basic_filter_results) / len(all_results) * 100:.2f}%")
     return basic_filter_results
@@ -1156,15 +1326,17 @@ def _analysis_list_hash(value):
     return hash(key_text)
 
 
-def _format_additional_info_value(value, source_key=None):
+def _format_additional_info_value(value, source_key=None, feature_ids=None):
     """Format an additional performance-table value without losing structure."""
     if value is None:
         return "-"
     source_name = str(source_key).rsplit(".", 1)[-1]
+    if source_name in {"rolling_return_cv", "return_decay"}:
+        return f"{float(value):.4f}"
     if source_name == "avg_pct_gross" and isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
         return f"{float(value):.4f}"
     if source_name == "feature_conf_list" and isinstance(value, list):
-        return f"Hash:{str(_analysis_list_hash(value))[:8]}"
+        return str((feature_ids or {}).get(_analysis_list_hash(value), "-"))
     if isinstance(value, (dict, list, tuple)):
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     return str(value)
@@ -1297,8 +1469,15 @@ def show_key_strategy_indicators(
     output_dir,
     addition_info=None,
     strategy_num_start=1,
+    feature_map=None,
 ):
     """Print and render indicators without regenerating equity or correlation plots."""
+    if feature_map is None:
+        feature_values = [_resolve_additional_info_value(report, "feature_conf_list") for report in all_results]
+        feature_hashes = sorted({_analysis_list_hash(value) for value in feature_values if isinstance(value, list)}, key=str)
+        feature_ids = {key: index for index, key in enumerate(feature_hashes, start=1)}
+    else:
+        feature_ids = {_analysis_list_hash(value): index for index, value in feature_map.items()}
     strategy_numbers = [strategy_num_start + index for index in range(len(all_results))]
     model_numbers = _model_group_numbers(all_results)
     strategy_labels = [
@@ -1318,6 +1497,7 @@ def show_key_strategy_indicators(
             _format_additional_info_value(
                 _resolve_additional_info_value(report, source_key),
                 source_key,
+                feature_ids=feature_ids,
             )
             for _, source_key in additional_columns
         ]
@@ -1416,19 +1596,19 @@ def show_performance(
     addition_info=None,
     plot_ood=False,
     strategy_num_start=1,
+    feature_map=None,
 ):
+    """Display strategy performance using feature IDs from analyze_holdbar when supplied."""
     show_key_strategy_indicators(
         all_results,
         output_dir,
         addition_info=addition_info,
         strategy_num_start=strategy_num_start,
+        feature_map=feature_map,
     )
     strategy_numbers = [strategy_num_start + index for index in range(len(all_results))]
     model_numbers = _model_group_numbers(all_results)
-    strategy_labels = [
-        f"M{model_number}-S{strategy_number}"
-        for model_number, strategy_number in zip(model_numbers, strategy_numbers)
-    ]
+    strategy_labels = [f"M{model_number}-S{strategy_number}" for model_number, strategy_number in zip(model_numbers, strategy_numbers)]
     detailed_results = [attach_report_details(row) for row in all_results]
     for model_number, strategy_number, strategy_label, row in zip(
         model_numbers,
@@ -1439,7 +1619,7 @@ def show_performance(
         row["_model_num"] = model_number
         row["_strategy_num"] = strategy_number
         row["_strategy_label"] = strategy_label
-    compute_correlation(detailed_results, output_dir)
+    # compute_correlation(detailed_results, output_dir)
     plot_in_batches(
         detailed_results,
         output_dir,
@@ -1733,8 +1913,9 @@ def main():
     exp_dir7 = os.path.join(common.PERSISTENCE_DIR, "batch_experiments", "XLMUSDT_15m", "2026-08-24", "13_07_55")
     exp_dir8 = os.path.join(common.PERSISTENCE_DIR, "batch_experiments", "ETHUSDT_15m", "2026-09-02", "22_01_49")
     exp_dir9 = os.path.join(common.PERSISTENCE_DIR, "batch_experiments", "BTCUSDT_15m", "2026-09-03", "20_33_34")
+    exp_dir10 = os.path.join(common.PERSISTENCE_DIR, "batch_experiments", "DOGEUSDT_15m", "2026-09-05", "10_02_30")
 
-    exp_dir_list = [exp_dir8]
+    exp_dir_list = [exp_dir10]
     filter_report = None
     filter_report = os.path.join(output_dir, "filtered_raw_reports.jsonl")
     removed_count = clean_output_dir_except(output_dir, filter_report)
@@ -1775,7 +1956,7 @@ def main():
         # analyze_holdbar(uin_records,target_key="predict_num", period ='forward',metric_key="cagr")
         # plot_heatmap(uin_records,var1_key='fixed_hold_bars',var2_key='predict_num', metric_key="l_cagr",save_path=os.path.join(output_dir,f"l_cagr_heatmap_combined.png"))
         # plot_heatmap(uin_records,var1_key='fixed_hold_bars',var2_key='predict_num', metric_key="f_cagr",save_path=os.path.join(output_dir,f"f_cagr_heatmap_combined.png"))
-        # stats, f_map, groups = analyze_holdbar(uin_records,target_key="feature_conf_list",period ='long', metric_key="cagr")
+        # stats, f_map, groups = analyze_holdbar(uin_records, target_key="feature_conf_list", period="long", metric_key="cagr")
         # stats, f_map, groups = analyze_holdbar(uin_records,target_key="feature_conf_list",period ='forward', metric_key="cagr")
         save_raw_reports(uin_records, output_dir, "filtered_raw_reports.jsonl")
         exit()
@@ -1808,31 +1989,41 @@ def main():
     # analyze_model_performance_correlation(uin_records)
     # analyze_model_metrics_by_decile(uin_records)
     # exit()
-    uin_records, fail = filter_by_train_valid_test_cagr(uin_records, min_train_cagr=0.3, valid_test_ratio=0.05)
-    uin_records, _ = filter_by_criteria(uin_records, criteria=["forward.cagr>=0.1", "forward.risk_per_trade_pct<0.04"])
-    # uin_records = [record for record in uin_records if common.recursive_get(record, "long.params.train.model_cfg.model_type") == "logistic_regression"]
+    # uin_records, fail = filter_by_validation_stability(uin_records, window_days=90, step_days=30, min_windows=4, max_cv=1.0, max_decay=0.20)
+    # uin_records, fail = filter_by_train_valid_test_cagr(uin_records, min_train_cagr=0.5, valid_test_ratio=0.2)
+    # uin_records, _ = filter_by_criteria(uin_records, criteria=["forward.risk_per_trade_pct<0.04", "forward.stride>2", "forward.cagr>0.4"])
+    stats, f_map, groups = analyze_holdbar(uin_records, target_key="feature_conf_list", period="forward", metric_key="cagr")
+    # analyze_holdbar(uin_records, target_key="stride", period="forward", metric_key="cagr")
+    # uin_records = [record for record in uin_records if common.recursive_get(record, "long.params.train.model_cfg.model_type") != "logistic_regression"]
     start = 10
     show_count = 40
     # analyze_ml_trading_correlation(uin_records, period="long", output_dir_path=os.path.join(output_dir, "ml_trading_correlation"), group_by_model=True)
     # analyze_ml_trading_correlation(uin_records, period="forward", output_dir_path=os.path.join(output_dir, "ml_trading_correlation"), group_by_model=True)
     # exit()
     selected = uin_records
-    selected_hash_filter = ["19bcaa57b5cb", "a48b13dc4e7b"]
-    candidate = set(selected_hash_filter)
-    # selected = [record for record in selected if record.get("hash") in candidate]
+    if not selected:
+        print("No strategies in the requested selection slice after filtering")
+        return
+    logistic_regression_selected_hash_filter = ["bb5a04d1e971", "4aad18cc36d2", "6faa99baaf30", "e6bae1026f44", "cee28d106192"]
+    consltm_selected_hash_filter = ["d3031351d1b7", "9027fc4aaeb1", "fbf6505bcd5f", "2de9ad429fde", "dad45aa8bae9", "5094b003832c"]
+    candidate = set(logistic_regression_selected_hash_filter + consltm_selected_hash_filter)
+    selected = [record for record in selected if record.get("hash") in candidate]
 
     show_performance(
         selected,
         os.path.join(output_dir, "plot"),
         3,
         addition_info={
-            "risk": "risk_per_trade_pct",
-            "daily_loss": "max_daily_loss_pct",
+            "vol_multiplier": "vol_multiplier_long",
+            "vol_ewma_span": "vol_ewma_span",
             "avg_pct_gross": "forward.avg_pct_gross",
-            "stride":"stride"
+            "stride": "stride",
+            "seq_len": "seq_len",
+            "predict_num": "predict_num",
             # "hold_bars": "fixed_hold_bars",
         },
         plot_ood=True,
+        feature_map=f_map,
     )
     # rc_pos_ratio_results, unselected = filter_by_criteria(
     #     stable_selected1, criteria=["long.rc_pos_ratio>=0.7"]
@@ -2212,14 +2403,14 @@ def get_value_by_path(obj, path):
 
 def analyze_holdbar(records, target_key="fixed_hold_bars", period="forward", metric_key="cagr"):
     """
-    Final enhanced version:
-    1. Supports list-type target_key (auto sort, join, and hash).
-    2. Returns grouped_records to keep original records grouped.
+    Group records by a parameter and print aggregated performance statistics.
+    Feature configuration lists use consecutive IDs starting at 1, with a
+    printed mapping to their full configurations. Other lists use hashes.
 
     Returns:
         analysis_results (list): list of aggregated statistics.
-        hash_map (dict): mapping from hash to original list.
-        grouped_records (dict): {hash_or_value: [original_records...]}.
+        hash_map (dict): mapping from group ID or hash to original list.
+        grouped_records (dict): {group_key: [original_records...]}.
     """
     from collections import defaultdict
     import numpy as np
@@ -2259,12 +2450,21 @@ def analyze_holdbar(records, target_key="fixed_hold_bars", period="forward", met
         print(f"No valid {target_key} found")
         return [], {}, {}
 
+    numbered_features = target_key == "feature_conf_list"
+    if numbered_features:
+        feature_keys = sorted(grouped_records, key=str)
+        hash_map = {index: hash_map.get(key, key) for index, key in enumerate(feature_keys, start=1)}
+        grouped_records = {index: grouped_records[key] for index, key in enumerate(feature_keys, start=1)}
+        print("\nfeature_conf_list ID mapping:")
+        for index, features in hash_map.items():
+            print(f"{index}: {json.dumps(features, ensure_ascii=False)}")
+
     # 3. Compute performance statistics per group
     analysis_results = []
     total_count = sum(len(v) for v in grouped_records.values())
 
     # Sort by key for stable output
-    for key in sorted(grouped_records.keys(), key=lambda x: str(x)):
+    for key in sorted(grouped_records.keys(), key=lambda x: x if numbered_features else str(x)):
         group_items = grouped_records[key]
         count = len(group_items)
 
@@ -2284,7 +2484,7 @@ def analyze_holdbar(records, target_key="fixed_hold_bars", period="forward", met
                 calmar_list.append(calmar)
 
         # Label for display
-        display_label = f"Hash:{str(key)[:8]}" if key in hash_map else key
+        display_label = f"Hash:{str(key)[:8]}" if key in hash_map and not numbered_features else key
 
         analysis_results.append(
             {
@@ -2307,7 +2507,8 @@ def analyze_holdbar(records, target_key="fixed_hold_bars", period="forward", met
     print("\n" + "=" * 110)
     print(f"{target_key} {period} analysis (total {total_count} reports)")
     print("=" * 110)
-    header = f"{'Value/Hash':<15} {'Count':<8} {'%':<6} {f'{metric_key.upper()}':<12} {'':<2}{'AVG':<6}{'Max':<6}{'Std':<6}{'Med':<6} {'Calmar:':<8}{'AVG':<6}{'MAX':<6}{'Med':<6}"
+    group_label = "Feature ID" if numbered_features else "Value/Hash"
+    header = f"{group_label:<15} {'Count':<8} {'%':<6} {f'{metric_key.upper()}':<12} {'':<2}{'AVG':<6}{'Max':<6}{'Std':<6}{'Med':<6} {'Calmar:':<8}{'AVG':<6}{'MAX':<6}{'Med':<6}"
     print(header)
     print("-" * 110)
 

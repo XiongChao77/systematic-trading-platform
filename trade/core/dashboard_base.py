@@ -1,3 +1,4 @@
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
@@ -18,8 +19,17 @@ class MarginMode(Enum):
 
 @dataclass(frozen=True)
 class AccountBalance:
+    """Account totals; used_margin is None when the venue cannot report it."""
+
     balance: float
     equity: float
+    used_margin: Optional[float]
+
+    def __post_init__(self) -> None:
+        if self.used_margin is not None and (
+            not math.isfinite(self.used_margin) or self.used_margin < 0
+        ):
+            object.__setattr__(self, "used_margin", None)
 
 
 @dataclass(frozen=True)
@@ -63,7 +73,7 @@ class AccountDashboard(ABC):
 
     @abstractmethod
     def get_dashboard_balance(self) -> AccountBalance:
-        """Return the current account balance and equity."""
+        """Return account balance, equity and occupied position margin."""
         raise NotImplementedError
 
     @abstractmethod
