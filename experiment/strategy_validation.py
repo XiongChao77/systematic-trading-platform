@@ -1445,8 +1445,8 @@ def compare_reproduction_metrics(original, reproduced, period, *, rtol=1e-6, ato
             "period_range_matches": same_range, "metrics": comparisons}
 
 
-def run_live_reproduction(jobs, output_dir, logger, experiment_context, *, periods=("long", "forward"), rtol=1e-6, atol=1e-8):
-    """Replay configured model artifacts offline and persist per-strategy comparisons.
+def run_live_reproduction(jobs, output_dir, logger, experiment_context, *, rtol=1e-6, atol=1e-8):
+    """Replay only the forward period offline and persist per-strategy comparisons.
 
     Original mode keeps original broker/compound settings for a like-for-like
     reproduction. Live mode applies live broker/compound overrides and reports
@@ -1457,8 +1457,7 @@ def run_live_reproduction(jobs, output_dir, logger, experiment_context, *, perio
     import math
     from trade.runner import backtest_runner
 
-    if not periods or any(period not in {"long", "forward"} for period in periods):
-        raise ValueError("periods must contain long and/or forward")
+    period = "forward"
     if not all(math.isfinite(value) and value >= 0 for value in (rtol, atol)):
         raise ValueError("Comparison tolerances must be finite and non-negative")
     os.makedirs(output_dir, exist_ok=True)
@@ -1484,49 +1483,52 @@ def run_live_reproduction(jobs, output_dir, logger, experiment_context, *, perio
                     preparation.main(logger, para=pre_para, prep_output_dir=prep_dir)
                 validate_preparation(pre_para, prep_dir)
                 prepared[prep_key] = prep_dir
-            for period in periods:
-                # Reuse identical backtests across venues without losing strategy IDs.
-                execution_key = hashlib.sha256(json.dumps(
-                    {"prep": prep_key, "model": job["model_path"], "broker": job["broker"],
-                     "strategy": job["strategy"], "period": period, "device": job["device"]},
-                    sort_keys=True, default=str,
-                ).encode()).hexdigest()[:20]
-                if execution_key not in executions:
-                    run_dir = os.path.join(output_dir, "backtests", execution_key)
-                    os.makedirs(run_dir, exist_ok=True)
-                    data_config = backtest_runner.ModelDataConfig(
-                        prep_output_dir=prep_dir, train_output_dir=job["model_path"],
-                        prediction_cache_dir=os.path.join(output_dir, "prediction_cache", prep_key,
-                                                          hashlib.sha256(job["model_path"].encode()).hexdigest()[:20]),
-                        device=job["device"], use_prediction_cache=True,
-                    )
-                    backtest_runner.precompute_prediction_cache(
-                        logger, data_config, config_from_dict_train(params["train"]), period,
-                        inference_batch_size=INFERENCE_BATCH_SIZE,
-                    )
-                    runner_config = backtest_runner.RunnerConfig(
-                        strategy_config=backtest_runner.strategy_config_from_dict(job["strategy"]),
-                        broker_config=backtest_runner.BrokerConfig(**job["broker"]),
-                        data_config=data_config, save_dir=run_dir, experiment_context=experiment_context,
-                    )
-                    logger.info("Replaying %d/%d | strategy=%s period=%s model=%s", index, len(jobs), job["strategy_id"], period, job["model_path"])
-                    output = backtest_runner.main(logger, runner_config, period)
-                    report = output["report"]
-                    validate_report_market(report, pre_para.symbol, pre_para.interval)
-                    validate_report_period(report, period)
-                    report_path = os.path.join(run_dir, "report.json")
-                    write_json(report_path, report)
-                    write_json(os.path.join(run_dir, REPORT_DETAILS_FILE), output["report_details"])
-                    executions[execution_key] = (report, report_path)
-                report, report_path = executions[execution_key]
-                comparison = compare_reproduction_metrics(job["original"], report, period, rtol=rtol, atol=atol)
-                comparison["report_path"] = report_path
-                result["periods"][period] = comparison
-                logger.info("Comparison | strategy=%s period=%s matches=%s", job["strategy_id"], period, comparison["matches"])
-            result["status"] = "matched" if all(item["matches"] for item in result["periods"].values()) else "mismatch"
+            # Reuse identical backtests across venues without losing strategy IDs.
+            execution_key = hashlib.sha256(json.dumps(
+                {"prep": prep_key, "model": job["model_path"], "broker": job["broker"],
+                 "strategy": job["strategy"], "period": period, "device": job["device"]},
+                sort_keys=True, default=str,
+            ).encode()).hexdigest()[:20]
+            if execution_key not in executions:
+                run_dir = os.path.join(output_dir, "backtests", execution_key)
+                os.makedirs(run_dir, exist_ok=True)
+                data_config = backtest_runner.ModelDataConfig(
+                    prep_output_dir=prep_dir, train_output_dir=job["model_path"],
+                    prediction_cache_dir=os.path.join(output_dir, "prediction_cache", prep_key,
+                                                      hashlib.sha256(job["model_path"].encode()).hexdigest()[:20]),
+                    device=job["device"], use_prediction_cache=True,
+                )
+                backtest_runner.precompute_prediction_cache(
+                    logger, data_config, config_from_dict_train(params["train"]), period,
+                    inference_batch_size=INFERENCE_BATCH_SIZE,
+                )
+                runner_config = backtest_runner.RunnerConfig(
+                    strategy_config=backtest_runner.strategy_config_from_dict(job["strategy"]),
+                    broker_config=backtest_runner.BrokerConfig(**job["broker"]),
+                    data_config=data_config, save_dir=run_dir, experiment_context=experiment_context,
+                )
+                logger.info("Replaying %d/%d | strategy=%s period=%s model=%s", index, len(jobs), job["strategy_id"], period, job["model_path"])
+                output = backtest_runner.main(logger, runner_config, period)
+                report = output["report"]
+                validate_report_market(report, pre_para.symbol, pre_para.interval)
+                validate_report_period(report, period)
+                report_path = os.path.join(run_dir, "report.json")
+                write_json(report_path, report)
+                write_json(os.path.join(run_dir, REPORT_DETAILS_FILE), output["report_details"])
+                executions[execution_key] = (report, report_path)
+            report, report_path = executions[execution_key]
+            comparison = compare_reproduction_metrics(job["original"], report, period, rtol=rtol, atol=atol)
+            comparison["report_path"] = report_path
+            result["periods"][period] = comparison
+            result["status"] = "matched" if comparison["matches"] else "mismatch"
         except Exception as exc:
             result["error"] = f"{type(exc).__name__}: {exc}"
             logger.exception("Reproduction failed: %s", job["strategy_id"])
+        logger.info(
+            "Live reproduction %d/%d | strategy=%s period=%s | %s | status=%s",
+            index, len(jobs), job["strategy_id"], period,
+            "PASS" if result["status"] == "matched" else "FAIL", result["status"],
+        )
         comparisons.append(result)
         write_jsonl(os.path.join(output_dir, "live_reproduction_comparisons.jsonl"), comparisons)
     summary = {status: sum(item["status"] == status for item in comparisons) for status in ("matched", "mismatch", "error")}
@@ -1577,7 +1579,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strategy-id", action="append", help="Select a live strategy ID; repeat to select several")
     parser.add_argument("--settings", choices=("original", "live"), default="original",
                         help="Keep original broker/compound settings for reproduction, or apply live overrides")
-    parser.add_argument("--periods", nargs="+", choices=("long", "forward"), default=["long", "forward"])
     parser.add_argument("--rtol", type=float, default=1e-6)
     parser.add_argument("--atol", type=float, default=1e-8)
     parser.add_argument("--dry-run", action="store_true", help="Validate live sources and model metadata without running backtests")
@@ -1599,7 +1600,7 @@ def main() -> None:
         logger = setup_logger(output_dir)
         context = ExperimentContext(git_commit=common.git_revision(require_clean=args.check_git_clean))
         results = run_live_reproduction(jobs, output_dir, logger, context,
-                                       periods=tuple(dict.fromkeys(args.periods)), rtol=args.rtol, atol=args.atol)
+                                       rtol=args.rtol, atol=args.atol)
         if any(item["status"] != "matched" for item in results):
             raise SystemExit(1)
         return

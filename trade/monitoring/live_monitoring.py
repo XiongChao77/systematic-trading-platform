@@ -7,6 +7,8 @@ import math
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, Mapping, Optional
@@ -61,6 +63,10 @@ class LiveStateRegistry:
         self._pipelines = {pipeline.spec.strategy_id: pipeline for pipeline in pipelines}
         self._signals: dict[str, dict[str, Any]] = {}
         self._position_open_times: dict[str, tuple[str, datetime]] = {}
+        self.collection_timings: dict[str, float] = {}
+        self._snapshots: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._collection_stop = threading.Event()
+        self._collectors: list[threading.Thread] = []
 
     def record_cycle(
         self,
@@ -87,11 +93,74 @@ class LiveStateRegistry:
             if intent.action.value in {"open", "close"}:
                 self._position_open_times.pop(pipeline.spec.strategy_id, None)
 
-    def strategy_snapshots(self, status: str = "running") -> list[dict[str, Any]]:
-        with self._lock:
-            signals = {strategy_id: dict(payload) for strategy_id, payload in self._signals.items()}
+    def start_collection(self, interval_seconds: float, logger: logging.Logger) -> None:
+        if self._collectors:
+            return
+        self._collection_stop.clear()
+        for strategy_id, pipeline in self._pipelines.items():
+            thread = threading.Thread(
+                target=self._collect_strategy, args=(strategy_id, pipeline, interval_seconds, logger),
+                name=f"dashboard-{strategy_id}", daemon=True,
+            )
+            self._collectors.append(thread)
+            thread.start()
 
-        return [self._snapshot_pipeline(pipeline, signals.get(strategy_id), status) for strategy_id, pipeline in self._pipelines.items()]
+    def _collect_strategy(self, strategy_id, pipeline, interval_seconds, logger):
+        while not self._collection_stop.is_set():
+            started = time.monotonic()
+            try:
+                snapshot = self._snapshot_pipeline(pipeline, None, "running")
+                with self._lock:
+                    if self._collection_stop.is_set():
+                        return
+                    self._snapshots[strategy_id] = (started, snapshot)
+            except Exception:
+                logger.exception("Dashboard collection failed | strategy=%s", strategy_id)
+            elapsed = time.monotonic() - started
+            logger.info("Dashboard collection timing | strategy=%s total_ms=%.1f", strategy_id, elapsed * 1000)
+            self._collection_stop.wait(max(0.0, interval_seconds - elapsed))
+
+    def stop_collection(self) -> None:
+        self._collection_stop.set()
+        deadline = time.monotonic() + 2.0
+        for thread in self._collectors:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    def strategy_snapshots(self, status: str = "running") -> list[dict[str, Any]]:
+        """Copy latest data without waiting for any exchange request."""
+        now = time.monotonic()
+        with self._lock:
+            cached = deepcopy(self._snapshots)
+            signals = deepcopy(self._signals)
+        results = []
+        for strategy_id, pipeline in self._pipelines.items():
+            entry = cached.get(strategy_id)
+            snapshot = entry[1] if entry else self._snapshot_pipeline(pipeline, None, status, collect=False)
+            snapshot["dashboard_age_seconds"] = None if entry is None else max(0.0, now - entry[0])
+            snapshot["status"] = status if status == "stopped" or bool(getattr(pipeline, "enable", True)) else "disabled"
+            snapshot["latest_signal"] = signals.get(strategy_id)
+            snapshot["availability"]["latest_signal"] = strategy_id in signals
+            position = snapshot["position"]
+            if position and position.get("opened_at") and snapshot["max_holding_seconds"] is not None:
+                opened_at = datetime.fromisoformat(position["opened_at"])
+                elapsed = max(0.0, (_utc_now() - opened_at).total_seconds())
+                position["remaining_holding_seconds"] = max(0.0, snapshot["max_holding_seconds"] - elapsed)
+            results.append(snapshot)
+        return results
+
+    def timing_snapshot(self):
+        with self._lock:
+            return dict(self.collection_timings)
+
+    @contextmanager
+    def _time_component(self, strategy_id: str, component: str):
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            elapsed = time.monotonic() - started
+            with self._lock:
+                self.collection_timings[f"{strategy_id}/{component}"] = elapsed
 
     def _position_opened_at(self, pipeline, dashboard_position) -> datetime | None:
         strategy_id = pipeline.spec.strategy_id
@@ -103,7 +172,7 @@ class LiveStateRegistry:
 
         opened_at = dashboard_position.opened_at
         if opened_at is None:
-            opened_at = pipeline.venue.get_last_position_open_time()
+            opened_at = pipeline.venue.get_dashboard_position_open_time(dashboard_position)
         if opened_at is None:
             return None
         if not isinstance(opened_at, datetime):
@@ -138,7 +207,7 @@ class LiveStateRegistry:
         interval_ms = int(interval_ms)
         return bars * interval_ms / 1000.0
 
-    def _snapshot_pipeline(self, pipeline, signal, status: str) -> dict[str, Any]:
+    def _snapshot_pipeline(self, pipeline, signal, status: str, *, collect: bool = True) -> dict[str, Any]:
         account = None
         position = None
         dashboard_position = None
@@ -162,28 +231,20 @@ class LiveStateRegistry:
         if risk_per_trade_pct is None or max_daily_loss_pct is None:
             raise RuntimeError("Live strategy risk configuration must contain finite " "risk_per_trade_pct and max_daily_loss_pct values")
 
-        if not isinstance(venue, AccountDashboard):
-            errors.append(
-                {
-                    "component": "dashboard",
-                    "message": f"{type(venue).__name__} has no dashboard interface",
-                }
-            )
-        else:
-            try:
-                account = asdict(venue.get_dashboard_balance())
-                account_available = True
-            except Exception as exc:
-                errors.append({"component": "account", "message": str(exc) or type(exc).__name__})
-            try:
-                dashboard_position = venue.get_dashboard_position()
-                if dashboard_position is not None:
-                    position = asdict(dashboard_position)
-                    position["side"] = dashboard_position.side.value
-                    position["margin_mode"] = dashboard_position.margin_mode.value
-                position_available = True
-            except Exception as exc:
-                errors.append({"component": "position", "message": str(exc) or type(exc).__name__})
+        if collect and not isinstance(venue, AccountDashboard):
+            errors.append({"component": "dashboard", "message": f"{type(venue).__name__} has no dashboard interface"})
+        elif collect:
+            with self._time_component(pipeline.spec.strategy_id, "dashboard"):
+                dashboard = venue.get_dashboard_snapshot()
+            account = None if dashboard.account is None else asdict(dashboard.account)
+            dashboard_position = dashboard.position
+            account_available = dashboard.account_available
+            position_available = dashboard.position_available
+            errors.extend(dashboard.errors)
+            if dashboard_position is not None:
+                position = asdict(dashboard_position)
+                position["side"] = dashboard_position.side.value
+                position["margin_mode"] = dashboard_position.margin_mode.value
 
         if dashboard_position is None:
             if position_available:
@@ -191,10 +252,11 @@ class LiveStateRegistry:
         else:
             opened_at = None
             try:
-                opened_at = self._position_opened_at(
-                    pipeline,
-                    dashboard_position,
-                )
+                with self._time_component(pipeline.spec.strategy_id, "position_timing"):
+                    opened_at = self._position_opened_at(
+                        pipeline,
+                        dashboard_position,
+                    )
             except Exception as exc:
                 errors.append(
                     {
@@ -269,6 +331,7 @@ class LiveMonitoringService:
     def start(self) -> None:
         if self._thread is not None:
             return
+        self.registry.start_collection(self.config.publish_interval_seconds, self.logger)
         self._thread = threading.Thread(
             target=self._run,
             name=f"live-monitoring-{self.config.runner_id}",
@@ -313,10 +376,15 @@ class LiveMonitoringService:
                 )
 
     def publish_once(self, status: str = "running") -> bool:
+        started = time.monotonic()
+        collection_finished = None
+        accepted = False
         try:
+            payload = self._payload(status)
+            collection_finished = time.monotonic()
             response = self.session.post(
                 self.config.publish_url,
-                json=self._payload(status),
+                json=payload,
                 timeout=self.config.request_timeout_seconds,
             )
             response.raise_for_status()
@@ -326,21 +394,43 @@ class LiveMonitoringService:
                 result = None
             if isinstance(result, Mapping) and result.get("accepted") is False:
                 raise RuntimeError(f"Snapshot rejected: {result.get('reason', 'unknown reason')}")
+            accepted = True
             return True
         except Exception as exc:
             now = time.monotonic()
             if now - self._last_error_log_at >= self.ERROR_LOG_INTERVAL_SECONDS:
                 self._last_error_log_at = now
-                self.logger.debug(
+                self.logger.warning(
                     "Live monitoring publish failed | runner=%s url=%s error=%s",
                     self.config.runner_id,
                     self.config.publish_url,
                     exc,
                 )
             return False
+        finally:
+            finished = time.monotonic()
+            elapsed = finished - started
+            collect_seconds = (finished if collection_finished is None else collection_finished) - started
+            post_seconds = 0.0 if collection_finished is None else finished - collection_finished
+            components = ", ".join(
+                f"{name}={duration:.3f}s"
+                for name, duration in sorted(
+                    self.registry.timing_snapshot().items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )
+            )
+            self.logger.log(
+                logging.WARNING if elapsed > self.config.publish_interval_seconds else logging.INFO,
+                "Live monitoring timing | runner=%s accepted=%s total=%.3fs "
+                "collect=%.3fs post=%.3fs interval=%.3fs components=[%s]",
+                self.config.runner_id, accepted, elapsed, collect_seconds,
+                post_seconds, self.config.publish_interval_seconds, components,
+            )
 
     def stop(self) -> None:
         self._stop_event.set()
+        self.registry.stop_collection()
         if self._thread is not None:
             thread = self._thread
             thread.join(timeout=(self.config.publish_interval_seconds + self.config.request_timeout_seconds + 0.5))

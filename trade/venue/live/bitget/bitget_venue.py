@@ -411,8 +411,26 @@ class BitgetVenue(VenueBase, AccountDashboard):
             if cursor:
                 query["idLessThan"] = cursor
             data = self._request("GET", path, query, signed=True)
+            # Bitget represents an empty page with a null list and no next ID.
+            if (
+                isinstance(data, dict)
+                and list_key in data
+                and data[list_key] is None
+                and "endId" in data
+                and data["endId"] in (None, "")
+            ):
+                return
             if not isinstance(data, dict) or not isinstance(data.get(list_key), list):
-                raise RuntimeError(f"Bitget returned invalid paginated data for {path}")
+                list_type = (
+                    type(data[list_key]).__name__
+                    if isinstance(data, dict) and list_key in data
+                    else "missing"
+                )
+                raise RuntimeError(
+                    f"Bitget returned invalid paginated data for {path}: "
+                    f"expected data.{list_key} to be a list, "
+                    f"data_type={type(data).__name__}, list_type={list_type}"
+                )
             rows = data[list_key]
             yield from rows
             if len(rows) < self.PAGE_SIZE:

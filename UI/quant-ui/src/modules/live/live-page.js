@@ -62,10 +62,13 @@ function mountList(container, context) {
   function render(payload) {
     const items = Array.isArray(payload?.items) ? payload.items : [];
     hasData = items.length > 0;
+    const unavailableStrategies = items.filter((item) => item.available !== true).length;
     status.textContent = payload?.runners?.unavailable
       ? `${payload.runners.unavailable} runner unavailable`
-      : "Live";
-    status.className = `status-pill ${payload?.runners?.unavailable ? "busy" : "success"}`;
+      : unavailableStrategies
+        ? `${unavailableStrategies} ${unavailableStrategies === 1 ? "strategy" : "strategies"} unavailable`
+        : "Live";
+    status.className = `status-pill ${payload?.runners?.unavailable || unavailableStrategies ? "busy" : "success"}`;
 
     if (!items.length) {
       tableWrap.classList.add("hidden");

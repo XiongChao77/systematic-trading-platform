@@ -77,6 +77,15 @@ SUPPORTED_BINANCE_DATA_SOURCES = {
 }
 
 
+class StrategyLoggerAdapter(logging.LoggerAdapter):
+    """Include strategy context in text logs as well as structured records."""
+
+    def process(self, msg, kwargs):
+        msg, kwargs = super().process(msg, kwargs)
+        context = " ".join(f"{key}={value}" for key, value in self.extra.items())
+        return f"{msg} | {context}", kwargs
+
+
 class RunnerEventType(Enum):
     CLOSED_CANDLE = auto()
     DATA_CHECK = auto()
@@ -978,7 +987,7 @@ class LiveRunner:
             discovery_connection = self._ctrader_connection(
                 connection_path,
                 "live",
-                logger,
+                self.logger,
             )
             account_id, environment = discovery_connection.resolve_account(config.trader_login)
             logger.info(
@@ -990,7 +999,7 @@ class LiveRunner:
             account_connection = self._ctrader_connection(
                 connection_path,
                 environment,
-                logger,
+                self.logger,
             )
             ctrader_venue = CTraderVenue(
                 connection_path,
@@ -1127,8 +1136,20 @@ class LiveRunner:
                 )
                 continue
 
-            model = self._load_model(spec)
-            feature_generator = self._create_feature_generator(spec)
+            strategy_logger = StrategyLoggerAdapter(
+                self.logger,
+                {
+                    "strategy_id": spec.strategy_id,
+                    "hash": spec.hash_id,
+                    "symbol": spec.base_define.symbol,
+                },
+            )
+            try:
+                model = self._load_model(spec)
+                feature_generator = self._create_feature_generator(spec)
+            except Exception:
+                strategy_logger.exception("Strategy model or feature initialization failed")
+                raise
             market_config = common.MarketDataSourceConfig(
                 **{field.name: getattr(spec.base_define, field.name) for field in fields(common.MarketDataSourceConfig)}
             )
@@ -1144,11 +1165,13 @@ class LiveRunner:
                 grouped_pipelines.append((market_config, feed_pipelines))
             else:
                 feed_pipelines = feed_entry[1]
-            venue = self._venue_factory(spec, self.logger)
+            venue = None
             try:
+                venue = self._venue_factory(spec, strategy_logger)
                 self._validate_ctrader_initial_balance(spec, venue)
-                notifier = self._notify_factory(spec, self.logger)
+                notifier = self._notify_factory(spec, strategy_logger)
                 strategy = self._create_strategy(spec, venue)
+                strategy.logger = strategy_logger
                 self.logger.info(
                     "Strategy created | id=%s hash=%s venue=%s",
                     spec.strategy_id,
@@ -1156,6 +1179,7 @@ class LiveRunner:
                     type(venue).__name__,
                 )
             except Exception:
+                strategy_logger.exception("Strategy venue or decision initialization failed")
                 shutdown = getattr(venue, "shutdown", None)
                 if callable(shutdown):
                     try:
@@ -1445,7 +1469,7 @@ class LiveRunner:
                 )
             except Exception:
                 self.logger.exception(
-                    "Invalid signal dispatch failed | id=%s hash=%s symbol=%s",
+                    "Invalid signal dispatch failed | strategy_id=%s hash=%s symbol=%s",
                     pipeline.spec.strategy_id,
                     pipeline.spec.hash_id,
                     pipeline.spec.base_define.symbol,
@@ -1658,6 +1682,27 @@ class LiveRunner:
                         if self._prediction_callback is not None:
                             self._prediction_callback(pipeline, candle_open_time_ms, latest_prediction.copy())
                         market = _market_view(predicted)
+                    except Exception:
+                        self.logger.exception(
+                            "Market preparation failed; dispatching INVALID | strategy_id=%s hash=%s symbol=%s",
+                            pipeline.spec.strategy_id,
+                            pipeline.spec.hash_id,
+                            pipeline.spec.base_define.symbol,
+                        )
+                        try:
+                            market = self._invalid_market_view(frame)
+                            latest_prediction = pd.Series({"pred": Signal.INVALID.value})
+                        except Exception:
+                            self.logger.exception(
+                                "Invalid market preparation failed; skipping candle | strategy_id=%s hash=%s symbol=%s",
+                                pipeline.spec.strategy_id,
+                                pipeline.spec.hash_id,
+                                pipeline.spec.base_define.symbol,
+                            )
+                            continue
+
+                    # Dispatch only once: strategy state may change before execution fails.
+                    try:
                         candle_open_time_utc = pd.Timestamp(
                             candle_open_time_ms,
                             unit="ms",
@@ -1677,37 +1722,13 @@ class LiveRunner:
                         )
                     except Exception:
                         self.logger.exception(
-                            "Strategy cycle failed; dispatching INVALID | " "id=%s hash=%s symbol=%s",
+                            "Strategy dispatch or recording failed; skipping candle without retry | "
+                            "strategy_id=%s hash=%s symbol=%s open_time_utc=%s",
                             pipeline.spec.strategy_id,
                             pipeline.spec.hash_id,
                             pipeline.spec.base_define.symbol,
+                            _format_utc_ms(candle_open_time_ms),
                         )
-                        try:
-                            market = self._invalid_market_view(frame)
-                            candle_open_time_utc = pd.Timestamp(
-                                candle_open_time_ms,
-                                unit="ms",
-                                tz="UTC",
-                            ).to_pydatetime()
-                            intent = self._dispatch(
-                                pipeline,
-                                market,
-                                candle_open_time_utc,
-                            )
-                            self._record_live_cycle(
-                                pipeline,
-                                pd.Series({"pred": Signal.INVALID.value}),
-                                market,
-                                intent,
-                                candle_open_time_utc,
-                            )
-                        except Exception:
-                            self.logger.exception(
-                                "Fallback INVALID dispatch failed | id=%s hash=%s symbol=%s",
-                                pipeline.spec.strategy_id,
-                                pipeline.spec.hash_id,
-                                pipeline.spec.base_define.symbol,
-                            )
                 self._record_prediction_trace(
                     "record_live",
                     group,

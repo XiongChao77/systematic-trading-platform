@@ -7,6 +7,8 @@ import math
 import os
 import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -14,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any, Iterable
 
 from trade.core.dashboard_base import (
+    collect_dashboard,
     AccountBalance,
     AccountDashboard,
     AccountPosition,
@@ -79,6 +82,64 @@ class _CTraderIsolatedTcpProtocol(TcpProtocol):
         self._send_queue = deque()
         self._send_task = None
         self._lastSendMessageTime = None
+        self._dashboard_queue = deque()
+        self._sent_times = deque()
+        self._dashboard_sent_times = deque()
+
+    def send(self, message, instant=False, clientMsgId=None, isCanceled=None):
+        queued_at = time.monotonic()
+
+        def timed_cancellation_check():
+            canceled = isCanceled is not None and isCanceled()
+            logging.getLogger("trade.ctrader.connection").info(
+                "cTrader API queue timing | request_id=%s queue_wait_ms=%.1f canceled=%s",
+                clientMsgId, (time.monotonic() - queued_at) * 1000, canceled,
+            )
+            return canceled
+
+        result = super().send(
+            message, instant=instant, clientMsgId=clientMsgId,
+            isCanceled=timed_cancellation_check,
+        )
+        if not instant:
+            if str(clientMsgId).startswith("dashboard-"):
+                self._dashboard_queue.append(self._send_queue.pop())
+            else:
+                self._sendStrings()
+        return result
+
+    def connectionMade(self):
+        super().connectionMade()
+        self._send_task.stop()
+        self._send_task.start(0.02)
+
+    def _sendStrings(self):
+        """Drain priority reads/orders first, retaining the SDK's rolling limit."""
+        now = time.monotonic()
+        for timestamps in (self._sent_times, self._dashboard_sent_times):
+            while timestamps and now - timestamps[0] >= 1.0:
+                timestamps.popleft()
+        limit = self.factory.numberOfMessagesToSendPerSecond
+        while len(self._sent_times) < limit:
+            dashboard = not self._send_queue
+            if dashboard:
+                # Leave one request slot per second available for trading.
+                if not self._dashboard_queue or len(self._dashboard_sent_times) >= max(0, limit - 1):
+                    break
+                queue = self._dashboard_queue
+            else:
+                queue = self._send_queue
+            canceled, data = queue.popleft()
+            if canceled is not None and canceled():
+                continue
+            self.sendString(data)
+            self._sent_times.append(now)
+            if dashboard:
+                self._dashboard_sent_times.append(now)
+            self._lastSendMessageTime = datetime.now()
+        if not self._send_queue and not self._dashboard_queue:
+            if self._lastSendMessageTime is None or (datetime.now() - self._lastSendMessageTime).total_seconds() > 20:
+                self.heartbeat()
 
 
 class CTraderOpenApiConnection:
@@ -681,55 +742,77 @@ class CTraderOpenApiConnection:
         client_message_id: str | None = None,
         **fields,
     ):
-        if self._closed:
-            raise RuntimeError("cTrader connection is closed")
-        if not self._connected.wait(self._timeout):
-            raise ConnectionError("cTrader Open API is disconnected")
+        started = time.monotonic()
+        connected_at = submitted_at = None
+        success = False
+        client_message_id = client_message_id or str(uuid.uuid4())
+        try:
+            if self._closed:
+                raise RuntimeError("cTrader connection is closed")
+            if not self._connected.wait(self._timeout):
+                raise ConnectionError("cTrader Open API is disconnected")
 
-        message_class = getattr(self._messages, message_name)
-        message = message_class()
-        self._set_message_fields(message, fields)
-        completed = threading.Event()
-        outcome: dict[str, Any] = {}
+            connected_at = time.monotonic()
+            message_class = getattr(self._messages, message_name)
+            message = message_class()
+            self._set_message_fields(message, fields)
+            completed = threading.Event()
+            outcome: dict[str, Any] = {}
 
-        def send() -> None:
-            deferred = self._client.send(
-                message,
-                clientMsgId=client_message_id,
-                responseTimeoutInSeconds=self._timeout,
+            def send() -> None:
+                nonlocal submitted_at
+                submitted_at = time.monotonic()
+                deferred = self._client.send(
+                    message,
+                    clientMsgId=client_message_id,
+                    responseTimeoutInSeconds=self._timeout,
+                )
+
+                def succeeded(envelope):
+                    try:
+                        outcome["response"] = self._protobuf.extract(envelope)
+                    except Exception as exc:
+                        outcome["error"] = exc
+                    completed.set()
+                    return envelope
+
+                def failed(failure):
+                    outcome["error"] = failure
+                    completed.set()
+                    return None
+
+                deferred.addCallbacks(succeeded, failed)
+
+            self._call_in_reactor(send)
+            if not completed.wait(self._timeout + 1.0):
+                raise TimeoutError(f"Timed out waiting for {message_name}")
+            if "error" in outcome:
+                raise RuntimeError(
+                    f"cTrader request {message_name} failed: {outcome['error']}"
+                )
+            response = outcome["response"]
+            response_name = response.__class__.__name__
+            if response_name.endswith("ErrorRes") or response_name.endswith("ErrorEvent"):
+                raise RuntimeError(
+                    f"cTrader request {message_name} failed: "
+                    f"{getattr(response, 'errorCode', response_name)}: "
+                    f"{getattr(response, 'description', '')}"
+                )
+            success = True
+            return response
+        finally:
+            finished = time.monotonic()
+            self._logger.info(
+                "cTrader API timing | request=%s request_id=%s account=%s thread=%s "
+                "success=%s total_ms=%.1f connection_wait_ms=%.1f "
+                "dispatch_ms=%.1f sdk_round_trip_ms=%.1f",
+                message_name, client_message_id, fields.get("ctidTraderAccountId"),
+                threading.current_thread().name, success, (finished - started) * 1000,
+                ((finished if connected_at is None else connected_at) - started) * 1000,
+                0.0 if connected_at is None else
+                ((finished if submitted_at is None else submitted_at) - connected_at) * 1000,
+                0.0 if submitted_at is None else (finished - submitted_at) * 1000,
             )
-
-            def succeeded(envelope):
-                try:
-                    outcome["response"] = self._protobuf.extract(envelope)
-                except Exception as exc:
-                    outcome["error"] = exc
-                completed.set()
-                return envelope
-
-            def failed(failure):
-                outcome["error"] = failure
-                completed.set()
-                return None
-
-            deferred.addCallbacks(succeeded, failed)
-
-        self._call_in_reactor(send)
-        if not completed.wait(self._timeout + 1.0):
-            raise TimeoutError(f"Timed out waiting for {message_name}")
-        if "error" in outcome:
-            raise RuntimeError(
-                f"cTrader request {message_name} failed: {outcome['error']}"
-            )
-        response = outcome["response"]
-        response_name = response.__class__.__name__
-        if response_name.endswith("ErrorRes") or response_name.endswith("ErrorEvent"):
-            raise RuntimeError(
-                f"cTrader request {message_name} failed: "
-                f"{getattr(response, 'errorCode', response_name)}: "
-                f"{getattr(response, 'description', '')}"
-            )
-        return response
 
     def request(
         self,
@@ -912,6 +995,7 @@ class CTraderVenue(VenueBase, AccountDashboard):
         firm: Firm,
     ):
         self.firm = Firm.parse(firm)
+        self._dashboard_local = threading.local()
         self.logger = logger
         self.label = str(magic)[:100]
         source_symbol = str(symbol).upper()
@@ -1071,8 +1155,36 @@ class CTraderVenue(VenueBase, AccountDashboard):
             raise RuntimeError("cTrader returned invalid account equity")
         return equity
 
+    def _dashboard_request(self, message_name, **fields):
+        pending = getattr(self._dashboard_local, "pending", None)
+        if pending is not None:
+            return pending[message_name].result()
+        return self.api.request(
+            message_name, client_message_id=f"dashboard-{uuid.uuid4()}", **fields,
+        )
+
+    def get_dashboard_position_open_time(self, position):
+        # Reconciliation already supplied the opening time; never repeat that read.
+        return position.opened_at
+
+    def get_dashboard_snapshot(self):
+        # All three reads are independent. Each response is reused by both cards.
+        names = ("ProtoOATraderReq", "ProtoOAGetPositionUnrealizedPnLReq", "ProtoOAReconcileReq")
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ctrader-dashboard") as pool:
+            pending = {
+                name: pool.submit(
+                    self.api.request, name, client_message_id=f"dashboard-{uuid.uuid4()}",
+                    ctidTraderAccountId=self.account_id,
+                ) for name in names
+            }
+            self._dashboard_local.pending = pending
+            try:
+                return collect_dashboard(self.get_dashboard_balance, self.get_dashboard_position)
+            finally:
+                del self._dashboard_local.pending
+
     def get_dashboard_balance(self) -> AccountBalance:
-        trader_response = self.api.request(
+        trader_response = self._dashboard_request(
             "ProtoOATraderReq",
             ctidTraderAccountId=self.account_id,
         )
@@ -1081,7 +1193,7 @@ class CTraderVenue(VenueBase, AccountDashboard):
             trader.balance,
             getattr(trader, "moneyDigits", 0),
         )
-        pnl_response = self.api.request(
+        pnl_response = self._dashboard_request(
             "ProtoOAGetPositionUnrealizedPnLReq",
             ctidTraderAccountId=self.account_id,
         )
@@ -1100,7 +1212,7 @@ class CTraderVenue(VenueBase, AccountDashboard):
 
     def _dashboard_used_margin(self, trader) -> float | None:
         """Aggregate account margin per symbol using the broker's hedge rule."""
-        response = self.api.request(
+        response = self._dashboard_request(
             "ProtoOAReconcileReq",
             ctidTraderAccountId=self.account_id,
         )
@@ -1148,7 +1260,8 @@ class CTraderVenue(VenueBase, AccountDashboard):
         return round(weighted_price / total_volume, self.digits)
 
     def get_dashboard_position(self) -> AccountPosition | None:
-        positions = self._positions()
+        response = self._dashboard_request("ProtoOAReconcileReq", ctidTraderAccountId=self.account_id)
+        positions = self._filter_positions(response)
         if not positions:
             return None
         sides = {int(position.tradeData.tradeSide) for position in positions}
@@ -1173,7 +1286,7 @@ class CTraderVenue(VenueBase, AccountDashboard):
             self.symbol_id,
             is_buy=side_value == self.SELL,
         )
-        pnl_response = self.api.request(
+        pnl_response = self._dashboard_request(
             "ProtoOAGetPositionUnrealizedPnLReq",
             ctidTraderAccountId=self.account_id,
         )
@@ -1228,6 +1341,7 @@ class CTraderVenue(VenueBase, AccountDashboard):
             stop_loss_price=stop_loss_price,
             take_profit_price=take_profit_price,
             components=components,
+            opened_at=self._positions_opened_at(positions),
         )
 
     def _positions(self) -> list[Any]:
@@ -1235,6 +1349,9 @@ class CTraderVenue(VenueBase, AccountDashboard):
             "ProtoOAReconcileReq",
             ctidTraderAccountId=self.account_id,
         )
+        return self._filter_positions(response)
+
+    def _filter_positions(self, response):
         return [
             position
             for position in response.position
@@ -1271,9 +1388,13 @@ class CTraderVenue(VenueBase, AccountDashboard):
         )
 
     def get_last_position_open_time(self):
+        return self._positions_opened_at(self._positions())
+
+    @staticmethod
+    def _positions_opened_at(positions):
         timestamps = [
             int(getattr(position.tradeData, "openTimestamp", 0) or 0)
-            for position in self._positions()
+            for position in positions
         ]
         timestamps = [timestamp for timestamp in timestamps if timestamp > 0]
         if not timestamps:

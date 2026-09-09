@@ -88,6 +88,67 @@ mode, balances, positions, bid/ask, fill history, and private-stream subscriptio
 `--skip-websocket` checks only REST. It does not place a test trade or start a
 strategy. Normal `requests` proxy environment variables can be used for REST.
 
+## Account restriction diagnostics
+
+Use this separate GET-only diagnostic to investigate entry rejections such as
+`40022`. It continues collecting evidence when an individual endpoint fails;
+it does not initialize a live venue, open a WebSocket, or submit/cancel orders.
+
+From the repository root, select the exact strategy from the current live config:
+
+```bash
+.venv/bin/python -m trade.venue.live.bitget.diagnose_account \
+  --config LiveTrading/live_config.json \
+  --strategy-id Doge-bitget-1 \
+  --symbol DOGEUSDT \
+  --output output/bitget-diagnostics/doge-account.json
+```
+
+Repeat `--strategy-id` to check several strategies. All selected keys are tested
+against the explicit `--symbol`; choose strategies for that symbol. Alternatively,
+use `--key-path LiveTrading/bitget/trading7` instead of `--config`.
+Credential paths in the config resolve relative to that config file.
+
+The script reads Classic API authorities (`coow` is futures order write access),
+hashed user/parent identifiers, contract status, and futures account settings.
+`--include-uta` additionally queries UTA API permissions; success alone does not
+establish the account's trading mode. It does not query parent-only subaccount
+status, and it cannot expose the exchange's internal restriction reason.
+
+Reports omit balances, raw UIDs, whitelist addresses and credentials. Reports are
+created with owner-only permissions and existing files are not overwritten.
+Exit code zero means all requested reads succeeded, not that order placement is
+allowed. Missing write permission is recorded in `findings`; `trading_access`
+always remains `unverified`. Current reads cannot reconstruct historical access.
+
+```bash
+.venv/bin/python -m pytest -q trade/venue/live/bitget/test_diagnose_account.py
+```
+
+## Small market round-trip test
+
+The separate `market_round_trip` command checks for an empty symbol position and
+no pending regular or trigger orders. By default it performs only preflight.
+With `--execute`, it submits one market buy with a quote-time notional at most
+10 USDT, rounded down to the quantity step, and immediately market-closes its
+fills. Actual fill notional can differ due to market movement. Do not run it
+alongside another trader using the same account and symbol.
+
+```bash
+.venv/bin/python -m trade.venue.live.bitget.market_round_trip \
+  --key-path LiveTrading/bitget/trading7 \
+  --strategy-id Doge-bitget-1 --symbol DOGEUSDT \
+  --execute \
+  --output output/bitget-diagnostics/market-round-trip.jsonl
+```
+
+This command places real trades and incurs execution costs if filled. It keeps
+the existing account mode and leverage, never retries an entry, and verifies
+positions and pending orders after cleanup. A rejected entry is reported as
+`entry_failed`; `flat=true` means the final check found no position or pending
+orders. `cleanup_unconfirmed` requires investigation. The JSONL report preserves
+the original exchange error chain. Existing output files are not overwritten.
+
 ## API references
 
 - [Request signing](https://www.bitget.com/api-doc/classic/quickStart/intro)

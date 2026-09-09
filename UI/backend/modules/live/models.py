@@ -90,6 +90,7 @@ class StrategySnapshot(StrictModel):
     max_daily_loss_pct: float = Field(ge=0.0, le=1.0)
     max_holding_seconds: float | None = Field(default=None, ge=0.0)
     status: Literal["running", "disabled", "stopped"]
+    dashboard_age_seconds: float | None = Field(default=None, ge=0.0)
     account: AccountSnapshot | None = None
     position: PositionSnapshot | None = None
     latest_signal: SignalSnapshot | None = None

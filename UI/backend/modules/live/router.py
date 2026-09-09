@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from typing import Any
+import logging
+import time
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
 
 from UI.backend.modules.live.models import RunnerSnapshot
 from UI.backend.modules.live.store import (
@@ -13,7 +17,39 @@ from UI.backend.modules.live.store import (
 )
 
 
-router = APIRouter(tags=["live"])
+logger = logging.getLogger("uvicorn.error")
+
+
+class TimedLiveRoute(APIRoute):
+    """Time request validation, handler execution, and response serialization."""
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def timed_handler(request: Request):
+            started = time.monotonic()
+            status = 500
+            try:
+                response = await handler(request)
+                status = response.status_code
+                return response
+            except HTTPException as exc:
+                status = exc.status_code
+                raise
+            except RequestValidationError:
+                status = 422
+                raise
+            finally:
+                logger.info(
+                    "Live API timing | method=%s path=%s status=%s handler_ms=%.1f",
+                    request.method, request.url.path, status,
+                    (time.monotonic() - started) * 1000,
+                )
+
+        return timed_handler
+
+
+router = APIRouter(tags=["live"], route_class=TimedLiveRoute)
 
 
 @router.post("/internal/live/snapshots")

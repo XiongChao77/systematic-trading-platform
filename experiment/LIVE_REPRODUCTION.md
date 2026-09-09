@@ -12,7 +12,7 @@ Check report selection, model files, model types, and feature configurations:
   --live-config LiveTrading/live_config.json --dry-run
 ```
 
-Replay both `long` and `forward` with the model artifacts specified in the live
+Replay only `forward` with the model artifacts specified in the live
 configuration, without retraining or connecting to any live venue:
 
 ```bash
@@ -29,9 +29,9 @@ different settings may legitimately produce different returns. This is an
 offline backtest with the existing simulator, not a simulation of every
 exchange-specific live execution rule.
 
-Use repeated `--strategy-id ID` arguments to select individual strategies and
-`--periods forward` or `--periods long` to limit replay. Without explicit IDs,
-all `run_live=true` entries are selected, including disabled execution entries.
+Use repeated `--strategy-id ID` arguments to select individual strategies.
+Without explicit IDs, all `run_live=true` entries are selected, including
+disabled execution entries.
 An explicit ID may select a `run_live=false` entry for offline testing.
 
 The command regenerates prepared data from the original market configuration,
@@ -55,3 +55,6 @@ and `--atol 1e-8`; missing or nonfinite metrics do not count as a successful
 reproduction. A completed run exits with status 1 if any comparison mismatches
 or fails, while retaining its diagnostic outputs. Preparation/model/data errors
 are distinguished from metric mismatches.
+
+Each strategy immediately logs `PASS` when its forward comparison matches, or
+`FAIL` on a mismatch or error, with its strategy ID and progress count.

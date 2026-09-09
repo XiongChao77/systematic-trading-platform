@@ -1,6 +1,6 @@
 import math
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Optional
@@ -63,6 +63,27 @@ class AccountPosition:
     components: tuple[AccountPositionComponent, ...] = ()
 
 
+@dataclass
+class DashboardSnapshot:
+    account: Optional[AccountBalance] = None
+    position: Optional[AccountPosition] = None
+    account_available: bool = False
+    position_available: bool = False
+    errors: list[dict[str, str]] = field(default_factory=list)
+
+
+def collect_dashboard(balance, position) -> DashboardSnapshot:
+    """Preserve partial dashboard results when either component fails."""
+    snapshot = DashboardSnapshot()
+    for component, collect in (("account", balance), ("position", position)):
+        try:
+            setattr(snapshot, component, collect())
+            setattr(snapshot, f"{component}_available", True)
+        except Exception as exc:
+            snapshot.errors.append({"component": component, "message": str(exc) or type(exc).__name__})
+    return snapshot
+
+
 class AccountDashboard(ABC):
     """
     Read-only account information for logging, monitoring, and frontend display.
@@ -70,6 +91,14 @@ class AccountDashboard(ABC):
     Dashboard methods must not participate in strategy decisions or order
     execution. Failures in this interface should not affect the trading path.
     """
+
+    def get_dashboard_snapshot(self) -> DashboardSnapshot:
+        """Venues may combine independent reads and reuse shared responses."""
+        return collect_dashboard(self.get_dashboard_balance, self.get_dashboard_position)
+
+    def get_dashboard_position_open_time(self, position: AccountPosition) -> Optional[datetime]:
+        """Use timing supplied by the dashboard response where available."""
+        return position.opened_at or self.get_last_position_open_time()
 
     @abstractmethod
     def get_dashboard_balance(self) -> AccountBalance:

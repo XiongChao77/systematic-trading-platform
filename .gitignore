@@ -28,7 +28,13 @@ dow
 tests/*
 .venv/*
 *test*
+!trade/runner/test_live_runner.py
+!trade/monitoring/test_live_monitoring.py
+!trade/monitoring/test_api_timing.py
+!trade/monitoring/test_dashboard_collection.py
 !trade/venue/live/bitget/test_bitget_venue.py
+!trade/venue/live/bitget/test_diagnose_account.py
+!trade/venue/live/bitget/test_market_round_trip.py
 !trade/venue/live/bitget/smoke_test.py
 
 # Local experiment sweeps. Keep the tracked example as the default fallback.

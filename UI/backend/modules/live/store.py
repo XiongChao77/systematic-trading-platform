@@ -136,9 +136,14 @@ class LiveSnapshotStore:
             else max(0.0, (now - runner.last_received_at).total_seconds())
         )
         conflict_runners = self._conflicts.get(state.snapshot.strategy_id)
+        dashboard_age = state.snapshot.dashboard_age_seconds
+        if dashboard_age is not None:
+            dashboard_age += max(0.0, (now - state.received_at).total_seconds())
+        dashboard_fresh = dashboard_age is not None and dashboard_age <= self.stale_seconds
+        payload["dashboard_age_seconds"] = dashboard_age
         available = (
             state.snapshot.status == "stopped"
-            or (runner_available and not conflict_runners)
+            or (runner_available and not conflict_runners and dashboard_fresh)
         )
         payload.update(
             {
@@ -160,11 +165,12 @@ class LiveSnapshotStore:
             payload["errors"] = [
                 *payload.get("errors", []),
                 {
-                    "component": "runner",
+                    "component": "runner" if conflict_runners or not runner_available else "dashboard",
                     "message": (
                         "Strategy is reported by multiple runners"
                         if conflict_runners
-                        else "Runner snapshot is unavailable"
+                        else "Runner snapshot is unavailable" if not runner_available
+                        else "Dashboard data is unavailable or stale"
                     ),
                 },
             ]
@@ -198,6 +204,7 @@ class LiveSnapshotStore:
                         "received_at": item["received_at"],
                         "runner_sequence": item["runner_sequence"],
                         "runner_age_seconds": item["runner_age_seconds"],
+                        "dashboard_age_seconds": item["dashboard_age_seconds"],
                     }
                     for item in items
                 ],

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+
 import hashlib
 import hmac
 import itertools
@@ -21,6 +24,7 @@ import requests
 import websocket
 
 from trade.core.dashboard_base import (
+    collect_dashboard,
     AccountBalance,
     AccountDashboard,
     AccountPosition,
@@ -35,6 +39,7 @@ from trade.core.execution import (
 )
 from trade.core.protocol import OrderType, PositionDir, PositionView
 from trade.core.venue_base import VenueBase
+from trade.monitoring.request_budget import binance_dashboard_budget
 
 
 class BinanceVenue(VenueBase, AccountDashboard):
@@ -70,6 +75,10 @@ class BinanceVenue(VenueBase, AccountDashboard):
         self.timeout = float(timeout)
         self.session = session or requests.Session()
         self._request_lock = threading.RLock()
+        self._dashboard_local = threading.local()
+        self._dashboard_sessions = []
+        self._dashboard_sessions_lock = threading.Lock()
+        self._dashboard_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="binance-dashboard")
         self._protective_order_lock = threading.RLock()
         self._protective_orders: dict[str, dict[str, Any]] = {}
         self._user_stream_enabled = bool(enable_user_stream)
@@ -91,6 +100,7 @@ class BinanceVenue(VenueBase, AccountDashboard):
             if self._user_stream_enabled:
                 self._start_user_stream()
         except Exception:
+            self._dashboard_pool.shutdown(wait=True, cancel_futures=True)
             self._stop_user_stream()
             self.session.close()
             raise
@@ -116,40 +126,72 @@ class BinanceVenue(VenueBase, AccountDashboard):
         *,
         signed: bool = False,
     ) -> Any:
-        with self._request_lock:
-            payload = dict(params or {})
-            if signed:
-                payload.setdefault("recvWindow", 5000)
-                payload["timestamp"] = int(time.time() * 1000)
-                query = urlencode(payload)
-                payload["signature"] = hmac.new(
-                    self.api_secret.encode("utf-8"),
-                    query.encode("utf-8"),
-                    hashlib.sha256,
-                ).hexdigest()
-            response = self.session.request(
-                method,
-                f"{self.BASE_URL}{path}",
-                params=payload if method.upper() in {"GET", "DELETE"} else None,
-                data=payload if method.upper() not in {"GET", "DELETE"} else None,
-                timeout=self.timeout,
-            )
-            try:
-                body = response.json()
-            except ValueError as exc:
-                raise RuntimeError(
-                    f"Binance returned a non-JSON response for {path}: "
-                    f"HTTP {response.status_code}"
-                ) from exc
-            if not response.ok:
-                raise RuntimeError(
-                    f"Binance request failed for {path}: HTTP {response.status_code}, "
-                    f"code={body.get('code')}, message={body.get('msg')}"
+        started = time.monotonic()
+        acquired = request_started = response_received = None
+        response = None
+        success = False
+        dashboard_session = getattr(getattr(self, "_dashboard_local", None), "session", None)
+        dashboard = dashboard_session is not None
+        session = dashboard_session if dashboard else self.session
+        try:
+            if dashboard and method.upper() != "GET":
+                raise RuntimeError("Dashboard transport only accepts read requests")
+            # Header observations include traffic from other accounts on this IP.
+            binance_dashboard_budget.reserve(5 if dashboard else 1, dashboard=dashboard)
+            with nullcontext() if dashboard else self._request_lock:
+                acquired = time.monotonic()
+                payload = dict(params or {})
+                if signed:
+                    payload.setdefault("recvWindow", 5000)
+                    payload["timestamp"] = int(time.time() * 1000)
+                    query = urlencode(payload)
+                    payload["signature"] = hmac.new(
+                        self.api_secret.encode("utf-8"),
+                        query.encode("utf-8"),
+                        hashlib.sha256,
+                    ).hexdigest()
+                request_started = time.monotonic()
+                response = session.request(
+                    method,
+                    f"{self.BASE_URL}{path}",
+                    params=payload if method.upper() in {"GET", "DELETE"} else None,
+                    data=payload if method.upper() not in {"GET", "DELETE"} else None,
+                    timeout=self.timeout,
                 )
-            return body
+                response_received = time.monotonic()
+                binance_dashboard_budget.observe(response.headers, response.status_code)
+                try:
+                    body = response.json()
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"Binance returned a non-JSON response for {path}: "
+                        f"HTTP {response.status_code}"
+                    ) from exc
+                if not response.ok:
+                    raise RuntimeError(
+                        f"Binance request failed for {path}: HTTP {response.status_code}, "
+                        f"code={body.get('code')}, message={body.get('msg')}"
+                    )
+                success = True
+                return body
+        finally:
+            finished = time.monotonic()
+            self.logger.info(
+                "Binance API timing | method=%s endpoint=%s symbol=%s thread=%s "
+                "success=%s status=%s total_ms=%.1f lock_wait_ms=%.1f "
+                "http_ms=%.1f decode_ms=%.1f",
+                method, path, self.symbol, threading.current_thread().name,
+                success, None if response is None else response.status_code,
+                (finished - started) * 1000,
+                ((finished if acquired is None else acquired) - started) * 1000,
+                0.0 if request_started is None else
+                ((finished if response_received is None else response_received) - request_started) * 1000,
+                0.0 if response_received is None else (finished - response_received) * 1000,
+            )
 
     def _load_filters(self) -> tuple[Decimal, Decimal, Decimal]:
         payload = self._request("GET", "/fapi/v1/exchangeInfo")
+        binance_dashboard_budget.configure(payload.get("rateLimits", []))
         symbol_info = next(
             (
                 item
@@ -756,6 +798,23 @@ class BinanceVenue(VenueBase, AccountDashboard):
         if not math.isfinite(equity) or equity <= 0:
             raise RuntimeError("Binance returned invalid account equity")
         return equity
+
+    def _dashboard_read(self, operation):
+        if not hasattr(self._dashboard_local, "session"):
+            session = requests.Session()
+            session.headers.update({"X-MBX-APIKEY": self.api_key})
+            self._dashboard_local.session = session
+            with self._dashboard_sessions_lock:
+                self._dashboard_sessions.append(session)
+        return operation()
+
+    def get_dashboard_snapshot(self):
+        balance = self._dashboard_pool.submit(self._dashboard_read, self.get_dashboard_balance)
+        position = self._dashboard_pool.submit(self._dashboard_read, self.get_dashboard_position)
+        return collect_dashboard(balance.result, position.result)
+
+    def get_dashboard_position_open_time(self, position):
+        return self._dashboard_pool.submit(self._dashboard_read, self.get_last_position_open_time).result()
 
     def get_dashboard_balance(self) -> AccountBalance:
         account = self._request("GET", "/fapi/v3/account", signed=True)
@@ -1556,5 +1615,8 @@ class BinanceVenue(VenueBase, AccountDashboard):
         return result
 
     def shutdown(self):
+        self._dashboard_pool.shutdown(wait=True, cancel_futures=True)
+        for session in self._dashboard_sessions:
+            session.close()
         self._stop_user_stream()
         self.session.close()

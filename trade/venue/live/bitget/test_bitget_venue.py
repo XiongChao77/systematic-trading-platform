@@ -526,6 +526,69 @@ def test_client_ids_are_unique_and_scoped(venue_factory):
     assert venue._order_action(first) is None
 
 
+@pytest.mark.parametrize(
+    ("data", "data_type", "list_type"),
+    [
+        (None, "NoneType", "missing"),
+        ([], "list", "missing"),
+        ({}, "dict", "missing"),
+        ({"entrustedList": None}, "dict", "NoneType"),
+        ({"endId": None}, "dict", "missing"),
+        ({"entrustedList": None, "endId": "123"}, "dict", "NoneType"),
+        ({"entrustedList": "private-order-data"}, "dict", "str"),
+        ({"entrustedList": {}}, "dict", "dict"),
+    ],
+)
+def test_invalid_pagination_reports_types_without_values(
+    venue_factory, monkeypatch, data, data_type, list_type
+):
+    venue = venue_factory()
+    monkeypatch.setattr(venue, "_request", lambda *args, **kwargs: data)
+    with pytest.raises(RuntimeError, match="invalid paginated data") as error:
+        venue._pending_plans()
+    message = str(error.value)
+    assert "/api/v2/mix/order/orders-plan-pending" in message
+    assert "expected data.entrustedList to be a list" in message
+    assert f"data_type={data_type}, list_type={list_type}" in message
+    assert "private-order-data" not in message
+
+
+@pytest.mark.parametrize("end_id", [None, ""])
+def test_startup_accepts_null_pending_plans(venue_factory, monkeypatch, end_id):
+    session = Session()
+    original_request = session.request
+
+    def request(method, url, **kwargs):
+        if urlsplit(url).path.endswith("/orders-plan-pending"):
+            return Response({"entrustedList": None, "endId": end_id})
+        return original_request(method, url, **kwargs)
+
+    monkeypatch.setattr(session, "request", request)
+    venue = venue_factory(session)
+    assert venue._protective_orders == {}
+    assert venue._pending_plans() == []
+
+
+def test_pagination_ends_on_null_page_after_full_page(venue_factory, monkeypatch):
+    venue = venue_factory()
+    monkeypatch.setattr(venue, "PAGE_SIZE", 2)
+    rows = [{"orderId": "3"}, {"orderId": "2"}]
+    pages = [
+        {"entrustedList": rows, "endId": "2"},
+        {"entrustedList": None, "endId": None},
+    ]
+    queries = []
+
+    def request(method, path, params, **kwargs):
+        queries.append(params)
+        return pages.pop(0)
+
+    monkeypatch.setattr(venue, "_request", request)
+    assert venue._pending_plans() == rows
+    assert len(queries) == 2
+    assert queries[1]["idLessThan"] == "2"
+
+
 def test_pagination_does_not_skip_equal_timestamps(venue_factory, monkeypatch):
     venue = venue_factory()
     monkeypatch.setattr(venue, "PAGE_SIZE", 2)
