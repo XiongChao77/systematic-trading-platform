@@ -55,3 +55,4 @@ account*
 !UI/quant-ui/src/modules/backtests/
 !UI/quant-ui/src/modules/backtests/**
 *__pycache__*
+orderbook_output

@@ -11,7 +11,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from dataclasses import replace
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from types import SimpleNamespace
 from typing import Any, Iterable
 
@@ -36,6 +37,11 @@ from ctrader_open_api.messages import (
     OpenApiMessages_pb2,
     OpenApiModelMessages_pb2,
 )
+
+
+class CTraderRequestError(RuntimeError):
+    """An explicit error response from the broker, not a transport failure."""
+
 
 # Binance USDT market-data symbols to FTMO's current cTrader crypto CFD symbols.
 CTRADER_SYMBOL_MAP = {
@@ -793,7 +799,7 @@ class CTraderOpenApiConnection:
             response = outcome["response"]
             response_name = response.__class__.__name__
             if response_name.endswith("ErrorRes") or response_name.endswith("ErrorEvent"):
-                raise RuntimeError(
+                raise CTraderRequestError(
                     f"cTrader request {message_name} failed: "
                     f"{getattr(response, 'errorCode', response_name)}: "
                     f"{getattr(response, 'description', '')}"
@@ -1071,6 +1077,10 @@ class CTraderVenue(VenueBase, AccountDashboard):
                     f"got {response_trader_login}"
                 )
         self._limited_risk = bool(getattr(trader, "isLimitedRisk", False))
+        self._margin_according_to_gsl = self._limited_risk and (
+            int(getattr(trader, "limitedRiskMarginCalculationStrategy", 0))
+            == OpenApiModelMessages_pb2.ACCORDING_TO_GSL
+        )
 
         symbols = self.api.request(
             "ProtoOASymbolsListReq",
@@ -1471,6 +1481,42 @@ class CTraderVenue(VenueBase, AccountDashboard):
     def normalize_order_quantity(self, size: float) -> float:
         return self._normalize_volume(float(size)) / 100.0
 
+    def get_available_margin(self) -> float:
+        """Return fresh account-wide free margin in the deposit currency."""
+        balance = self.get_dashboard_balance()
+        if balance.used_margin is None:
+            raise RuntimeError("cTrader account used margin is unavailable")
+        equity, used = float(balance.equity), float(balance.used_margin)
+        if not math.isfinite(equity) or not math.isfinite(used) or used < 0:
+            raise RuntimeError("cTrader returned invalid account margin values")
+        return max(0.0, equity - used)
+
+    def get_expected_margin(self, size: float, *, is_buy: bool) -> float:
+        """Ask the broker for the quantity's margin in the deposit currency."""
+        if self._margin_according_to_gsl:
+            raise RuntimeError(
+                "cTrader expected-margin API does not support GSL-based margin"
+            )
+        volume = self._normalize_volume(float(size))
+        response = self.api.request(
+            "ProtoOAExpectedMarginReq",
+            ctidTraderAccountId=self.account_id,
+            symbolId=self.symbol_id,
+            volume=[volume],
+        )
+        if int(response.ctidTraderAccountId) != self.account_id:
+            raise RuntimeError("cTrader margin response account does not match")
+        matching = [item for item in response.margin if int(item.volume) == volume]
+        field = "buyMargin" if is_buy else "sellMargin"
+        if len(matching) != 1 or not CTraderOpenApiConnection._message_has_field(
+            matching[0], field
+        ):
+            raise RuntimeError("cTrader expected margin is missing or ambiguous")
+        margin = self._money(getattr(matching[0], field), response.moneyDigits)
+        if not math.isfinite(margin) or margin < 0:
+            raise RuntimeError("cTrader returned invalid expected margin")
+        return margin
+
     @staticmethod
     def _normalized_order_status(raw_status: int) -> str:
         return {
@@ -1801,6 +1847,43 @@ class CTraderVenue(VenueBase, AccountDashboard):
             )
         return tuple(orders)
 
+    def _relative_protection_distance(self, price: float, percentage: float) -> int:
+        """Quantize to symbol ticks before encoding in 1/100000 price units."""
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError("Protection reference price must be positive and finite")
+        if not math.isfinite(percentage) or percentage <= 0:
+            raise ValueError("Protection percentage must be positive and finite")
+        if self.digits < 0:
+            raise ValueError("Symbol price digits must be nonnegative")
+        # The protocol cannot represent prices finer than five decimal places.
+        digits = min(self.digits, 5)
+        ticks = (
+            Decimal(str(price)) * Decimal(str(percentage)) * (10 ** digits)
+        ).to_integral_value(rounding=ROUND_HALF_UP)
+        return max(1, int(ticks)) * (10 ** (5 - digits))
+
+    def _build_execution_report(self, **kwargs):
+        report = super()._build_execution_report(**kwargs)
+        result = kwargs["result"]
+        responses = result if isinstance(result, list) else [result]
+        errors = [
+            response.rejection_reason
+            for response in responses
+            if getattr(response, "rejection_reason", "")
+        ]
+        if errors:
+            report = replace(
+                report,
+                reason="; ".join(errors),
+                submitted_quantity=sum(
+                    order.submitted_quantity for order in report.orders
+                ),
+                accepted_at_utc=(
+                    None if len(errors) == len(responses) else report.accepted_at_utc
+                ),
+            )
+        return report
+
     def submit_order(
         self,
         size,
@@ -1834,12 +1917,12 @@ class CTraderVenue(VenueBase, AccountDashboard):
             else round(price, self.digits)
         )
         relative_stop = (
-            max(1, int(round(reference_price * stop_loss_pct * 100_000)))
+            self._relative_protection_distance(reference_price, stop_loss_pct)
             if stop_loss_pct is not None
             else None
         )
         relative_take_profit = (
-            max(1, int(round(reference_price * take_profit_pct * 100_000)))
+            self._relative_protection_distance(reference_price, take_profit_pct)
             if take_profit_pct is not None
             else None
         )
@@ -1882,14 +1965,34 @@ class CTraderVenue(VenueBase, AccountDashboard):
                         "cTrader limited-risk account requires a symbol with guaranteed stops"
                     )
                 fields["guaranteedStopLoss"] = True
-            if client_message_id:
-                response = self.api.request(
-                    "ProtoOANewOrderReq",
-                    client_message_id=client_message_id,
-                    **fields,
+            try:
+                if client_message_id:
+                    response = self.api.request(
+                        "ProtoOANewOrderReq",
+                        client_message_id=client_message_id,
+                        **fields,
+                    )
+                else:
+                    response = self.api.request("ProtoOANewOrderReq", **fields)
+            except CTraderRequestError as exc:
+                self.logger.error(
+                    "cTrader entry rejected | execution_id=%s reason=%s",
+                    execution_id,
+                    exc,
                 )
-            else:
-                response = self.api.request("ProtoOANewOrderReq", **fields)
+                responses.append(
+                    SimpleNamespace(
+                        rejection_reason=str(exc),
+                        order=SimpleNamespace(
+                            orderId="",
+                            clientOrderId=client_message_id,
+                            tradeData=SimpleNamespace(volume=volume),
+                            orderStatus=OpenApiModelMessages_pb2.ORDER_STATUS_REJECTED,
+                        ),
+                    )
+                )
+                # Keep earlier child fills and stop submitting further batches.
+                break
             responses.append(response)
             if index + 1 < len(batches):
                 time.sleep(max(0.0, float(interval_ms) / 1000.0))

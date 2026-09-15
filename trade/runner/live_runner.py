@@ -353,6 +353,70 @@ class StrategyPipeline:
                 quantity,
                 float(observation.account.equity),
             )
+        margin_quantity = quantity
+        logger = getattr(self.venue, "logger", None) or logging.getLogger("trade.live")
+        try:
+            available_margin = float(self.venue.get_available_margin())
+            is_buy = intent.target_dir == PositionDir.POSITIVE
+
+            def expected_margin(size: float) -> float:
+                value = float(self.venue.get_expected_margin(size, is_buy=is_buy))
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError("Expected margin must be finite and nonnegative")
+                return value
+
+            if not math.isfinite(available_margin) or available_margin < 0:
+                raise ValueError("Available margin must be finite and nonnegative")
+            required_margin = expected_margin(quantity)
+            final_margin = required_margin
+            # Re-query after scaling: dynamic leverage can make margin nonlinear.
+            for _ in range(16):
+                if final_margin <= available_margin:
+                    break
+                if available_margin == 0:
+                    quantity, final_margin = 0.0, 0.0
+                    break
+                candidate = quantity * available_margin / final_margin
+                try:
+                    normalized = float(self.venue.normalize_order_quantity(candidate))
+                except ValueError:
+                    quantity, final_margin = 0.0, 0.0
+                    break
+                if not math.isfinite(normalized) or not 0 < normalized <= candidate:
+                    raise ValueError("Invalid normalized margin quantity")
+                if normalized >= quantity:
+                    raise ValueError("Margin scaling did not reduce quantity")
+                quantity = normalized
+                final_margin = expected_margin(quantity)
+            if final_margin > available_margin:
+                raise RuntimeError("Could not verify an affordable quantity after scaling")
+        except Exception:
+            logger.exception(
+                "cTrader margin precheck failed; entry rejected | strategy_id=%s symbol=%s",
+                self.spec.strategy_id, self.spec.base_define.symbol,
+            )
+            return self._rejected_entry(intent, "margin_precheck_failed")
+
+        if quantity < margin_quantity:
+            message = (
+                f"WARNING | event=margin_quantity_reduced | runner_id={self.runner_id} | "
+                f"strategy_id={self.spec.strategy_id} | symbol={self.spec.base_define.symbol} | "
+                f"account_id={self.venue.get_execution_account_id()} | "
+                f"required_margin={required_margin:.8g} | available_margin={available_margin:.8g} | "
+                f"final_required_margin={final_margin:.8g} | margin_currency=account_deposit | "
+                f"original_quantity={original_quantity:.8g} | precheck_quantity={margin_quantity:.8g} | "
+                f"submitted_quantity={quantity:.8g} | scale_ratio={quantity / margin_quantity:.8g}"
+            )
+            logger.warning(message)
+            # Every reduced entry needs a warning, not one warning per process.
+            try:
+                if self.notifier is None or not self.notifier.send(message):
+                    logger.error("Margin warning delivery failed | %s", message)
+            except Exception:
+                logger.exception("Margin warning delivery failed | %s", message)
+        if quantity == 0:
+            return self._rejected_entry(intent, "insufficient_margin_below_minimum")
+
         intent.order_qty = quantity
         report = self.venue.execute_action(intent)
         if isinstance(report, ExecutionReport) and quantity < original_quantity:
