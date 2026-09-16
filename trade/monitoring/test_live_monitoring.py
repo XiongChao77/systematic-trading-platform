@@ -1,12 +1,16 @@
 """Deterministic checks for monitoring delay diagnostics."""
 
 import logging
+import threading
 from unittest.mock import Mock
 
 import pytest
 import requests
 
 from trade.monitoring import live_monitoring as monitoring
+from trade.core.dashboard_base import collect_dashboard
+from trade.core.dashboard_reads import DashboardReads
+from trade.monitoring.live_monitoring import LiveMonitoringConfig, LiveMonitoringService, LiveStateRegistry
 
 
 def test_component_timing_includes_failed_calls(monkeypatch):
@@ -56,3 +60,60 @@ def test_publish_distinguishes_collection_and_upload_delay(monkeypatch, caplog, 
         assert f"accepted={not upload_fails}" in caplog.text
         service.publish_once()
     assert caplog.text.count("Live monitoring timing") == 2
+
+
+def test_blocked_read_preserves_other_results_and_never_queues_retries():
+    reads = DashboardReads()
+    release = threading.Event()
+    calls = []
+
+    def blocked():
+        calls.append(True)
+        release.wait()
+        return "late result"
+
+    try:
+        result = reads.batch({"account": blocked, "position": lambda: None}, timeout=0.05)
+        snapshot = collect_dashboard(lambda: result("account"), lambda: result("position"))
+        assert not snapshot.account_available
+        assert snapshot.position_available and snapshot.position is None
+        assert "timed out" in snapshot.errors[0]["message"]
+        result = reads.batch({"account": blocked, "position": lambda: "fresh"}, timeout=0.05)
+        with pytest.raises(TimeoutError, match="still in progress"):
+            result("account")
+        assert result("position") == "fresh"
+        assert len(calls) == 1
+    finally:
+        release.set()
+    reads._pending["account"].result(timeout=1)
+    assert reads.batch({"account": lambda: "new"})("account") == "new"
+
+
+def test_publisher_preserves_notification_received_during_upload():
+    registry = LiveStateRegistry([])
+    service = LiveMonitoringService(
+        LiveMonitoringConfig("http://test/snapshots", "test", publish_interval_seconds=30),
+        registry, logger=logging.getLogger("test"), session=Mock(),
+    )
+    published = []
+    done = threading.Event()
+
+    def publish():
+        published.append(True)
+        if len(published) == 1:
+            registry.updated.set()
+        else:
+            service._stop_event.set()
+            done.set()
+
+    service.publish_once = publish
+    registry.updated.set()
+    worker = threading.Thread(target=service._run, daemon=True)
+    worker.start()
+    try:
+        assert done.wait(1)
+        assert len(published) == 2
+    finally:
+        service._stop_event.set()
+        registry.updated.set()
+        worker.join(1)

@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Optional
+from functools import cached_property
+
+from trade.core.dashboard_reads import DashboardReads
 
 
 class PositionSide(Enum):
@@ -92,9 +95,14 @@ class AccountDashboard(ABC):
     execution. Failures in this interface should not affect the trading path.
     """
 
+    @cached_property
+    def dashboard_reads(self):
+        return DashboardReads()
+
     def get_dashboard_snapshot(self) -> DashboardSnapshot:
         """Venues may combine independent reads and reuse shared responses."""
-        return collect_dashboard(self.get_dashboard_balance, self.get_dashboard_position)
+        result = self.dashboard_reads.batch({"account": self.get_dashboard_balance, "position": self.get_dashboard_position})
+        return collect_dashboard(lambda: result("account"), lambda: result("position"))
 
     def get_dashboard_position_open_time(self, position: AccountPosition) -> Optional[datetime]:
         """Use timing supplied by the dashboard response where available."""
