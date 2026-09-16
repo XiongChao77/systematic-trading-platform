@@ -1,16 +1,26 @@
 # Live dashboard collection
 
-The publisher sends the latest cached state every `publish_interval_seconds`
-(one second in `LiveTrading/live_config.json`). Each strategy has one background
-collector, with at most one refresh in progress. A blocked collector cannot
-hold up another strategy or the publisher. Trading never reads this dashboard
-cache.
+Each strategy collects every `publish_interval_seconds`. Completed collection
+updates the cache and signals a single publisher thread. Notifications coalesce;
+there is no separate publishing timer. Failed collection also signals publication.
+A publication timeout does not block collection; the next notification retries
+with the latest state.
+
+Independent reads run in separate reusable daemon workers with a shared one-second
+collection deadline. A timed-out read is marked unavailable; other results survive.
+Until that read returns, later cycles skip it instead of creating queued requests.
+Late results are discarded, and the next cycle starts a fresh read. A 1.25-second
+outer deadline also protects against a blocked venue snapshot implementation.
+Position-opening-time enrichment has its own one-second deadline. Trading never
+reads this dashboard cache. Component errors are displayed without turning failed
+position reads into an empty position or zero PnL.
 
 Every strategy carries `dashboard_age_seconds`, measured from the beginning of
 its collection with a monotonic clock. The backend adds elapsed time since
-receipt and expires data after five seconds. Repeated heartbeats do not renew
-old account values. Missing or stale data affects only that strategy. Runner
-heartbeats retain their separate five-second expiry.
+receipt for backend diagnostics. Dashboard age does not control page availability.
+Page availability expires five seconds after the last received runner publication;
+repeated publications renew availability without resetting the recorded data age.
+Missing account or position data retains its component-level availability flag.
 
 ## Exchange requests
 
@@ -23,7 +33,7 @@ heartbeats retain their separate five-second expiry.
   messages per second per connection; this remains below cTrader's documented
   50 non-historical requests per second and within its five historical requests
   per second limit. Heartbeats retain the SDK's immediate handling.
-- Binance fetches account and position data concurrently through two dedicated,
+- Binance fetches account and position data concurrently through dedicated,
   reusable dashboard sessions. These reads, including dashboard position-history
   reconstruction, do not acquire the trading HTTP lock. Existing stream-derived
   protective-order prices are reused. Account and position responses remain

@@ -242,6 +242,18 @@ function mountDetail(container, context, strategyId) {
     ]);
     renderPositionComponents(container, positionAvailable, position);
 
+    for (const component of ["account", "position"]) {
+      const card = container.querySelector(`[data-card="${component}"]`);
+      card.querySelector('[data-role="collection-error"]')?.remove();
+      if (payload.available && !payload.availability?.[component]) {
+        const error = (payload.errors ?? []).find((item) => item.component === component || item.component === "dashboard");
+        const message = document.createElement("p");
+        message.dataset.role = "collection-error";
+        message.textContent = error ? `Fetch failed: ${error.message}` : "Data unavailable";
+        card.append(message);
+      }
+    }
+
     const signalAvailable = payload.available && payload.availability?.latest_signal;
     const signal = payload.latest_signal;
     renderCard(container, "signal", signalAvailable, [
@@ -295,6 +307,7 @@ function renderCard(container, name, available, fields) {
   const card = container.querySelector(`[data-card="${name}"]`);
   card.classList.toggle("unavailable", !available);
   card.querySelector("dl").innerHTML = fields.map(([label, value, tone = "", description = ""]) => {
+    if (!available) value = null;
     const unavailable = value === null || value === undefined || value === "—";
     const classes = [unavailable ? "value-unavailable" : "", unavailable ? "" : tone]
       .filter(Boolean)

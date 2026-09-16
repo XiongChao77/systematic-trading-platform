@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 
 import hashlib
@@ -78,7 +77,6 @@ class BinanceVenue(VenueBase, AccountDashboard):
         self._dashboard_local = threading.local()
         self._dashboard_sessions = []
         self._dashboard_sessions_lock = threading.Lock()
-        self._dashboard_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="binance-dashboard")
         self._protective_order_lock = threading.RLock()
         self._protective_orders: dict[str, dict[str, Any]] = {}
         self._user_stream_enabled = bool(enable_user_stream)
@@ -100,7 +98,6 @@ class BinanceVenue(VenueBase, AccountDashboard):
             if self._user_stream_enabled:
                 self._start_user_stream()
         except Exception:
-            self._dashboard_pool.shutdown(wait=True, cancel_futures=True)
             self._stop_user_stream()
             self.session.close()
             raise
@@ -176,7 +173,8 @@ class BinanceVenue(VenueBase, AccountDashboard):
                 return body
         finally:
             finished = time.monotonic()
-            self.logger.info(
+            self.logger.log(
+                logging.DEBUG if success else logging.INFO,
                 "Binance API timing | method=%s endpoint=%s symbol=%s thread=%s "
                 "success=%s status=%s total_ms=%.1f lock_wait_ms=%.1f "
                 "http_ms=%.1f decode_ms=%.1f",
@@ -809,12 +807,15 @@ class BinanceVenue(VenueBase, AccountDashboard):
         return operation()
 
     def get_dashboard_snapshot(self):
-        balance = self._dashboard_pool.submit(self._dashboard_read, self.get_dashboard_balance)
-        position = self._dashboard_pool.submit(self._dashboard_read, self.get_dashboard_position)
-        return collect_dashboard(balance.result, position.result)
+        result = self.dashboard_reads.batch({
+            "account": lambda: self._dashboard_read(self.get_dashboard_balance),
+            "position": lambda: self._dashboard_read(self.get_dashboard_position),
+        })
+        return collect_dashboard(lambda: result("account"), lambda: result("position"))
 
     def get_dashboard_position_open_time(self, position):
-        return self._dashboard_pool.submit(self._dashboard_read, self.get_last_position_open_time).result()
+        result = self.dashboard_reads.batch({"position_timing": lambda: self._dashboard_read(self.get_last_position_open_time)})
+        return result("position_timing")
 
     def get_dashboard_balance(self) -> AccountBalance:
         account = self._request("GET", "/fapi/v3/account", signed=True)
@@ -1615,7 +1616,6 @@ class BinanceVenue(VenueBase, AccountDashboard):
         return result
 
     def shutdown(self):
-        self._dashboard_pool.shutdown(wait=True, cancel_futures=True)
         for session in self._dashboard_sessions:
             session.close()
         self._stop_user_stream()

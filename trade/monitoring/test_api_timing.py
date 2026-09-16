@@ -57,7 +57,7 @@ def test_ctrader_logs_queue_time_without_changing_cancellation(monkeypatch, capl
     protocol.heartbeat = Mock()
     protocol.send(b"test", clientMsgId="dashboard-request-1", isCanceled=lambda: canceled)
     clock[0] = 0.9
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.DEBUG):
         protocol._sendStrings()
     assert "request_id=dashboard-request-1 queue_wait_ms=900.0" in caplog.text
     assert f"canceled={canceled}" in caplog.text

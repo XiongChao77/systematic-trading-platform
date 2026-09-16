@@ -75,10 +75,11 @@ def test_slow_strategy_does_not_block_publishing_or_fast_strategy():
     assert [p["sequence"] for p in published] == list(range(1, len(published) + 1))
 
 
-def test_heartbeat_does_not_refresh_stale_dashboard_data():
+@pytest.mark.parametrize("dashboard_age", [None, 4.0, 60.0])
+def test_page_availability_tracks_publication_without_resetting_data_age(dashboard_age):
     registry = LiveStateRegistry([pipeline("test", Dashboard())])
     strategy = registry._snapshot_pipeline(registry._pipelines["test"], None, "running")
-    strategy["dashboard_age_seconds"] = 4.0
+    strategy["dashboard_age_seconds"] = dashboard_age
     now = datetime.now(UTC)
     store = LiveSnapshotStore()
     store._now = lambda: now
@@ -88,14 +89,22 @@ def test_heartbeat_does_not_refresh_stale_dashboard_data():
     ))
     store.update(payload)
     assert store.strategy("test")["available"]
-    now += timedelta(seconds=2)
-    assert not store.strategy("test")["available"]
-    payload.strategies[0].dashboard_age_seconds = 6.0
+    now += timedelta(seconds=3)
+    snapshot = store.strategy("test")
+    assert snapshot["available"]
+    assert snapshot["dashboard_age_seconds"] == (None if dashboard_age is None else dashboard_age + 3)
+    payload.strategies[0].dashboard_age_seconds = snapshot["dashboard_age_seconds"]
     payload.sequence = 2
     store.update(payload)
     assert store.strategies()["runners"]["available"] == 1
+    assert store.strategies()["items"][0]["balance"] == 100
+    now += timedelta(seconds=5)
+    assert store.strategy("test")["available"]
+    now += timedelta(milliseconds=1)
+    snapshot = store.strategy("test")
+    assert not snapshot["available"]
+    assert snapshot["errors"][-1]["component"] == "runner"
     assert store.strategies()["items"][0]["balance"] is None
-    payload.strategies[0].dashboard_age_seconds = 0.2
     payload.sequence = 3
     store.update(payload)
     assert store.strategy("test")["available"]
@@ -224,3 +233,42 @@ def test_dashboard_weight_budget_reserves_trading_capacity(monkeypatch):
     with pytest.raises(RuntimeError):
         budget.reserve(5, dashboard=True)
     budget.reserve(5, dashboard=False)
+
+
+def test_failed_collection_still_publishes_and_recovers():
+    venue = Dashboard()
+    original = venue.get_dashboard_snapshot
+    attempts = []
+
+    def snapshot():
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise RuntimeError("Snapshot failed")
+        return original()
+
+    venue.get_dashboard_snapshot = snapshot
+    registry = LiveStateRegistry([pipeline("test", venue)])
+    published = []
+    recovered = threading.Event()
+    session = Mock()
+
+    def post(*args, json, **kwargs):
+        item = json["strategies"][0]
+        published.append(item)
+        if item["availability"]["account"]:
+            recovered.set()
+        return NS(raise_for_status=lambda: None, json=lambda: {"accepted": True})
+
+    session.post.side_effect = post
+    service = LiveMonitoringService(
+        LiveMonitoringConfig("http://test/snapshots", "test", publish_interval_seconds=0.1),
+        registry, logger=logging.getLogger("test"), session=session,
+    )
+    try:
+        service.start()
+        assert recovered.wait(2)
+        assert not published[0]["availability"]["account"]
+        assert published[0]["errors"][0]["component"] == "dashboard"
+        assert published[-1]["availability"]["account"]
+    finally:
+        service.stop()

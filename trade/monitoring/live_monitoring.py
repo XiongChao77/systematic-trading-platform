@@ -17,6 +17,7 @@ import requests
 
 from data_process import common
 from trade.core.dashboard_base import AccountDashboard
+from trade.core.dashboard_reads import DashboardReads
 
 
 def _utc_now() -> datetime:
@@ -67,6 +68,9 @@ class LiveStateRegistry:
         self._snapshots: dict[str, tuple[float, dict[str, Any]]] = {}
         self._collection_stop = threading.Event()
         self._collectors: list[threading.Thread] = []
+        self.updated = threading.Event()
+        self._timing_reads = DashboardReads()
+        self._snapshot_reads = DashboardReads()
 
     def record_cycle(
         self,
@@ -114,10 +118,15 @@ class LiveStateRegistry:
                     if self._collection_stop.is_set():
                         return
                     self._snapshots[strategy_id] = (started, snapshot)
-            except Exception:
+            except Exception as exc:
                 logger.exception("Dashboard collection failed | strategy=%s", strategy_id)
+                snapshot = self._snapshot_pipeline(pipeline, None, "running", collect=False)
+                snapshot["errors"].append({"component": "dashboard", "message": str(exc) or type(exc).__name__})
+                with self._lock:
+                    self._snapshots[strategy_id] = (started, snapshot)
+            self.updated.set()
             elapsed = time.monotonic() - started
-            logger.info("Dashboard collection timing | strategy=%s total_ms=%.1f", strategy_id, elapsed * 1000)
+            logger.debug("Dashboard collection timing | strategy=%s total_ms=%.1f", strategy_id, elapsed * 1000)
             self._collection_stop.wait(max(0.0, interval_seconds - elapsed))
 
     def stop_collection(self) -> None:
@@ -172,7 +181,8 @@ class LiveStateRegistry:
 
         opened_at = dashboard_position.opened_at
         if opened_at is None:
-            opened_at = pipeline.venue.get_dashboard_position_open_time(dashboard_position)
+            result = self._timing_reads.batch({strategy_id: lambda: pipeline.venue.get_dashboard_position_open_time(dashboard_position)})
+            opened_at = result(strategy_id)
         if opened_at is None:
             return None
         if not isinstance(opened_at, datetime):
@@ -235,7 +245,10 @@ class LiveStateRegistry:
             errors.append({"component": "dashboard", "message": f"{type(venue).__name__} has no dashboard interface"})
         elif collect:
             with self._time_component(pipeline.spec.strategy_id, "dashboard"):
-                dashboard = venue.get_dashboard_snapshot()
+                result = self._snapshot_reads.batch(
+                    {pipeline.spec.strategy_id: venue.get_dashboard_snapshot}, timeout=1.25,
+                )
+                dashboard = result(pipeline.spec.strategy_id)
             account = None if dashboard.account is None else asdict(dashboard.account)
             dashboard_position = dashboard.position
             account_available = dashboard.account_available
@@ -341,10 +354,11 @@ class LiveMonitoringService:
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
-            cycle_started_at = time.monotonic()
+            self.registry.updated.wait()
+            self.registry.updated.clear()
+            if self._stop_event.is_set():
+                break
             self.publish_once()
-            elapsed = time.monotonic() - cycle_started_at
-            self._stop_event.wait(max(0.0, self.config.publish_interval_seconds - elapsed))
 
     def _payload(self, status: str) -> dict[str, Any]:
         self._sequence += 1
@@ -421,7 +435,7 @@ class LiveMonitoringService:
                 )
             )
             self.logger.log(
-                logging.WARNING if elapsed > self.config.publish_interval_seconds else logging.INFO,
+                logging.WARNING if elapsed > self.config.publish_interval_seconds else logging.DEBUG,
                 "Live monitoring timing | runner=%s accepted=%s total=%.3fs "
                 "collect=%.3fs post=%.3fs interval=%.3fs components=[%s]",
                 self.config.runner_id, accepted, elapsed, collect_seconds,
@@ -430,6 +444,7 @@ class LiveMonitoringService:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self.registry.updated.set()
         self.registry.stop_collection()
         if self._thread is not None:
             thread = self._thread

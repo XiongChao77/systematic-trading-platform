@@ -1978,7 +1978,7 @@ def main() -> None:
     os.makedirs(log_dir, exist_ok=True)
     logger, _ = common.setup_session_logger(
         log_file_path=os.path.join(log_dir, "session.log"),
-        console_level=logging.DEBUG,
+        console_level=logging.INFO,
     )
     logging.getLogger("urllib3").setLevel(logging.INFO)
     logging.getLogger("websocket").setLevel(logging.INFO)

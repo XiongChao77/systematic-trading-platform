@@ -8,7 +8,6 @@ import os
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from datetime import datetime, timezone
 from dataclasses import replace
@@ -97,7 +96,7 @@ class _CTraderIsolatedTcpProtocol(TcpProtocol):
 
         def timed_cancellation_check():
             canceled = isCanceled is not None and isCanceled()
-            logging.getLogger("trade.ctrader.connection").info(
+            logging.getLogger("trade.ctrader.connection").debug(
                 "cTrader API queue timing | request_id=%s queue_wait_ms=%.1f canceled=%s",
                 clientMsgId, (time.monotonic() - queued_at) * 1000, canceled,
             )
@@ -808,7 +807,8 @@ class CTraderOpenApiConnection:
             return response
         finally:
             finished = time.monotonic()
-            self._logger.info(
+            self._logger.log(
+                logging.DEBUG if success and client_message_id.startswith("dashboard-") else logging.INFO,
                 "cTrader API timing | request=%s request_id=%s account=%s thread=%s "
                 "success=%s total_ms=%.1f connection_wait_ms=%.1f "
                 "dispatch_ms=%.1f sdk_round_trip_ms=%.1f",
@@ -1168,7 +1168,7 @@ class CTraderVenue(VenueBase, AccountDashboard):
     def _dashboard_request(self, message_name, **fields):
         pending = getattr(self._dashboard_local, "pending", None)
         if pending is not None:
-            return pending[message_name].result()
+            return pending(message_name)
         return self.api.request(
             message_name, client_message_id=f"dashboard-{uuid.uuid4()}", **fields,
         )
@@ -1180,18 +1180,16 @@ class CTraderVenue(VenueBase, AccountDashboard):
     def get_dashboard_snapshot(self):
         # All three reads are independent. Each response is reused by both cards.
         names = ("ProtoOATraderReq", "ProtoOAGetPositionUnrealizedPnLReq", "ProtoOAReconcileReq")
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ctrader-dashboard") as pool:
-            pending = {
-                name: pool.submit(
-                    self.api.request, name, client_message_id=f"dashboard-{uuid.uuid4()}",
-                    ctidTraderAccountId=self.account_id,
-                ) for name in names
-            }
-            self._dashboard_local.pending = pending
-            try:
-                return collect_dashboard(self.get_dashboard_balance, self.get_dashboard_position)
-            finally:
-                del self._dashboard_local.pending
+        self._dashboard_local.pending = self.dashboard_reads.batch({
+            name: lambda name=name: self.api.request(
+                name, client_message_id=f"dashboard-{uuid.uuid4()}",
+                ctidTraderAccountId=self.account_id,
+            ) for name in names
+        })
+        try:
+            return collect_dashboard(self.get_dashboard_balance, self.get_dashboard_position)
+        finally:
+            del self._dashboard_local.pending
 
     def get_dashboard_balance(self) -> AccountBalance:
         trader_response = self._dashboard_request(
