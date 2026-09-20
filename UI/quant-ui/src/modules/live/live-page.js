@@ -41,6 +41,7 @@ function mountList(container, context) {
                 <th>Venue</th>
                 <th>Symbol</th>
                 <th>Interval</th>
+                <th>Init Balance</th>
                 <th>Balance</th>
                 <th title="Used position margin / account equity">Margin utilization</th>
                 <th>Unrealized PnL</th>
@@ -104,6 +105,7 @@ function mountList(container, context) {
           <td>${escapeHtml(formatVenue(item.venue))}</td>
           <td>${escapeHtml(item.symbol)}</td>
           <td>${escapeHtml(item.interval)}</td>
+          <td>${formatMoney(item.initial_balance)}</td>
           <td class="${balanceAvailable ? "" : "value-unavailable"}">${balanceAvailable ? formatMoney(item.balance) : "—"}</td>
           <td class="${margin === "—" ? "value-unavailable" : ""}">${margin}</td>
           <td class="${pnlAvailable ? tone : "value-unavailable"}">${pnl}</td>
@@ -212,6 +214,8 @@ function mountDetail(container, context, strategyId) {
 
     const accountAvailable = payload.available && payload.availability?.account;
     renderCard(container, "account", accountAvailable, [
+      ["Init Balance", formatMoney(payload.initial_balance), "", "", true],
+      ["Start time", formatDateTime(payload.start_time), "", "", true],
       ["Balance", formatMoney(payload.account?.balance)],
       ["Equity", formatMoney(payload.account?.equity)],
       ["Used margin", formatMoney(accountAvailable ? payload.account?.used_margin : null)],
@@ -306,8 +310,8 @@ function detailCard(name, title) {
 function renderCard(container, name, available, fields) {
   const card = container.querySelector(`[data-card="${name}"]`);
   card.classList.toggle("unavailable", !available);
-  card.querySelector("dl").innerHTML = fields.map(([label, value, tone = "", description = ""]) => {
-    if (!available) value = null;
+  card.querySelector("dl").innerHTML = fields.map(([label, value, tone = "", description = "", persistent = false]) => {
+    if (!available && !persistent) value = null;
     const unavailable = value === null || value === undefined || value === "—";
     const classes = [unavailable ? "value-unavailable" : "", unavailable ? "" : tone]
       .filter(Boolean)

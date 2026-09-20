@@ -1,6 +1,7 @@
 """Regression tests for single-dispatch handling of closed candles."""
 
 import logging
+import queue
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -51,6 +52,7 @@ def candle_runner(monkeypatch):
                 get_daily_reset_date=Mock(side_effect=lambda timestamp: timestamp.date()),
             ),
             _execute_intent=Mock(return_value=None),
+            notifier=Mock(send=Mock(return_value=True)),
         )
 
     frame = pd.DataFrame([{"open_time_ms_utc": OPEN_TIME_MS, "close": 0.1}])
@@ -70,6 +72,129 @@ def candle_runner(monkeypatch):
     runner._predict = Mock(side_effect=lambda pipeline, frame: frame.assign(pred=Signal.POSITIVE.value))
     monkeypatch.setattr(live_runner, "_prepare_market_frame", lambda frame, base_define: frame.copy())
     return runner, group, first, second
+
+
+@pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("delivery", [True, False, RuntimeError("Telegram unavailable")])
+def test_data_check_warns_without_blocking_missing_event(candle_runner, monkeypatch, caplog, missing, delivery):
+    runner, group, first, second = candle_runner
+    runner._closed = False
+    runner.feed_groups = [group]
+    runner._events = queue.Queue()
+    runner._data_check_timer_interval_ms = INTERVAL_MS
+    runner._next_min_expect_candle_open_time = OPEN_TIME_MS
+    fire_time = OPEN_TIME_MS + INTERVAL_MS + live_runner.DATA_CHECK_TIMER_DELAY_MS
+    runner._next_data_check_timer_time_ms = fire_time
+    runner._start_data_check_timer = Mock()
+    monkeypatch.setattr(live_runner.time, "time", lambda: fire_time / 1000)
+    if not missing:
+        group.last_processed_candle_open_time_ms = OPEN_TIME_MS
+
+    def send(message):
+        # Telegram must not delay enqueuing the event or scheduling the next check.
+        assert runner._events.qsize() == 1
+        runner._start_data_check_timer.assert_called_once()
+        assert "WARNING: Candle missing at DATA_CHECK" in message
+        assert f"check_delay_ms={live_runner.DATA_CHECK_TIMER_DELAY_MS}" in message
+        if isinstance(delivery, Exception):
+            raise delivery
+        return delivery
+
+    first.notifier.send.side_effect = send
+    runner._data_check_timer_handler()
+    assert first.notifier.send.call_count == int(missing)
+    assert second.notifier.send.call_count == int(missing)
+    assert runner._events.qsize() == int(missing)
+    if missing:
+        event = runner._events.get_nowait()
+        assert event.e_type == live_runner.RunnerEventType.DATA_CHECK
+        assert event.timestamp_ms == OPEN_TIME_MS
+        if delivery is not True:
+            assert "DATA_CHECK warning delivery failed" in caplog.text
+
+
+@pytest.mark.parametrize("age, skipped", [(29.999, False), (30.0, False), (30.001, True)])
+def test_market_age_includes_queue_wait_and_uses_strict_limit(candle_runner, monkeypatch, caplog, age, skipped):
+    runner, group, first, second = candle_runner
+    monkeypatch.setattr(live_runner.time, "monotonic", lambda: 100.0 + age)
+    event = live_runner.RunnerEvent(
+        live_runner.RunnerEventType.CLOSED_CANDLE, group, OPEN_TIME_MS,
+        received_monotonic=100.0,
+    )
+    assert runner._process_event(event)
+    for item in (first, second):
+        assert item._execute_intent.call_count == (0 if skipped else 1)
+        assert item.notifier.send.call_count == (1 if skipped else 0)
+        assert len(item.strategy.observations) == (0 if skipped else 1)
+    if skipped:
+        assert "receipt_age_seconds=30.001" in caplog.text
+        runner._predict.assert_not_called()
+    assert not runner._process_event(event)
+    assert first.notifier.send.call_count == (1 if skipped else 0)
+
+
+@pytest.mark.parametrize("stage", ["prediction", "account", "strategy", "previous_execution"])
+def test_market_age_is_rechecked_after_slow_work(candle_runner, monkeypatch, stage):
+    runner, group, first, second = candle_runner
+    clock = [100.0]
+    monkeypatch.setattr(live_runner.time, "monotonic", lambda: clock[0])
+
+    def delayed(result):
+        def call(*args, **kwargs):
+            clock[0] = 130.001
+            return result(*args, **kwargs) if callable(result) else result
+        return call
+
+    if stage == "prediction":
+        runner._predict.side_effect = delayed(lambda pipeline, frame: frame.assign(pred=Signal.POSITIVE.value))
+    elif stage == "account":
+        first.venue.get_account_equity.side_effect = delayed(100)
+    elif stage == "strategy":
+        first.strategy._process = delayed(first.strategy._process)
+    else:
+        first._execute_intent.side_effect = delayed(None)
+    event = live_runner.RunnerEvent(
+        live_runner.RunnerEventType.CLOSED_CANDLE, group, OPEN_TIME_MS,
+        received_monotonic=100.0,
+    )
+    runner._process_event(event)
+    assert first._execute_intent.call_count == (1 if stage == "previous_execution" else 0)
+    second._execute_intent.assert_not_called()
+    second.notifier.send.assert_called_once()
+    assert not second.strategy.observations
+    if stage in {"prediction", "account"}:
+        assert not first.strategy.observations
+
+
+@pytest.mark.parametrize("delivery", [False, RuntimeError("Telegram unavailable")])
+def test_notification_failure_does_not_allow_expired_execution(candle_runner, monkeypatch, caplog, delivery):
+    runner, group, first, second = candle_runner
+    monkeypatch.setattr(live_runner.time, "monotonic", lambda: 131.0)
+    if isinstance(delivery, Exception):
+        first.notifier.send.side_effect = delivery
+    else:
+        first.notifier.send.return_value = delivery
+    runner._process_event(live_runner.RunnerEvent(
+        live_runner.RunnerEventType.CLOSED_CANDLE, group, OPEN_TIME_MS,
+        received_monotonic=100.0,
+    ))
+    first._execute_intent.assert_not_called()
+    second._execute_intent.assert_not_called()
+    second.notifier.send.assert_called_once()
+    assert "Market age warning delivery failed" in caplog.text
+
+
+def test_expired_market_cannot_execute_through_invalid_cache_path(candle_runner, monkeypatch):
+    runner, group, first, second = candle_runner
+    group.feed.get_latest_data.return_value = None
+    monkeypatch.setattr(live_runner.time, "monotonic", lambda: 131.0)
+    runner._process_event(live_runner.RunnerEvent(
+        live_runner.RunnerEventType.CLOSED_CANDLE, group, OPEN_TIME_MS,
+        received_monotonic=100.0,
+    ))
+    first._execute_intent.assert_not_called()
+    second._execute_intent.assert_not_called()
+    first.notifier.send.assert_called_once()
 
 
 @pytest.mark.parametrize("failure_stage", ["execution", "strategy", "recording"])

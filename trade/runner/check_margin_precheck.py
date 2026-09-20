@@ -56,6 +56,7 @@ def execute(pipeline, **kwargs):
 
 
 def test_sufficient_margin_keeps_quantity(pipeline):
+    pipeline.venue.get_available_margin.return_value = 1200
     result = execute(pipeline)
     assert result.submitted_quantity == 100
     pipeline.notifier.send.assert_not_called()
@@ -65,15 +66,16 @@ def test_reduction_rechecks_and_warns_each_entry(pipeline, caplog):
     pipeline.venue.get_available_margin.return_value = 253.17
     with caplog.at_level(logging.WARNING):
         result = execute(pipeline)
+        pipeline.notifier.send.assert_called_once()
         execute(pipeline)
     assert result.requested_quantity == 100
-    assert result.submitted_quantity == 25.31
+    assert result.submitted_quantity == 22.78
     assert pipeline.notifier.send.call_count == 2
     message = pipeline.notifier.send.call_args.args[0]
-    for text in ("strategy_id=strategy-7", "required_margin=1000", "available_margin=253.17", "scale_ratio=0.2531"):
+    for text in ("strategy_id=strategy-7", "required_margin=1000", "available_margin=253.17", "margin_limit=227.853", "max_margin_ratio=0.9", "scale_ratio=0.2278"):
         assert text in message
         assert text in caplog.text
-    assert pipeline.venue.get_expected_margin.call_args.args == (25.31,)
+    assert pipeline.venue.get_expected_margin.call_args.args == (22.78,)
 
 
 def test_nonlinear_margin_is_requeried(pipeline):
@@ -82,7 +84,7 @@ def test_nonlinear_margin_is_requeried(pipeline):
     result = execute(pipeline)
     assert result.status == "accepted"
     assert result.submitted_quantity < 18.18
-    assert 100 + result.submitted_quantity * 10 <= 200
+    assert 100 + result.submitted_quantity * 10 <= 180
 
 
 @pytest.mark.parametrize("available", [0, 5])
@@ -107,7 +109,7 @@ def test_invalid_precheck_never_submits(pipeline):
 def test_notification_failure_does_not_restore_oversized_order(pipeline):
     pipeline.venue.get_available_margin.return_value = 200
     pipeline.notifier.send.side_effect = RuntimeError("Telegram unavailable")
-    assert execute(pipeline).submitted_quantity == 20
+    assert execute(pipeline).submitted_quantity == 18
 
 
 def test_close_bypasses_margin_precheck(pipeline):
@@ -146,3 +148,12 @@ def test_free_margin_subtracts_used_margin_and_rejects_missing_values():
     venue.get_dashboard_balance.return_value.used_margin = None
     with pytest.raises(RuntimeError, match="unavailable"):
         venue.get_available_margin()
+
+
+@pytest.mark.parametrize("quantity, submitted", [(89, 89), (90, 90), (91, 90), (100, 90)])
+def test_margin_reserve_boundary(pipeline, quantity, submitted):
+    result = execute(pipeline, order_qty=quantity)
+    assert result.requested_quantity == quantity
+    assert result.submitted_quantity == submitted
+    assert pipeline.notifier.send.call_count == int(quantity > submitted)
+    assert pipeline.venue.get_expected_margin.call_args.args == (submitted,)

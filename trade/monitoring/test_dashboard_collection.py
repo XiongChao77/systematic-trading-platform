@@ -42,6 +42,25 @@ def pipeline(name, venue):
     ))
 
 
+def test_initial_state_reaches_list_and_detail_without_live_account_data():
+    item = pipeline("test", Dashboard())
+    item.initial_balance = 200
+    item.start_time = "2026-09-07T13:00:39.848Z"
+    registry = LiveStateRegistry([item])
+    strategy = registry._snapshot_pipeline(item, None, "running", collect=False)
+    now = datetime.now(UTC)
+    store = LiveSnapshotStore()
+    store.update(RunnerSnapshot.model_validate(dict(
+        runner_id="runner", runner_instance_id="instance", runner_started_at=now,
+        sent_at=now, sequence=1, strategies=[strategy],
+    )))
+    assert store.strategies()["items"][0]["initial_balance"] == 200
+    detail = store.strategy("test")
+    assert detail["initial_balance"] == 200
+    assert datetime.fromisoformat(detail["start_time"]) == datetime.fromisoformat(item.start_time)
+    assert not detail["availability"]["account"]
+
+
 def test_slow_strategy_does_not_block_publishing_or_fast_strategy():
     release = threading.Event()
     slow = Dashboard(release)

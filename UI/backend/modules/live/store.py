@@ -193,6 +193,7 @@ class LiveSnapshotStore:
                         "venue": item["venue"],
                         "symbol": item["symbol"],
                         "interval": item["interval"],
+                        "initial_balance": item["initial_balance"],
                         "balance": self._balance(item),
                         "margin_utilization": self._margin_utilization(item),
                         "unrealized_pnl": self._unrealized_pnl(item),

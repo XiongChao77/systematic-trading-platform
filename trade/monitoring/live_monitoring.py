@@ -300,6 +300,8 @@ class LiveStateRegistry:
             "venue": venue_name,
             "symbol": pipeline.spec.base_define.symbol,
             "interval": pipeline.spec.base_define.interval,
+            "initial_balance": getattr(pipeline, "initial_balance", None),
+            "start_time": getattr(pipeline, "start_time", None),
             "risk_per_trade_pct": risk_per_trade_pct,
             "max_daily_loss_pct": max_daily_loss_pct,
             "max_holding_seconds": max_holding_seconds,

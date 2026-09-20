@@ -48,6 +48,7 @@ from trade.core.protocol import (
 )
 from trade.core.execution import ExecutionEvent, ExecutionReport
 from trade.runner.config import BrokerConfig
+from trade.runner.initial_state import initialize_strategies
 from trade.monitoring.live_monitoring import (
     LiveMonitoringConfig,
     LiveMonitoringService,
@@ -96,6 +97,7 @@ class RunnerEvent:
     e_type: RunnerEventType
     group: FeedGroup
     timestamp_ms: int
+    received_monotonic: float = field(default_factory=time.monotonic)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -203,10 +205,13 @@ class StrategyPipeline:
     runner_id: str = "live-runner"
     enable: bool = True
     notifier: Notify | None = None
+    initial_balance: float | None = None
+    start_time: str | None = None
     notification_keys: set[str] = field(default_factory=set, repr=False)
 
     PROFIT_TARGET_OVERSHOOT_MULTIPLIER: ClassVar[float] = 1.02
     ROUND_TRIP_COMMISSION_SIDES: ClassVar[float] = 2.0
+    MAX_MARGIN_RATIO: ClassVar[float] = 0.9
 
     def __post_init__(self) -> None:
         if not isinstance(self.enable, bool):
@@ -367,16 +372,17 @@ class StrategyPipeline:
 
             if not math.isfinite(available_margin) or available_margin < 0:
                 raise ValueError("Available margin must be finite and nonnegative")
+            margin_limit = available_margin * self.MAX_MARGIN_RATIO
             required_margin = expected_margin(quantity)
             final_margin = required_margin
             # Re-query after scaling: dynamic leverage can make margin nonlinear.
             for _ in range(16):
-                if final_margin <= available_margin:
+                if final_margin <= margin_limit:
                     break
-                if available_margin == 0:
+                if margin_limit == 0:
                     quantity, final_margin = 0.0, 0.0
                     break
-                candidate = quantity * available_margin / final_margin
+                candidate = quantity * margin_limit / final_margin
                 try:
                     normalized = float(self.venue.normalize_order_quantity(candidate))
                 except ValueError:
@@ -388,7 +394,7 @@ class StrategyPipeline:
                     raise ValueError("Margin scaling did not reduce quantity")
                 quantity = normalized
                 final_margin = expected_margin(quantity)
-            if final_margin > available_margin:
+            if final_margin > margin_limit:
                 raise RuntimeError("Could not verify an affordable quantity after scaling")
         except Exception:
             logger.exception(
@@ -403,6 +409,7 @@ class StrategyPipeline:
                 f"strategy_id={self.spec.strategy_id} | symbol={self.spec.base_define.symbol} | "
                 f"account_id={self.venue.get_execution_account_id()} | "
                 f"required_margin={required_margin:.8g} | available_margin={available_margin:.8g} | "
+                f"margin_limit={margin_limit:.8g} | max_margin_ratio={self.MAX_MARGIN_RATIO:.8g} | "
                 f"final_required_margin={final_margin:.8g} | margin_currency=account_deposit | "
                 f"original_quantity={original_quantity:.8g} | precheck_quantity={margin_quantity:.8g} | "
                 f"submitted_quantity={quantity:.8g} | scale_ratio={quantity / margin_quantity:.8g}"
@@ -442,7 +449,8 @@ class FeedGroup:
         return f"{self.market_config.symbol}_{self.market_config.interval}"
 
 
-DATA_CHECK_TIMER_DELAY_MS = 5000
+DATA_CHECK_TIMER_DELAY_MS = 10000
+MAX_MARKET_RECEIPT_AGE_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -1332,6 +1340,7 @@ class LiveRunner:
     def _data_check_timer_handler(self):
         if self._closed:
             return
+        notifications = []
         now_ms = int(time.time() * 1000)
         drift_ms = now_ms - self._next_data_check_timer_time_ms
         if abs(drift_ms) > 100:
@@ -1396,7 +1405,22 @@ class LiveRunner:
                         timestamp_ms=expected_open_time_ms,
                     )
                 )
+                for pipeline in group.pipelines:
+                    if not pipeline.enable:
+                        continue
+                    message = (
+                        "WARNING: Candle missing at DATA_CHECK | "
+                        f"strategy_id={pipeline.spec.strategy_id} hash={pipeline.spec.hash_id} "
+                        f"symbol={group.market_config.symbol} interval={group.market_config.interval} "
+                        f"expected_open_time_utc={_format_utc_ms(expected_open_time_ms)} "
+                        f"last_processed_open_time_utc={_format_utc_ms(last_processed_candle_open_time_ms)} "
+                        f"check_delay_ms={DATA_CHECK_TIMER_DELAY_MS} lag_ms={lag_ms}"
+                    )
+                    notifications.append((pipeline, message))
         self._start_data_check_timer()
+        # Queue every missing candle and schedule the next check before network I/O.
+        for pipeline, message in notifications:
+            self._send_warning(pipeline, message, "DATA_CHECK")
 
     def initialize(self) -> None:
         if self._closed:
@@ -1436,6 +1460,12 @@ class LiveRunner:
                     "Live prediction trace started | files=%s",
                     self._prediction_trace.paths,
                 )
+
+        if self.output_dir is not None:
+            initialize_strategies(
+                os.path.join(os.path.dirname(self.output_dir), "initial.json"),
+                self.strategy_pipelines,
+            )
 
         for group in self.feed_groups:
             group.feed.start(
@@ -1486,7 +1516,10 @@ class LiveRunner:
         )
         return predicted
 
-    def _dispatch_invalid_to_group(self, group: FeedGroup, candle_open_time_ms: int):
+    def _dispatch_invalid_to_group(
+        self, group: FeedGroup, candle_open_time_ms: int,
+        received_monotonic: float | None = None,
+    ):
         try:
             frame = group.feed.get_latest_data()
         except Exception:
@@ -1505,6 +1538,8 @@ class LiveRunner:
         for pipeline in group.pipelines:
             if not bool(getattr(pipeline, "enable", True)):
                 continue
+            if self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
+                continue
             try:
                 observation = Observation(
                     market=market,
@@ -1513,7 +1548,11 @@ class LiveRunner:
                     candle_open_time_utc=candle_open_time_utc,
                     daily_reset_date=pipeline.venue.get_daily_reset_date(candle_open_time_utc),
                 )
+                if self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
+                    continue
                 intent = pipeline.strategy.process(observation)
+                if self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
+                    continue
                 execution_report = pipeline._execute_intent(observation, intent)
                 self._record_execution(pipeline, execution_report)
                 self._record_live_cycle(
@@ -1539,12 +1578,46 @@ class LiveRunner:
                     pipeline.spec.base_define.symbol,
                 )
 
+    def _send_warning(self, pipeline: StrategyPipeline, message: str, category: str) -> None:
+        try:
+            notifier = pipeline.notifier
+            if notifier is None or not notifier.send(message):
+                self.logger.error("%s warning delivery failed | strategy_id=%s", category, pipeline.spec.strategy_id)
+        except Exception:
+            self.logger.exception("%s warning delivery failed | strategy_id=%s", category, pipeline.spec.strategy_id)
+
+    def _skip_expired_market(
+        self,
+        pipeline: StrategyPipeline,
+        candle_open_time_utc: datetime,
+        received_monotonic: float | None,
+    ) -> bool:
+        if received_monotonic is None:
+            return False
+        age_seconds = time.monotonic() - received_monotonic
+        if age_seconds <= MAX_MARKET_RECEIPT_AGE_SECONDS:
+            return False
+        message = (
+            "WARNING: Strategy execution skipped because market data is too old | "
+            f"strategy_id={pipeline.spec.strategy_id} hash={pipeline.spec.hash_id} "
+            f"symbol={pipeline.spec.base_define.symbol} "
+            f"candle_open_time_utc={candle_open_time_utc.isoformat()} "
+            f"receipt_age_seconds={age_seconds:.3f} "
+            f"limit_seconds={MAX_MARKET_RECEIPT_AGE_SECONDS:g}"
+        )
+        self.logger.warning(message)
+        self._send_warning(pipeline, message, "Market age")
+        return True
+
     def _dispatch(
         self,
         pipeline: StrategyPipeline,
         market: MarketView,
         candle_open_time_utc: datetime,
-    ) -> TradeIntent:
+        received_monotonic: float | None = None,
+    ) -> TradeIntent | None:
+        if self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
+            return None
         observation = Observation(
             market=market,
             position=pipeline.venue.get_current_state(),
@@ -1552,7 +1625,11 @@ class LiveRunner:
             candle_open_time_utc=candle_open_time_utc,
             daily_reset_date=pipeline.venue.get_daily_reset_date(candle_open_time_utc),
         )
+        if self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
+            return None
         intent = pipeline.strategy.process(observation)
+        if self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
+            return None
         execution_report = pipeline._execute_intent(observation, intent)
         self._record_execution(pipeline, execution_report)
         self.logger.info(
@@ -1701,6 +1778,7 @@ class LiveRunner:
         group: FeedGroup,
         last_processed_candle_open_time_ms,
         candle_open_time_ms: int,
+        received_monotonic: float | None = None,
     ) -> None:
         expected_open_time_ms = last_processed_candle_open_time_ms + group.interval_ms
         if candle_open_time_ms > expected_open_time_ms:
@@ -1722,7 +1800,7 @@ class LiveRunner:
                 group.market_config.interval,
                 _format_utc_ms(candle_open_time_ms),
             )
-            self._dispatch_invalid_to_group(group, candle_open_time_ms)
+            self._dispatch_invalid_to_group(group, candle_open_time_ms, received_monotonic)
         else:
             if frame.empty or int(frame.iloc[-1]["open_time_ms_utc"]) != candle_open_time_ms:
                 self.logger.error(
@@ -1731,11 +1809,14 @@ class LiveRunner:
                     group.market_config.interval,
                     _format_utc_ms(candle_open_time_ms),
                 )
-                self._dispatch_invalid_to_group(group, candle_open_time_ms)
+                self._dispatch_invalid_to_group(group, candle_open_time_ms, received_monotonic)
             else:
                 trace_predictions: dict[str, pd.Series] = {}
+                candle_open_time_utc = pd.Timestamp(candle_open_time_ms, unit="ms", tz="UTC").to_pydatetime()
                 for pipeline in group.pipelines:
                     if not bool(getattr(pipeline, "enable", True)):
+                        continue
+                    if self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
                         continue
                     try:
                         prepared = _prepare_market_frame(frame, pipeline.spec.base_define)
@@ -1767,16 +1848,14 @@ class LiveRunner:
 
                     # Dispatch only once: strategy state may change before execution fails.
                     try:
-                        candle_open_time_utc = pd.Timestamp(
-                            candle_open_time_ms,
-                            unit="ms",
-                            tz="UTC",
-                        ).to_pydatetime()
                         intent = self._dispatch(
                             pipeline,
                             market,
                             candle_open_time_utc,
+                            received_monotonic,
                         )
+                        if intent is None:
+                            continue
                         self._record_live_cycle(
                             pipeline,
                             latest_prediction,
@@ -1821,6 +1900,7 @@ class LiveRunner:
                 event.group,
                 last_processed_candle_open_time_ms,
                 event.timestamp_ms,
+                event.received_monotonic,
             )
         elif event.e_type == RunnerEventType.DATA_CHECK:
             self._dispatch_invalid_to_group(

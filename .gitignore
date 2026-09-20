@@ -29,6 +29,7 @@ tests/*
 .venv/*
 *test*
 !trade/runner/test_live_runner.py
+!trade/runner/test_initial_state.py
 !trade/monitoring/test_live_monitoring.py
 !trade/monitoring/test_api_timing.py
 !trade/monitoring/test_dashboard_collection.py

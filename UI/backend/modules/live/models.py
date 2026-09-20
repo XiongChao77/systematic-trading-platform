@@ -86,6 +86,8 @@ class StrategySnapshot(StrictModel):
     venue: str = Field(min_length=1)
     symbol: str = Field(min_length=1)
     interval: str = Field(min_length=1)
+    initial_balance: float | None = Field(default=None, ge=0.0)
+    start_time: AwareDatetime | None = None
     risk_per_trade_pct: float = Field(ge=0.0, le=1.0)
     max_daily_loss_pct: float = Field(ge=0.0, le=1.0)
     max_holding_seconds: float | None = Field(default=None, ge=0.0)
