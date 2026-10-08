@@ -139,7 +139,7 @@ def round_trip(venue, emit, *, notional=Decimal("10"), execute=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--key-path", required=True)
-    parser.add_argument("--strategy-id", required=True)
+    parser.add_argument("--instance-id", required=True)
     parser.add_argument("--symbol", default="DOGEUSDT")
     parser.add_argument(
         "--execute",
@@ -157,7 +157,7 @@ def main():
         def emit(event, data):
             row = {
                 "time_utc": datetime.now(timezone.utc).isoformat(),
-                "strategy_id": args.strategy_id,
+                "instance_id": args.instance_id,
                 "symbol": args.symbol,
                 "event": event,
                 "data": data,

@@ -55,19 +55,35 @@ router = APIRouter(tags=["live"], route_class=TimedLiveRoute)
 @router.post("/internal/live/snapshots")
 async def publish_snapshot(payload: RunnerSnapshot) -> dict[str, Any]:
     try:
-        return live_snapshot_store.update(payload)
+        result = live_snapshot_store.update(payload)
+        return result
     except LiveSnapshotConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/api/live/strategies")
-async def strategies() -> dict[str, Any]:
+async def strategies(viewer_id: str = "") -> dict[str, Any]:
+    if viewer_id:
+        live_snapshot_store.watch(viewer_id)
     return live_snapshot_store.strategies()
 
 
-@router.get("/api/live/strategies/{strategy_id}")
-async def strategy_detail(strategy_id: str) -> dict[str, Any]:
-    strategy = live_snapshot_store.strategy(strategy_id)
+@router.get("/api/live/strategies/{instance_id}")
+async def strategy_detail(instance_id: str, viewer_id: str = "") -> dict[str, Any]:
+    strategy = live_snapshot_store.strategy(instance_id)
     if strategy is None:
         raise HTTPException(status_code=404, detail="Live strategy not found")
+    if viewer_id:
+        live_snapshot_store.watch(viewer_id, instance_id)
     return strategy
+
+
+@router.delete("/api/live/viewers/{viewer_id}")
+async def release_viewer(viewer_id: str) -> dict[str, bool]:
+    live_snapshot_store.unwatch(viewer_id)
+    return {"released": True}
+
+
+@router.get("/internal/live/demand/{runner_id}")
+def monitoring_demand(runner_id: str, version: int = -1) -> dict[str, Any]:
+    return live_snapshot_store.wait_for_demand(runner_id, version)

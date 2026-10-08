@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 from trade.core.protocol import Firm, OrderType, PositionView
 from trade.core.protocol import TradeIntent, ActionType, PositionDir
+from trade.core.execution_status import execution_status
 from trade.core.execution import (
     ExecutionEvent,
     ExecutionFill,
@@ -231,22 +232,12 @@ class VenueBase:
         )
         order_statuses = {order.status for order in orders}
         filled_quantity = sum(fill.quantity for fill in fills)
-        if fills:
-            status = (
-                "filled"
-                if filled_quantity + 1e-12 >= submitted_quantity
-                else "partially_filled"
-            )
-        elif "rejected" in order_statuses:
-            status = "rejected"
-        elif order_statuses == {"filled"}:
-            status = "filled"
-        elif "partially_filled" in order_statuses:
-            status = "partially_filled"
-        elif "accepted" in order_statuses:
-            status = "accepted"
-        else:
-            status = "submitted"
+        status = execution_status(
+            [order.status for order in orders], submitted_quantity, filled_quantity
+        )
+        # This is a response snapshot. Receipt alone does not prove acceptance.
+        if not (order_statuses & {"accepted", "partially_filled", "filled"} or fills):
+            accepted_at_utc = None
         return ExecutionReport(
             execution_id=execution_id,
             order_role=order_role,

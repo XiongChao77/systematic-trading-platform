@@ -12,23 +12,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterable
 
-from trade.recording.execution_trace import LiveExecutionTraceRecorder
+from trade.core.execution_status import execution_status, order_status, TERMINAL_STATUSES
+from trade.recording.execution_trace import LiveExecutionTraceRecorder, SCHEMA_VERSION
 
 _INTERNAL_SOURCE = "__source_path"
-_STATUS_RANK = {
-    "unknown": 0,
-    "submitting": 1,
-    "submitted": 2,
-    "accepted": 3,
-    "replaced": 4,
-    "partially_filled": 5,
-    "cancel_rejected": 5,
-    "cancelled": 6,
-    "expired": 6,
-    "rejected": 6,
-    "filled": 7,
-}
-
 
 def _float(value: object) -> float | None:
     if value in (None, ""):
@@ -67,6 +54,8 @@ def _earliest_time(*values: object) -> str:
 
 
 def _scope(row: dict[str, str]) -> str:
+    if row.get("trader_login"):
+        return f"trader_login:{row['trader_login']}"
     account_id = row.get("account_id", "")
     if account_id:
         return f"account:{account_id}"
@@ -74,7 +63,7 @@ def _scope(row: dict[str, str]) -> str:
         (
             "strategy",
             row.get("runner_id", ""),
-            row.get("strategy_id", ""),
+            row.get("instance_id", ""),
         )
     )
 
@@ -98,15 +87,15 @@ def _external_key(
 
 class _UnionFind:
     def __init__(self) -> None:
-        self.parents: dict[str, str] = {}
+        self.parents: dict[tuple[str, ...], tuple[str, ...]] = {}
 
-    def find(self, value: str) -> str:
+    def find(self, value: tuple[str, ...]) -> tuple[str, ...]:
         parent = self.parents.setdefault(value, value)
         if parent != value:
             self.parents[value] = self.find(parent)
         return self.parents[value]
 
-    def union(self, left: str, right: str) -> None:
+    def union(self, left: tuple[str, ...], right: tuple[str, ...]) -> None:
         left_root = self.find(left)
         right_root = self.find(right)
         if left_root == right_root:
@@ -134,7 +123,7 @@ def _legacy_identity(path: Path, row: dict[str, str]) -> dict[str, str]:
         "schema_version": "1",
         "runner_id": _runner_id_from_filename(path),
         "run_id": _run_id_from_path(path),
-        "strategy_id": row.get("strategy_id", ""),
+        "instance_id": row.get("instance_id", ""),
         "strategy_hash": row.get("strategy_hash", ""),
         "venue": row.get("venue", ""),
         "account_id": "",
@@ -226,7 +215,7 @@ def _discover(
         except ValueError:
             pass
         for kind in discovered:
-            if path.name.endswith(f"_{kind}.csv"):
+            if path.name == f"{kind}.csv" or path.name.endswith(f"_{kind}.csv"):
                 discovered[kind].append(path)
                 break
     return discovered
@@ -258,35 +247,71 @@ def _load_rows(
     return rows, legacy_files
 
 
+def _normalize_order_metadata(rows):
+    """Use real order/deal identity to repair sparse response observations."""
+    sides = {}
+    client_orders = defaultdict(set)
+    for kind in ("orders", "fills"):
+        for row in rows[kind]:
+            order = _external_key(row, "order_id", "order")
+            if order and row.get("side"):
+                sides[order] = row["side"]
+    for values in rows.values():
+        for row in values:
+            order = _external_key(row, "order_id", "order")
+            if order in sides:
+                row["side"] = sides[order]
+            client = _external_key(row, "client_order_id", "client_order")
+            if client and order:
+                client_orders[client + (row.get("side", ""),)].add(row["order_id"])
+    for values in rows.values():
+        for row in values:
+            client = _external_key(row, "client_order_id", "client_order")
+            candidates = client_orders.get(client + (row.get("side", ""),), set()) if client else set()
+            if not row.get("order_id") and len(candidates) == 1:
+                row["order_id"] = next(iter(candidates))
+
+
+def _separate_protection_orders(rows):
+    """Separate opposite-side protection fills attached to an entry report."""
+    reports = {_execution_key(row): row for row in rows["executions"]}
+    for kind in ("orders", "fills", "events"):
+        for row in rows[kind]:
+            report = reports.get(_execution_key(row))
+            if (report and row.get("side") and report.get("side")
+                    and row["side"] != report["side"]):
+                identifier = row.get("order_id") or row.get("client_order_id") or row.get("deal_id")
+                if identifier:
+                    row["execution_id"] += f":protection:{identifier}"
+                    row["order_role"] = "exit"
+
+
 def _link_execution_ids(rows: dict[str, list[dict[str, str]]]) -> _UnionFind:
     union_find = _UnionFind()
-    identifiers: dict[tuple[str, ...], str] = {}
+    identifiers = {}
     for kind in ("executions", "orders", "fills", "events"):
         for row in rows[kind]:
-            execution_id = row.get("execution_id", "")
-            if not execution_id:
+            if not row.get("execution_id"):
                 continue
-            union_find.find(execution_id)
-            keys = [
-                _external_key(row, "order_id", "order"),
-                _external_key(row, "client_order_id", "client_order"),
-                _external_key(row, "deal_id", "deal"),
-            ]
+            node = _execution_key(row) + (row.get("side", ""),)
+            union_find.find(node)
+            keys = [_external_key(row, "order_id", "order"),
+                    _external_key(row, "client_order_id", "client_order"),
+                    _external_key(row, "deal_id", "deal")]
             for key in (key for key in keys if key is not None):
-                previous = identifiers.setdefault(key, execution_id)
-                union_find.union(previous, execution_id)
+                # Opening and closing orders can echo the same client identifier.
+                key += (row.get("side", ""),)
+                previous = identifiers.setdefault(key, node)
+                union_find.union(previous, node)
     return union_find
 
 
-def _canonicalize(
-    rows: dict[str, list[dict[str, str]]],
-    union_find: _UnionFind,
-) -> None:
+def _canonicalize(rows, union_find):
     for values in rows.values():
         for row in values:
-            execution_id = row.get("execution_id", "")
-            if execution_id:
-                row["execution_id"] = union_find.find(execution_id)
+            if row.get("execution_id"):
+                node = _execution_key(row) + (row.get("side", ""),)
+                row["execution_id"] = union_find.find(node)[3]
 
 
 def _deduplicate(
@@ -325,32 +350,11 @@ def _fill_key(row: dict[str, str]) -> tuple[str, ...]:
 
 
 def _event_key(row: dict[str, str]) -> tuple[str, ...]:
-    deal_key = _external_key(row, "deal_id", "deal")
-    if deal_key is not None:
-        return deal_key
-    order_key = _external_key(row, "order_id", "order") or _external_key(
-        row,
-        "client_order_id",
-        "client_order",
-    )
-    if order_key is not None:
-        return order_key + (row.get("status", ""),)
-    event_id = row.get("event_id", "")
-    if event_id:
-        return (
-            "event",
-            row.get("venue", ""),
-            _scope(row),
-            row.get("venue_symbol", ""),
-            event_id,
-        )
     return (
-        "event_fingerprint",
-        row.get("execution_id", ""),
-        row.get("order_id", ""),
-        row.get("status", ""),
-        row.get("deal_id", ""),
-        row.get("event_at_utc", ""),
+        row.get("venue", ""), _scope(row), row.get("venue_symbol", ""),
+        row.get("order_id", ""), row.get("client_order_id", ""),
+        row.get("event_id", ""), row.get("status", ""),
+        row.get("deal_id", ""), row.get("event_at_utc", ""),
     )
 
 
@@ -360,6 +364,7 @@ def _order_key(row: dict[str, str]) -> tuple[str, ...]:
         or _external_key(row, "client_order_id", "client_order")
         or (
             "local_order",
+            row.get("venue", ""), _scope(row),
             row.get("execution_id", ""),
             row.get("order_index", ""),
         )
@@ -426,14 +431,23 @@ def _synthesize_orders(
         )
         row[_INTERNAL_SOURCE] = event.get(_INTERNAL_SOURCE, "")
         rows.append(row)
-    deduplicated, duplicate_count = _deduplicate(
-        rows,
-        _order_key,
-        lambda row: (
-            _STATUS_RANK.get(row.get("status", ""), 0),
-            row.get(_INTERNAL_SOURCE, ""),
-        ),
-    )
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[_order_key(row)].append(row)
+    deduplicated = []
+    duplicate_count = 0
+    for candidates in grouped.values():
+        duplicate_count += len(candidates) - 1
+        state = order_status([row.get("status", "") for row in candidates])
+        selected = next((row for row in reversed(candidates) if row.get("status") == state), candidates[-1])
+        result = dict(selected)
+        # Sparse events should not erase order size or client identifiers.
+        for candidate in candidates:
+            for field, value in candidate.items():
+                if not result.get(field) and value:
+                    result[field] = value
+        result["status"] = state
+        deduplicated.append(result)
     for index, row in enumerate(deduplicated):
         if not row.get("order_index"):
             row["order_index"] = str(index)
@@ -474,24 +488,11 @@ def _drop_superseded_aggregate_fills(
     return output, dropped
 
 
-def _status_from_lifecycle(
-    submitted_quantity: float | None,
-    filled_quantity: float,
-    events: list[dict[str, str]],
-    fallback: str,
-) -> str:
-    if submitted_quantity is not None and submitted_quantity > 0:
-        if filled_quantity + 1e-12 >= submitted_quantity:
-            return "filled"
-        if filled_quantity > 0:
-            return "partially_filled"
-    elif filled_quantity > 0:
-        latest = max(events, key=lambda row: row.get("event_at_utc", ""), default={})
-        return latest.get("status", "filled") or "filled"
-    if not events:
-        return fallback
-    latest = max(events, key=lambda row: row.get("event_at_utc", ""))
-    return latest.get("status", "") or fallback
+def _status_from_lifecycle(submitted_quantity, filled_quantity, orders, fallback):
+    return execution_status(
+        [order.get("status", "unknown") for order in orders],
+        submitted_quantity, filled_quantity, fallback,
+    )
 
 
 def _calculate_bps(
@@ -511,11 +512,12 @@ def _finalize_executions(
     fills: list[dict[str, str]],
     events: list[dict[str, str]],
 ) -> list[dict[str, str]]:
-    by_execution = {row["execution_id"]: row for row in executions}
+    by_execution = {_execution_key(row): row for row in executions}
     identity_sources = events + fills + orders
     for source in identity_sources:
         execution_id = source.get("execution_id", "")
-        if not execution_id or execution_id in by_execution:
+        key = _execution_key(source)
+        if not execution_id or key in by_execution:
             continue
         row = {field: "" for field in LiveExecutionTraceRecorder.EXECUTION_FIELDS}
         for field in LiveExecutionTraceRecorder.IDENTITY_FIELDS:
@@ -526,19 +528,17 @@ def _finalize_executions(
         row["side"] = source.get("side", "")
         row["status"] = source.get("status", "submitted")
         row["reason"] = source.get("reason", "")
-        row["requested_quantity"] = source.get("submitted_quantity", "")
-        row["submitted_quantity"] = source.get("submitted_quantity", "")
-        by_execution[execution_id] = row
+        by_execution[key] = row
 
     orders_by_execution: dict[str, list[dict[str, str]]] = defaultdict(list)
     fills_by_execution: dict[str, list[dict[str, str]]] = defaultdict(list)
     events_by_execution: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in orders:
-        orders_by_execution[row.get("execution_id", "")].append(row)
+        orders_by_execution[_execution_key(row)].append(row)
     for row in fills:
-        fills_by_execution[row.get("execution_id", "")].append(row)
+        fills_by_execution[_execution_key(row)].append(row)
     for row in events:
-        events_by_execution[row.get("execution_id", "")].append(row)
+        events_by_execution[_execution_key(row)].append(row)
 
     finalized = []
     for execution_id in sorted(by_execution):
@@ -554,6 +554,15 @@ def _finalize_executions(
             submitted_quantity = sum(
                 quantity for quantity in quantities if quantity is not None
             )
+        for order in execution_orders:
+            child_fills = [fill for fill in execution_fills if _order_key(fill) == _order_key(order)]
+            quantity = sum(_float(fill.get("quantity")) or 0 for fill in child_fills)
+            if quantity:
+                target = _float(order.get("submitted_quantity"))
+                if target and quantity + 1e-12 >= target:
+                    order["status"] = "filled"
+                elif order["status"] not in TERMINAL_STATUSES:
+                    order["status"] = "partially_filled"
         priced_fills = [
             (_float(fill.get("price")), _float(fill.get("quantity")), fill)
             for fill in execution_fills
@@ -597,8 +606,6 @@ def _finalize_executions(
         first_fill = min(fill_times) if fill_times else None
         decision_at = _parse_time(row.get("decision_at_utc"))
         submitted_at = _parse_time(row.get("submitted_at_utc"))
-        accepted_at = _parse_time(row.get("accepted_at_utc"))
-        event_times = [event.get("event_at_utc", "") for event in execution_events]
         row["run_id"] = "merged"
         row["submitted_quantity"] = _number(submitted_quantity)
         if not row.get("requested_quantity"):
@@ -614,7 +621,7 @@ def _finalize_executions(
         row["status"] = _status_from_lifecycle(
             submitted_quantity,
             filled_quantity,
-            execution_events,
+            execution_orders,
             row.get("status", "submitted"),
         )
         latest_reason = next(
@@ -631,11 +638,11 @@ def _finalize_executions(
         )
         if latest_reason:
             row["reason"] = latest_reason
+        terminal = execution_orders and all(order.get("status") in TERMINAL_STATUSES for order in execution_orders)
         row["completed_at_utc"] = _latest_time(
-            row.get("completed_at_utc"),
-            *event_times,
+            *[event.get("event_at_utc", "") for event in execution_events if event.get("status") in TERMINAL_STATUSES],
             *[fill.get("executed_at_utc", "") for fill in execution_fills],
-        )
+        ) if terminal else ""
         row["accepted_at_utc"] = _earliest_time(
             row.get("accepted_at_utc"),
             *[
@@ -644,6 +651,7 @@ def _finalize_executions(
                 if event.get("status") == "accepted"
             ],
         )
+        accepted_at = _parse_time(row.get("accepted_at_utc"))
         row["decision_slippage_bps"] = _number(
             _calculate_bps(side, fill_vwap, decision_price)
         )
@@ -712,6 +720,10 @@ def merge_execution_traces(
         raise ValueError(f"No execution trace records found below {root}")
 
     input_counts = {kind: len(values) for kind, values in rows.items()}
+    initial_count = sum(":initial:" in row.get("event_id", "") for row in rows["events"])
+    rows["events"] = [row for row in rows["events"] if ":initial:" not in row.get("event_id", "")]
+    _normalize_order_metadata(rows)
+    _separate_protection_orders(rows)
     union_find = _link_execution_ids(rows)
     _canonicalize(rows, union_find)
 
@@ -741,7 +753,7 @@ def merge_execution_traces(
 
     for collection in (executions, orders, fills, events):
         for row in collection:
-            row["schema_version"] = "2"
+            row["schema_version"] = SCHEMA_VERSION
             row["run_id"] = "merged"
     executions.sort(
         key=lambda row: (
@@ -779,7 +791,7 @@ def merge_execution_traces(
         events,
     )
     report = {
-        "schema_version": 2,
+        "schema_version": int(SCHEMA_VERSION),
         "input_dir": str(root),
         "output_dir": str(destination),
         "source_files": {kind: len(values) for kind, values in paths.items()},
@@ -790,6 +802,7 @@ def merge_execution_traces(
             "fills": len(fills),
             "events": len(events),
         },
+        "ignored_response_snapshot_events": initial_count,
         "deduplication": {
             "duplicate_executions": duplicate_executions,
             "duplicate_orders": duplicate_orders,

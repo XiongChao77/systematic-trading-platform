@@ -43,3 +43,8 @@ dependencies = [
 ctrader = [
     "ctrader-open-api==0.9.2",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["test/regression"]
+python_files = ["test_*.py"]
+norecursedirs = ["manual", "offline", ".venv", "node_modules", ".git"]

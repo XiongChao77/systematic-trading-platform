@@ -51,7 +51,12 @@ class ExecutionEvent:
 
 @dataclass(frozen=True)
 class ExecutionReport:
-    """Normalized result of one strategy entry or exit intent."""
+    """Snapshot of one submission response, not its final lifecycle state.
+
+    completed_at_utc is local report creation time; accepted_at_utc is local
+    response receipt time only when the response contains acceptance evidence.
+    Venue events and actual fills determine the subsequent order lifecycle.
+    """
 
     side: str
     requested_quantity: float

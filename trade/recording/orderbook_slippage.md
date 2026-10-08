@@ -85,9 +85,3 @@ promise future fills.
 
 Official API reference:
 https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Order-Book
-
-## Offline checks
-
-```bash
-python3 -m unittest trade.recording.check_orderbook_slippage -v
-```

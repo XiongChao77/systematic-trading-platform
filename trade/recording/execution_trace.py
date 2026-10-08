@@ -2,35 +2,29 @@
 
 from __future__ import annotations
 
-import csv
 import math
 import os
 import queue
-import re
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from trade.recording.persistent_csv import AppendCsv
 from trade.core.execution import ExecutionEvent, ExecutionReport
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "4"
 
 
 @dataclass(frozen=True)
 class ExecutionTraceConfig:
-    """Destination for per-session execution trace files."""
+    """Destination for persistent execution trace journals."""
 
     output_dir: str
 
     def __post_init__(self) -> None:
         if not str(self.output_dir).strip():
             raise ValueError("execution_trace.output_dir must not be empty")
-
-
-def _safe_filename_part(value: Any) -> str:
-    text = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value).strip())
-    return text.strip("-.") or "unknown"
 
 
 def _number(value: Any) -> Any:
@@ -48,21 +42,25 @@ def _identity_fields(
     *,
     runner_id: str,
     run_id: str,
-    strategy_id: str,
+    instance_id: str,
     strategy_hash: str,
     venue: str,
     account_id: str,
     strategy_symbol: str,
     venue_symbol: str,
+    trader_login: str = "",
 ) -> dict[str, str]:
+    if venue.casefold() in {"ctrader", "ctradervenue"} and (not trader_login or account_id):
+        raise ValueError("cTrader trace identity requires trader_login and no account_id")
     return {
         "schema_version": SCHEMA_VERSION,
         "runner_id": runner_id,
         "run_id": run_id,
-        "strategy_id": strategy_id,
+        "instance_id": instance_id,
         "strategy_hash": strategy_hash,
         "venue": venue,
         "account_id": account_id,
+        "trader_login": trader_login,
         "strategy_symbol": strategy_symbol,
         "venue_symbol": venue_symbol,
     }
@@ -75,10 +73,11 @@ class LiveExecutionTraceRecorder:
         "schema_version",
         "runner_id",
         "run_id",
-        "strategy_id",
+        "instance_id",
         "strategy_hash",
         "venue",
         "account_id",
+        "trader_login",
         "strategy_symbol",
         "venue_symbol",
     )
@@ -163,24 +162,32 @@ class LiveExecutionTraceRecorder:
     ) -> None:
         timestamp = (started_at or datetime.now(UTC)).astimezone(UTC)
         session = timestamp.strftime("%Y%m%dT%H%M%S%fZ")
-        prefix = f"{_safe_filename_part(runner_id)}_{session}"
         output_dir = os.path.abspath(config.output_dir)
         os.makedirs(output_dir, exist_ok=True)
         self.executions_path = os.path.join(
             output_dir,
-            f"{prefix}_executions.csv",
+            "executions.csv",
         )
-        self.orders_path = os.path.join(output_dir, f"{prefix}_orders.csv")
-        self.fills_path = os.path.join(output_dir, f"{prefix}_fills.csv")
-        self.events_path = os.path.join(output_dir, f"{prefix}_events.csv")
+        self.orders_path = os.path.join(output_dir, "orders.csv")
+        self.fills_path = os.path.join(output_dir, "fills.csv")
+        self.events_path = os.path.join(output_dir, "events.csv")
         self.runner_id = str(runner_id)
         self.run_id = str(
-            run_id or os.path.basename(os.path.dirname(output_dir)) or session
+            run_id or session
         )
         self._logger = logger
         self._queue: queue.Queue[Any] = queue.Queue()
         self._sentinel = object()
         self._closed = False
+        self._error = None
+        self._writers = []
+        try:
+            for path, fields in zip(self.paths, (self.EXECUTION_FIELDS, self.CHILD_ORDER_FIELDS, self.FILL_FIELDS, self.EVENT_FIELDS)):
+                self._writers.append(AppendCsv(path, fields))
+        except Exception:
+            for writer in self._writers:
+                writer.close()
+            raise
         self._thread = threading.Thread(
             target=self._run,
             name="live-execution-trace",
@@ -201,12 +208,13 @@ class LiveExecutionTraceRecorder:
         self,
         report: ExecutionReport,
         *,
-        strategy_id: str,
+        instance_id: str,
         strategy_hash: str,
         venue: str,
         account_id: str,
         strategy_symbol: str,
         venue_symbol: str,
+        trader_login: str = "",
     ) -> None:
         if self._closed:
             return
@@ -215,10 +223,11 @@ class LiveExecutionTraceRecorder:
                 "report",
                 report,
                 self._identity(
-                    strategy_id=strategy_id,
+                    instance_id=instance_id,
                     strategy_hash=strategy_hash,
                     venue=venue,
                     account_id=account_id,
+                    trader_login=trader_login,
                     strategy_symbol=strategy_symbol,
                     venue_symbol=venue_symbol,
                 ),
@@ -229,12 +238,13 @@ class LiveExecutionTraceRecorder:
         self,
         event: ExecutionEvent,
         *,
-        strategy_id: str,
+        instance_id: str,
         strategy_hash: str,
         venue: str,
         account_id: str,
         strategy_symbol: str,
         venue_symbol: str,
+        trader_login: str = "",
     ) -> None:
         if self._closed:
             return
@@ -243,10 +253,11 @@ class LiveExecutionTraceRecorder:
                 "event",
                 event,
                 self._identity(
-                    strategy_id=strategy_id,
+                    instance_id=instance_id,
                     strategy_hash=strategy_hash,
                     venue=venue,
                     account_id=account_id,
+                    trader_login=trader_login,
                     strategy_symbol=strategy_symbol,
                     venue_symbol=venue_symbol,
                 ),
@@ -262,63 +273,9 @@ class LiveExecutionTraceRecorder:
 
     def _run(self) -> None:
         try:
-            with (
-                open(
-                    self.executions_path,
-                    "x",
-                    encoding="utf-8",
-                    newline="",
-                ) as executions_handle,
-                open(
-                    self.orders_path,
-                    "x",
-                    encoding="utf-8",
-                    newline="",
-                ) as orders_handle,
-                open(
-                    self.fills_path,
-                    "x",
-                    encoding="utf-8",
-                    newline="",
-                ) as fills_handle,
-                open(
-                    self.events_path,
-                    "x",
-                    encoding="utf-8",
-                    newline="",
-                ) as events_handle,
-            ):
-                executions_writer = csv.DictWriter(
-                    executions_handle,
-                    fieldnames=self.EXECUTION_FIELDS,
-                )
-                orders_writer = csv.DictWriter(
-                    orders_handle,
-                    fieldnames=self.CHILD_ORDER_FIELDS,
-                )
-                fills_writer = csv.DictWriter(
-                    fills_handle,
-                    fieldnames=self.FILL_FIELDS,
-                )
-                events_writer = csv.DictWriter(
-                    events_handle,
-                    fieldnames=self.EVENT_FIELDS,
-                )
-                handles = (
-                    executions_handle,
-                    orders_handle,
-                    fills_handle,
-                    events_handle,
-                )
-                for writer in (
-                    executions_writer,
-                    orders_writer,
-                    fills_writer,
-                    events_writer,
-                ):
-                    writer.writeheader()
-                for handle in handles:
-                    handle.flush()
+            with self._writers[0], self._writers[1], self._writers[2], self._writers[3]:
+                executions_writer, orders_writer, fills_writer, events_writer = self._writers
+                handles = self._writers
 
                 while True:
                     item = self._queue.get()
@@ -332,7 +289,6 @@ class LiveExecutionTraceRecorder:
                             executions_writer,
                             orders_writer,
                             fills_writer,
-                            events_writer,
                         )
                     else:
                         self._write_event(
@@ -343,7 +299,8 @@ class LiveExecutionTraceRecorder:
                         )
                     for handle in handles:
                         handle.flush()
-        except Exception:
+        except Exception as exc:
+            self._error = exc
             if self._logger is not None:
                 self._logger.exception("Live execution trace writer failed")
 
@@ -355,7 +312,6 @@ class LiveExecutionTraceRecorder:
         executions_writer,
         orders_writer,
         fills_writer,
-        events_writer,
     ) -> None:
         executions_writer.writerow(cls._execution_row(report, identity))
         for index, order in enumerate(report.orders):
@@ -383,31 +339,6 @@ class LiveExecutionTraceRecorder:
                     identity,
                 )
             )
-        orders = report.orders or (None,)
-        for index, order in enumerate(orders):
-            events_writer.writerow(
-                identity
-                | {
-                    "event_id": f"{report.execution_id}:initial:{index}",
-                    "execution_id": report.execution_id,
-                    "order_role": report.order_role,
-                    "side": report.side,
-                    "status": order.status if order is not None else report.status,
-                    "event_at_utc": _time(report.completed_at_utc),
-                    "order_id": order.order_id if order is not None else "",
-                    "client_order_id": (
-                        order.client_order_id if order is not None else ""
-                    ),
-                    "submitted_quantity": _number(
-                        order.submitted_quantity
-                        if order is not None
-                        else report.submitted_quantity
-                    ),
-                    "reason": report.reason,
-                    "deal_id": "",
-                }
-            )
-
     @classmethod
     def _write_event(
         cls,
@@ -522,4 +453,6 @@ class LiveExecutionTraceRecorder:
             return
         self._closed = True
         self._queue.put(self._sentinel)
-        self._thread.join(timeout=5.0)
+        self._thread.join()
+        if self._error is not None:
+            raise RuntimeError("Execution trace writer failed") from self._error

@@ -8,7 +8,7 @@
 .live-strategy-row { cursor: pointer; outline: none; transition: background 120ms ease; }
 .live-strategy-row:hover, .live-strategy-row:focus { background: #f7f9fe; }
 .live-strategy-row.unavailable td { color: #a0a8b8; }
-.strategy-id-cell { color: var(--brand) !important; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 750; }
+.instance-id-cell { color: var(--brand) !important; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 750; }
 .value-unavailable { color: #a0a8b8 !important; }
 .live-request-failed { opacity: 0.46; filter: grayscale(0.65); }
 .live-detail-header { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 13px; margin-bottom: 18px; }
@@ -32,3 +32,26 @@
 .live-position-components td { color: #34405a; font-weight: 700; }
 .live-position-components tbody tr:last-child td { border-bottom: 0; }
 @media (max-width: 1100px) { .live-detail-grid { grid-template-columns: 1fr; } }
+
+.live-list-header { gap: 24px; flex-wrap: wrap; }
+.live-list-overview { display: flex; align-items: center; justify-content: flex-end; gap: 18px; margin-left: auto; }
+.live-pnl-summary { display: grid; grid-template-columns: repeat(2, minmax(300px, 1fr)); gap: 12px; }
+.live-pnl-group { padding: 12px 16px; border: 1px solid var(--border); border-radius: 12px; background: #fff; }
+.live-pnl-group h2 { margin: 0 0 10px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }
+.live-pnl-group dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; margin: 0; }
+.live-pnl-metric dt { color: var(--muted); font-size: 11px; }
+.live-pnl-metric dd { margin: 5px 0; font-size: 18px; font-weight: 750; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.live-pnl-metric small { color: var(--muted); font-size: 10px; }
+.live-pnl-metric .live-pnl-partial { color: #a16207; }
+@media (max-width: 1100px) {
+  .live-list-overview { width: 100%; margin-left: 0; justify-content: space-between; flex-wrap: wrap; }
+  .live-pnl-summary { flex: 1; }
+}
+@media (max-width: 720px) {
+  .live-pnl-summary { grid-template-columns: 1fr; width: 100%; flex-basis: 100%; }
+}
+
+@media (max-width: 400px) {
+  .live-pnl-group { padding: 12px; }
+  .live-pnl-group dl { grid-template-columns: 1fr; gap: 12px; }
+}

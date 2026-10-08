@@ -84,7 +84,7 @@ python -m experiment.trigger_direction_report_view
 Run cross-period and cross-asset validation for selected candidates:
 
 ```bash
-python -m experiment.strategy_validation \
+python -m test.offline.test_strategy_validation \
   --selected-configs path/to/selected_configs.jsonl
 ```
 

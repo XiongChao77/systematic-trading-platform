@@ -7,6 +7,7 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
+from dataclasses import replace
 from decimal import Decimal, ROUND_DOWN
 
 # Path setup
@@ -22,7 +23,7 @@ from trade.core.dashboard_base import (
     MarginMode,
     PositionSide,
 )
-from trade.core.execution import ExecutionFill, ExecutionOrder
+from trade.core.execution import ExecutionEvent, ExecutionFill, ExecutionOrder
 from trade.core.protocol import ActionType, OrderType, PositionDir, PositionView
 from trade.core.venue_base import VenueBase
 
@@ -40,6 +41,7 @@ class BybitVenue(VenueBase, AccountDashboard):
         self.symbol = symbol
         self.magic = str(magic or "financial-ml-system")
         self._order_id_sequence = itertools.count()
+        self._execution_ids_by_client_order_id = {}
         self.logger = logger or logging.getLogger("BybitVenue")
         self.logger.info(f"BybitVenue key_path:{key_path} symbol {symbol}")
         
@@ -69,7 +71,48 @@ class BybitVenue(VenueBase, AccountDashboard):
         )
         nonce = re.sub(r"[^A-Za-z0-9_-]", "_", nonce_source)[-14:]
         suffix = f"_{action}_{nonce}"
-        return f"{safe_magic[:36 - len(suffix)]}{suffix}"
+        client_id = f"{safe_magic[:36 - len(suffix)]}{suffix}"
+        if execution_id:
+            self._execution_ids_by_client_order_id[client_id] = (str(execution_id), action)
+        return client_id
+
+    def shutdown(self):
+        self.engine.stop()
+
+    def set_execution_event_callback(self, callback):
+        super().set_execution_event_callback(callback)
+        self.engine.ws_stream.order_stream(callback=self._on_order_event)
+
+    def _on_order_event(self, message):
+        for order in message.get("data", []):
+            client_id = str(order.get("orderLinkId") or "")
+            parent_id = str(order.get("parentOrderLinkId") or "")
+            identity = self._execution_ids_by_client_order_id.get(client_id or parent_id)
+            if identity is None:
+                continue
+            status = {"Rejected": "rejected", "New": "accepted",
+                      "PartiallyFilled": "partially_filled", "Filled": "filled",
+                      "Cancelled": "cancelled", "Deactivated": "expired"}.get(order.get("orderStatus"))
+            if status is None:
+                continue
+            execution_id, action = identity
+            timestamp = int(order.get("updatedTime") or message.get("creationTime") or time.time() * 1000)
+            self._emit_execution_event(ExecutionEvent(
+                execution_id=execution_id, status=status,
+                event_at_utc=datetime.fromtimestamp(timestamp / 1000, timezone.utc),
+                order_role="entry" if action == "open" and not parent_id else "exit",
+                side=str(order.get("side", "")).lower(), order_id=str(order.get("orderId") or ""),
+                client_order_id=client_id, submitted_quantity=float(order.get("qty") or 0),
+                reason=str(order.get("rejectReason") or order.get("cancelType") or ""),
+            ))
+
+    def _build_execution_report(self, **kwargs):
+        report = super()._build_execution_report(**kwargs)
+        result = kwargs["result"]
+        results = result if isinstance(result, list) else [result]
+        errors = [f"Bybit code={item.get('retCode')}: {item.get('retMsg', '')}"
+                  for item in results if isinstance(item, dict) and item.get("retCode") != 0]
+        return replace(report, reason="; ".join(errors)) if errors else report
 
     def normalize_order_quantity(self, size: float) -> float:
         quantity = Decimal(str(size))
@@ -285,7 +328,14 @@ class BybitVenue(VenueBase, AccountDashboard):
         results = result if isinstance(result, list) else [result]
         orders = []
         for item in results:
-            if not isinstance(item, dict) or item.get("retCode") != 0:
+            if not isinstance(item, dict):
+                continue
+            if item.get("retCode") != 0:
+                orders.append(ExecutionOrder(
+                    submitted_quantity=float(item.get("_trace_submitted_quantity") or submitted_quantity),
+                    client_order_id=str(item.get("_trace_client_order_id", "")),
+                    status="rejected",
+                ))
                 continue
             payload = item.get("result", {})
             order_id = str(payload.get("orderId", "") or "")

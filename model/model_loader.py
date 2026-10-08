@@ -262,7 +262,7 @@ class ModelHandler(MetaConfig):
         return results
 
     def predict(self, df, kline_interval_ms, is_live=True, batch_size=2048, diff_thresh=None, min_thresh=0.3, stride =1,
-                   cache_path = '', use_cache= False):
+                   cache_path = '', use_cache= False, show_feature_distribution = True):
         """
         Run inference with optional strategy enhancement based on probability differences.
         
@@ -289,6 +289,7 @@ class ModelHandler(MetaConfig):
             stride= stride,
             cache_path = cache_path,
             use_cache = use_cache,
+            show_feature_distribution = show_feature_distribution
         )
         
         # Check whether any valid windows were generated (data too short or discontinuous windows may be dropped)

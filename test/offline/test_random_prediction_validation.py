@@ -19,7 +19,7 @@ from typing import Any, Iterable
 import numpy as np
 
 current_work_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.join(current_work_dir, ".."))
+sys.path.append(os.path.abspath(os.path.join(current_work_dir, "..", "..")))
 
 from data_process import common, preparation
 from data_process.utils import TaskIdentity, load_selected_configs
@@ -696,6 +696,6 @@ def main() -> None:
     logger.info("Random prediction validation completed: %s", output_dir)
 
 
-# example python3 random_prediction_validation.py --folder ../LiveTrading/market/ETH/15_42_18/ --hash df2d2252c66d
+# Run from the repository root: python -m test.offline.test_random_prediction_validation --help
 if __name__ == "__main__":
     main()

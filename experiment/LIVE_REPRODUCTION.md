@@ -8,7 +8,7 @@ source. Strategies in different files can use the same hash independently.
 Check report selection, model files, model types, and feature configurations:
 
 ```bash
-.venv/bin/python experiment/strategy_validation.py \
+.venv/bin/python test/offline/test_strategy_validation.py \
   --live-config LiveTrading/live_config.json --dry-run
 ```
 
@@ -16,7 +16,7 @@ Replay only `forward` with the model artifacts specified in the live
 configuration, without retraining or connecting to any live venue:
 
 ```bash
-.venv/bin/python experiment/strategy_validation.py \
+.venv/bin/python test/offline/test_strategy_validation.py \
   --live-config LiveTrading/live_config.json \
   --output-dir /tmp/live-reproduction
 ```

@@ -142,9 +142,10 @@ class PositionView:
 
 @dataclass
 class AccountView:
-    """From the venue: account equity."""
+    """Account equity for risk guards and optional cash balance for margin limits."""
 
     equity: float = 0.0
+    balance: Optional[float] = None
 
 
 @dataclass

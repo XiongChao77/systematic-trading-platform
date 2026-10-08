@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from dataclasses import replace
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
@@ -24,18 +25,24 @@ from trade.core.dashboard_base import (
     MarginMode,
     PositionSide,
 )
+from trade.core.execution_status import order_status
 from trade.core.execution import (
     ExecutionEvent,
     ExecutionFill,
     ExecutionOrder,
 )
-from trade.core.protocol import Firm, OrderType, PositionDir, PositionView
+from trade.core.protocol import AccountView, Firm, OrderType, PositionDir, PositionView
 from trade.core.venue_base import VenueBase
+from twisted.application.internet import ClientService
 from ctrader_open_api import Client, EndPoints, Protobuf, TcpProtocol
 from ctrader_open_api.messages import (
     OpenApiMessages_pb2,
     OpenApiModelMessages_pb2,
 )
+
+
+class CTraderConnectionUnavailable(ConnectionError):
+    """The session is recovering or paused; no business request was submitted."""
 
 
 class CTraderRequestError(RuntimeError):
@@ -79,6 +86,20 @@ CTRADER_SYMBOL_MAP = {
 }
 
 
+# Official per-connection limits: https://help.ctrader.com/open-api/
+CTRADER_NON_HISTORICAL_REQUESTS_PER_SECOND = 50
+CTRADER_HISTORICAL_REQUESTS_PER_SECOND = 5
+CTRADER_HISTORICAL_REQUEST_TYPES = frozenset(
+    getattr(OpenApiMessages_pb2, name)().payloadType
+    for name in (
+        "ProtoOAGetTrendbarsReq", "ProtoOAGetTickDataReq", "ProtoOAOrderListReq",
+        "ProtoOADealListReq", "ProtoOACashFlowHistoryListReq",
+        "ProtoOAOrderListByPositionIdReq", "ProtoOADealListByPositionIdReq",
+        "ProtoOADealOffsetListReq", "ProtoOAOrderDetailsReq",
+    )
+)
+
+
 class _CTraderIsolatedTcpProtocol(TcpProtocol):
     """Keep SDK send state isolated between Live and Demo clients."""
 
@@ -88,14 +109,31 @@ class _CTraderIsolatedTcpProtocol(TcpProtocol):
         self._send_task = None
         self._lastSendMessageTime = None
         self._dashboard_queue = deque()
+        self._historical_queue = deque()
+        self._historical_sent_times = deque()
         self._sent_times = deque()
         self._dashboard_sent_times = deque()
 
     def send(self, message, instant=False, clientMsgId=None, isCanceled=None):
         queued_at = time.monotonic()
+        historical = getattr(message, "payloadType", None) in CTRADER_HISTORICAL_REQUEST_TYPES
+        timing_event = getattr(self.factory.client, "_request_timing_event", None)
+        if timing_event is not None:
+            timing_event(clientMsgId, "queued_at", priority_pending=len(self._send_queue),
+                         dashboard_pending=len(self._dashboard_queue),
+                         historical_pending=len(self._historical_queue),
+                         rate_class="historical" if historical else "non_historical",
+                         send_limit=(CTRADER_HISTORICAL_REQUESTS_PER_SECOND if historical
+                                     else self.factory.numberOfMessagesToSendPerSecond))
 
         def timed_cancellation_check():
             canceled = isCanceled is not None and isCanceled()
+            if timing_event is not None:
+                timing_event(clientMsgId, "cancelled_at" if canceled else "sent_at",
+                             priority_pending=len(self._send_queue),
+                             dashboard_pending=len(self._dashboard_queue),
+                             historical_pending=len(self._historical_queue),
+                             window_used=len(self._historical_sent_times if historical else self._sent_times))
             logging.getLogger("trade.ctrader.connection").debug(
                 "cTrader API queue timing | request_id=%s queue_wait_ms=%.1f canceled=%s",
                 clientMsgId, (time.monotonic() - queued_at) * 1000, canceled,
@@ -107,7 +145,10 @@ class _CTraderIsolatedTcpProtocol(TcpProtocol):
             isCanceled=timed_cancellation_check,
         )
         if not instant:
-            if str(clientMsgId).startswith("dashboard-"):
+            if historical:
+                self._historical_queue.append(self._send_queue.pop())
+                self._sendStrings()
+            elif str(clientMsgId).startswith("dashboard-"):
                 self._dashboard_queue.append(self._send_queue.pop())
             else:
                 self._sendStrings()
@@ -119,9 +160,9 @@ class _CTraderIsolatedTcpProtocol(TcpProtocol):
         self._send_task.start(0.02)
 
     def _sendStrings(self):
-        """Drain priority reads/orders first, retaining the SDK's rolling limit."""
+        """Drain trading first, with independent historical and ordinary budgets."""
         now = time.monotonic()
-        for timestamps in (self._sent_times, self._dashboard_sent_times):
+        for timestamps in (self._sent_times, self._dashboard_sent_times, self._historical_sent_times):
             while timestamps and now - timestamps[0] >= 1.0:
                 timestamps.popleft()
         limit = self.factory.numberOfMessagesToSendPerSecond
@@ -142,7 +183,14 @@ class _CTraderIsolatedTcpProtocol(TcpProtocol):
             if dashboard:
                 self._dashboard_sent_times.append(now)
             self._lastSendMessageTime = datetime.now()
-        if not self._send_queue and not self._dashboard_queue:
+        while self._historical_queue and len(self._historical_sent_times) < CTRADER_HISTORICAL_REQUESTS_PER_SECOND:
+            canceled, data = self._historical_queue.popleft()
+            if canceled is not None and canceled():
+                continue
+            self.sendString(data)
+            self._historical_sent_times.append(now)
+            self._lastSendMessageTime = datetime.now()
+        if not self._send_queue and not self._dashboard_queue and not self._historical_queue:
             if self._lastSendMessageTime is None or (datetime.now() - self._lastSendMessageTime).total_seconds() > 20:
                 self.heartbeat()
 
@@ -163,6 +211,9 @@ class CTraderOpenApiConnection:
     TOKEN_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
     TOKEN_REFRESH_MARGIN_SECONDS = 48 * 60 * 60
     HEARTBEAT_INTERVAL_SECONDS = 10.0
+    RECOVERY_ATTEMPTS = 3
+    RECOVERY_COOLDOWN_SECONDS = 3600.0
+    RECOVERY_RETRY_DELAYS = (1.0, 2.0)
 
     _reactor_lock = threading.Lock()
     _reactor_ready = threading.Event()
@@ -179,7 +230,7 @@ class CTraderOpenApiConnection:
         key_path: str,
         *,
         environment: str = "demo",
-        timeout: float = 10.0,
+        timeout: float = 3.0,
         logger: logging.Logger | None = None,
     ):
         self._protobuf = Protobuf
@@ -190,10 +241,24 @@ class CTraderOpenApiConnection:
 
         self._connected = threading.Event()
         self._application_authenticated = threading.Event()
+        # Reactor callbacks only take this short-lived state lock.
         self._authentication_lock = threading.RLock()
+        # Synchronous authentication operations may wait while holding this lock.
+        self._authentication_operation_lock = threading.RLock()
+        self._connection_generation = 0
         self._token_refresh_lock = threading.Lock()
         self._closed = False
         self._ever_authenticated = False
+        self._recovery_running = False
+        self._recovery_stop = threading.Event()
+        self._recovery_failure: str | None = None
+        self._recovery_failure_callback = None
+        self._recovery_success_callback = None
+        self._recovery_thread = None
+        self._transport_paused = False
+        self._next_recovery_at = None
+        self._last_recovered_monotonic = 0.0
+        self._recovery_episode = 0
 
         self._granted_account_ids: set[int] = set()
         self._account_ids_by_trader_login: dict[int, tuple[int, ...]] = {}
@@ -241,7 +306,11 @@ class CTraderOpenApiConnection:
             host,
             EndPoints.PROTOBUF_PORT,
             _CTraderIsolatedTcpProtocol,
+            numberOfMessagesToSendPerSecond=CTRADER_NON_HISTORICAL_REQUESTS_PER_SECOND,
         )
+        self._request_timing_lock = threading.Lock()
+        self._request_timings = {}
+        self._client._request_timing_event = self._mark_request_timing
         self._client.setConnectedCallback(self._on_connected)
         self._client.setDisconnectedCallback(self._on_disconnected)
         self._client.setMessageReceivedCallback(self._on_message)
@@ -346,7 +415,7 @@ class CTraderOpenApiConnection:
         import urllib.parse
         import urllib.request
 
-        with self._token_refresh_lock:
+        with self._token_refresh_lock, self._authentication_operation_lock:
             disk_access_token = self._load_first(
                 self._key_path,
                 self.ACCESS_TOKEN_FILES,
@@ -435,9 +504,9 @@ class CTraderOpenApiConnection:
             with self._authentication_lock:
                 registered_ids = tuple(self._registered_account_ids)
                 self._authenticated_account_ids.clear()
+                self._application_authenticated.clear()
 
             if self._connected.is_set():
-                self._application_authenticated.clear()
                 self._authenticate_application()
                 self._reload_granted_accounts()
                 for account_id in registered_ids:
@@ -485,27 +554,41 @@ class CTraderOpenApiConnection:
         reactor.callFromThread(callback, *args)
 
     def _on_connected(self, _client) -> None:
-        self._connected.set()
+        with self._authentication_lock:
+            if self._closed or self._transport_paused:
+                self._stop_transport()
+                return
+            self._connection_generation += 1
+            self._connected.set()
         self._logger.info(
             "cTrader Open API connection ready | environment=%s",
             self.environment,
         )
-        if self._ever_authenticated and not self._closed:
-            threading.Thread(
-                target=self._reauthenticate,
-                name="ctrader-reauth",
-                daemon=True,
-            ).start()
+        self._start_recovery()
 
     def _on_disconnected(self, _client, reason) -> None:
-        self._connected.clear()
-        self._application_authenticated.clear()
         with self._authentication_lock:
+            self._connection_generation += 1
+            self._connected.clear()
+            self._application_authenticated.clear()
             self._authenticated_account_ids.clear()
+        with self._quote_lock:
+            self._quotes.clear()
+            for event in self._quote_events.values():
+                event.clear()
         if not self._closed:
-            self._logger.warning("cTrader Open API disconnected: %s", reason)
+            self._logger.warning("cTrader Open API disconnected | environment=%s reason=%s", self.environment, reason)
+            self._start_recovery()
+
+    def _mark_request_timing(self, request_id, stage, **fields):
+        with self._request_timing_lock:
+            timing = self._request_timings.get(request_id)
+            if timing is not None:
+                timing[stage] = time.monotonic()
+                timing.update(fields)
 
     def _on_message(self, _client, envelope) -> None:
+        self._mark_request_timing(getattr(envelope, "clientMsgId", None), "received_at")
         try:
             message = self._protobuf.extract(envelope)
         except Exception:
@@ -559,44 +642,61 @@ class CTraderOpenApiConnection:
             else:
                 setattr(message, name, value)
 
+    def _validate_authentication_session(self, generation=None, *, require_application=False):
+        """Check session state while the caller holds the short-lived state lock."""
+        if self._closed or not self._connected.is_set():
+            raise ConnectionError("cTrader authentication session is closed or disconnected")
+        if generation is not None and generation != self._connection_generation:
+            raise ConnectionError("cTrader connection changed during authentication")
+        if require_application and not self._application_authenticated.is_set():
+            raise ConnectionError("cTrader application session is not authorized")
+        return self._connection_generation
+
     def _authenticate_application(self) -> None:
-        with self._authentication_lock:
+        with self._authentication_operation_lock:
+            with self._authentication_lock:
+                generation = self._validate_authentication_session()
             self._send_request(
                 "ProtoOAApplicationAuthReq",
                 clientId=self._client_id,
                 clientSecret=self._client_secret,
             )
-            self._application_authenticated.set()
+            with self._authentication_lock:
+                self._validate_authentication_session(generation)
+                self._application_authenticated.set()
 
     def _reload_granted_accounts(self) -> set[int]:
-        if not self._application_authenticated.wait(self._timeout):
-            raise ConnectionError("cTrader application session is not authorized")
-        accounts = self._send_request(
-            "ProtoOAGetAccountListByAccessTokenReq",
-            accessToken=self._access_token,
-        )
-        account_ids_by_login: dict[int, set[int]] = {}
-        account_environments_by_id: dict[int, str] = {}
-        granted_ids: set[int] = set()
-        for item in accounts.ctidTraderAccount:
-            account_id = int(item.ctidTraderAccountId)
-            granted_ids.add(account_id)
-            if self._message_has_field(item, "isLive"):
-                account_environment = "live" if bool(item.isLive) else "demo"
-            else:
-                account_environment = self.environment
-            account_environments_by_id[account_id] = account_environment
-            if not self._message_has_field(item, "traderLogin"):
-                continue
-            trader_login = int(item.traderLogin)
-            account_ids_by_login.setdefault(trader_login, set()).add(account_id)
-        self._granted_account_ids = granted_ids
-        self._account_environments_by_id = account_environments_by_id
-        self._account_ids_by_trader_login = {
-            trader_login: tuple(sorted(account_ids))
-            for trader_login, account_ids in account_ids_by_login.items()
-        }
-        return granted_ids
+        with self._authentication_operation_lock:
+            with self._authentication_lock:
+                generation = self._validate_authentication_session(require_application=True)
+            accounts = self._send_request(
+                "ProtoOAGetAccountListByAccessTokenReq",
+                accessToken=self._access_token,
+            )
+            account_ids_by_login: dict[int, set[int]] = {}
+            account_environments_by_id: dict[int, str] = {}
+            granted_ids: set[int] = set()
+            for item in accounts.ctidTraderAccount:
+                account_id = int(item.ctidTraderAccountId)
+                granted_ids.add(account_id)
+                if self._message_has_field(item, "isLive"):
+                    account_environment = "live" if bool(item.isLive) else "demo"
+                else:
+                    account_environment = self.environment
+                account_environments_by_id[account_id] = account_environment
+                if not self._message_has_field(item, "traderLogin"):
+                    continue
+                trader_login = int(item.traderLogin)
+                account_ids_by_login.setdefault(trader_login, set()).add(account_id)
+            with self._authentication_lock:
+                self._validate_authentication_session(generation, require_application=True)
+                self._granted_account_ids = granted_ids
+                self._account_environments_by_id = account_environments_by_id
+                self._account_ids_by_trader_login = {
+                    trader_login: tuple(sorted(account_ids))
+                    for trader_login, account_ids in account_ids_by_login.items()
+                }
+            return granted_ids
 
     @staticmethod
     def _message_has_field(message, field_name: str) -> bool:
@@ -618,29 +718,25 @@ class CTraderOpenApiConnection:
         if normalized_login <= 0:
             raise ValueError("cTrader trader_login must be positive")
 
-        with self._authentication_lock:
-            account_ids = self._account_ids_by_trader_login.get(
-                normalized_login,
-                (),
-            )
+        with self._authentication_operation_lock:
+            with self._authentication_lock:
+                account_ids = self._account_ids_by_trader_login.get(normalized_login, ())
             if not account_ids:
                 self._reload_granted_accounts()
-                account_ids = self._account_ids_by_trader_login.get(
-                    normalized_login,
-                    (),
-                )
-            if not account_ids:
-                raise ValueError(
-                    f"cTrader trader login {normalized_login} is not granted by the access token"
-                )
-            if len(account_ids) > 1:
-                candidates = ", ".join(str(account_id) for account_id in account_ids)
-                raise ValueError(
-                    f"cTrader trader login {normalized_login} is ambiguous; "
-                    f"account IDs: {candidates}"
-                )
-            account_id = account_ids[0]
-            return account_id, self._account_environments_by_id[account_id]
+            with self._authentication_lock:
+                account_ids = self._account_ids_by_trader_login.get(normalized_login, ())
+                if not account_ids:
+                    raise ValueError(
+                        f"cTrader trader login {normalized_login} is not granted by the access token"
+                    )
+                if len(account_ids) > 1:
+                    candidates = ", ".join(str(account_id) for account_id in account_ids)
+                    raise ValueError(
+                        f"cTrader trader login {normalized_login} is ambiguous; "
+                        f"account IDs: {candidates}"
+                    )
+                account_id = account_ids[0]
+                return account_id, self._account_environments_by_id[account_id]
 
     def resolve_account_id(self, trader_login: int | str) -> int:
         """Resolve a UI-visible trader login to an Open API account ID."""
@@ -649,52 +745,57 @@ class CTraderOpenApiConnection:
         return account_id
 
     def _authenticate_account(self, account_id: int) -> None:
-        with self._authentication_lock:
-            if self._closed or account_id not in self._registered_account_ids:
-                return
-            if account_id in self._authenticated_account_ids:
-                return
-
-            if not self._application_authenticated.wait(self._timeout):
-                raise ConnectionError("cTrader application session is not authorized")
-
-            if account_id not in self._granted_account_ids:
+        # Reauthentication must be able to acquire the operation lock while we wait.
+        if not self._application_authenticated.wait(self._timeout):
+            raise ConnectionError("cTrader application session is not authorized")
+        with self._authentication_operation_lock:
+            with self._authentication_lock:
+                generation = self._validate_authentication_session(require_application=True)
+                if account_id not in self._registered_account_ids:
+                    return
+                if account_id in self._authenticated_account_ids:
+                    return
+                granted = account_id in self._granted_account_ids
+            if not granted:
                 self._reload_granted_accounts()
-            if account_id not in self._granted_account_ids:
-                raise ValueError(
-                    f"cTrader account {account_id} is not granted by the access token"
-                )
-
+            with self._authentication_lock:
+                self._validate_authentication_session(generation, require_application=True)
+                if account_id not in self._granted_account_ids:
+                    raise ValueError(
+                        f"cTrader account {account_id} is not granted by the access token"
+                    )
             self._send_request(
                 "ProtoOAAccountAuthReq",
                 ctidTraderAccountId=account_id,
                 accessToken=self._access_token,
             )
-            self._authenticated_account_ids.add(account_id)
+            with self._authentication_lock:
+                self._validate_authentication_session(generation, require_application=True)
+                if account_id not in self._registered_account_ids:
+                    raise ConnectionError("cTrader account was released during authentication")
+                self._authenticated_account_ids.add(account_id)
             self._logger.info("cTrader account authenticated | account=%s", account_id)
 
     def authenticate(self, account_id: int | str) -> int:
-        """Acquire one venue reference to an authenticated trading account."""
-
+        """Acquire one venue reference without holding state locks across requests."""
         account_id = int(account_id)
         with self._authentication_lock:
             if self._closed:
                 raise RuntimeError("cTrader connection is closed")
-            self._account_ref_counts[account_id] = (
-                self._account_ref_counts.get(account_id, 0) + 1
-            )
+            self._account_ref_counts[account_id] = self._account_ref_counts.get(account_id, 0) + 1
             self._registered_account_ids.add(account_id)
-            try:
-                self._authenticate_account(account_id)
-            except Exception:
-                remaining = self._account_ref_counts[account_id] - 1
+        try:
+            self._authenticate_account(account_id)
+        except Exception:
+            with self._authentication_lock:
+                remaining = self._account_ref_counts.get(account_id, 0) - 1
                 if remaining > 0:
                     self._account_ref_counts[account_id] = remaining
                 else:
                     self._account_ref_counts.pop(account_id, None)
                     self._registered_account_ids.discard(account_id)
-                raise
-            return account_id
+            raise
+        return account_id
 
     def release_account(self, account_id: int | str) -> None:
         """Release one venue reference and close the connection when unused."""
@@ -728,17 +829,173 @@ class CTraderOpenApiConnection:
         if close_connection:
             self._stop_connection()
 
+    @property
+    def trading_ready(self) -> bool:
+        with self._authentication_lock:
+            return (not self._closed and not self._recovery_running
+                    and self._recovery_failure is None and self._connected.is_set()
+                    and self._application_authenticated.is_set()
+                    and self._registered_account_ids <= self._authenticated_account_ids)
+
+    @property
+    def last_recovered_monotonic(self) -> float:
+        with self._authentication_lock:
+            return self._last_recovered_monotonic
+
+    def accepts_market(self, received_monotonic=None) -> bool:
+        with self._authentication_lock:
+            return self.trading_ready and (
+                received_monotonic is None or received_monotonic >= self._last_recovered_monotonic
+            )
+
+    def recovery_state(self) -> dict:
+        with self._authentication_lock:
+            return {
+                "status": ("closed" if self._closed else "paused" if self._recovery_failure
+                           else "ready" if self.trading_ready else "recovering"),
+                "reason": self._recovery_failure,
+                "next_retry_at": self._next_recovery_at,
+                "episode": self._recovery_episode,
+            }
+
+    def set_recovery_callbacks(self, failed, succeeded) -> None:
+        """Register callbacks without changing the strategy's enabled setting."""
+        with self._authentication_lock:
+            self._recovery_failure_callback = failed
+            self._recovery_success_callback = succeeded
+            failure = self._recovery_failure
+        if failure is not None and failed is not None:
+            failed(self, failure)
+
+    def _start_recovery(self) -> None:
+        with self._authentication_lock:
+            if (self._closed or not self._ever_authenticated
+                    or self._recovery_running or self._recovery_failure is not None):
+                return
+            self._recovery_running = True
+            self._recovery_thread = threading.Thread(
+                target=self._reauthenticate, name="ctrader-reauth", daemon=True,
+            )
+            self._recovery_thread.start()
+
+    def _restore_session(self) -> int:
+        if not self._connected.wait(self._timeout):
+            raise ConnectionError("cTrader reconnect timed out")
+        with self._authentication_lock:
+            generation = self._validate_authentication_session()
+        self._start_heartbeat_timer()
+        self._check_access_token(force_if_expiry_unknown=True)
+        self._authenticate_application()
+        self._reload_granted_accounts()
+        with self._authentication_lock:
+            registered_ids = tuple(self._registered_account_ids)
+        for account_id in registered_ids:
+            self._authenticate_account(account_id)
+            # Read positions and pending orders before permitting fresh decisions.
+            self._send_request("ProtoOAReconcileReq", ctidTraderAccountId=account_id)
+            self._send_request("ProtoOATraderReq", ctidTraderAccountId=account_id)
+        with self._quote_lock:
+            subscriptions = [key for key in self._quote_events if key[0] in registered_ids]
+            for key in subscriptions:
+                self._quote_events[key].clear()
+        for account_id, symbol_id in subscriptions:
+            self.subscribe_spots(account_id, symbol_id)
+        with self._authentication_lock:
+            self._validate_authentication_session(generation, require_application=True)
+        return generation
+
+    def _complete_recovery(self, generation) -> None:
+        with self._authentication_lock:
+            self._validate_authentication_session(generation, require_application=True)
+            was_paused = self._recovery_failure is not None
+            self._recovery_failure = None
+            self._next_recovery_at = None
+            self._last_recovered_monotonic = time.monotonic()
+            self._recovery_running = False
+            # Serialize the notification with any following disconnect episode.
+            if was_paused and self._recovery_success_callback is not None:
+                try:
+                    self._recovery_success_callback(self)
+                except Exception:
+                    self._logger.exception("cTrader recovery success callback failed")
+        self._start_token_check_timer()
+        self._logger.info("cTrader connection recovery succeeded | environment=%s", self.environment)
+
+    def _pause_transport(self):
+        with self._authentication_lock:
+            self._transport_paused = True
+            self._connected.clear()
+            self._application_authenticated.clear()
+            self._authenticated_account_ids.clear()
+        with self._quote_lock:
+            self._quotes.clear()
+            for event in self._quote_events.values():
+                event.clear()
+        return self._stop_transport()
+
     def _reauthenticate(self) -> None:
-        try:
-            self._authenticate_application()
-            self._reload_granted_accounts()
-            with self._authentication_lock:
-                registered_ids = tuple(self._registered_account_ids)
-            for account_id in registered_ids:
-                self._authenticate_account(account_id)
-            self._ever_authenticated = True
-        except Exception:
-            self._logger.exception("cTrader Open API reauthentication failed")
+        """Try three times, then make one recovery attempt per hour until stopped."""
+        last_error = "ConnectionError"
+        for attempt in range(self.RECOVERY_ATTEMPTS):
+            if self._recovery_stop.is_set():
+                return
+            if attempt and self._recovery_stop.wait(self.RECOVERY_RETRY_DELAYS[attempt - 1]):
+                return
+            try:
+                self._complete_recovery(self._restore_session())
+                return
+            except Exception as exc:
+                last_error = type(exc).__name__
+                self._logger.exception(
+                    "cTrader connection recovery attempt failed | environment=%s attempt=%s/%s",
+                    self.environment, attempt + 1, self.RECOVERY_ATTEMPTS,
+                )
+        with self._authentication_lock:
+            if self._closed:
+                return
+            self._recovery_episode += 1
+            self._recovery_failure = (
+                f"cTrader recovery paused after {self.RECOVERY_ATTEMPTS} attempts; "
+                f"environment={self.environment}; error_type={last_error}"
+            )
+            self._next_recovery_at = datetime.fromtimestamp(
+                time.time() + self.RECOVERY_COOLDOWN_SECONDS, tz=timezone.utc,
+            ).isoformat()
+        stopped = self._pause_transport()
+        self._logger.error(self._recovery_failure)
+        if self._recovery_failure_callback is not None:
+            try:
+                self._recovery_failure_callback(self, self._recovery_failure)
+            except Exception:
+                self._logger.exception("cTrader recovery failure callback failed")
+
+        while not self._recovery_stop.wait(self.RECOVERY_COOLDOWN_SECONDS):
+            try:
+                if not stopped.wait(self._timeout):
+                    raise TimeoutError("Previous cTrader transport has not stopped")
+                with self._authentication_lock:
+                    if self._closed:
+                        return
+                    self._transport_paused = False
+                    self._next_recovery_at = None
+                def start_service():
+                    if not self._closed and not self._transport_paused:
+                        self._client.startService()
+                self._call_in_reactor(start_service)
+                self._complete_recovery(self._restore_session())
+                return
+            except Exception:
+                self._logger.exception(
+                    "cTrader hourly recovery failed; retrying in one hour | environment=%s",
+                    self.environment,
+                )
+                stopped = self._pause_transport()
+                with self._authentication_lock:
+                    if self._closed:
+                        return
+                    self._next_recovery_at = datetime.fromtimestamp(
+                        time.time() + self.RECOVERY_COOLDOWN_SECONDS, tz=timezone.utc,
+                    ).isoformat()
 
     def _send_request(
         self,
@@ -748,9 +1005,14 @@ class CTraderOpenApiConnection:
         **fields,
     ):
         started = time.monotonic()
+        generation = self._connection_generation
+        recovery_request = threading.current_thread() is self._recovery_thread
         connected_at = submitted_at = None
         success = False
         client_message_id = client_message_id or str(uuid.uuid4())
+        timing = {}
+        with self._request_timing_lock:
+            self._request_timings[client_message_id] = timing
         try:
             if self._closed:
                 raise RuntimeError("cTrader connection is closed")
@@ -766,6 +1028,12 @@ class CTraderOpenApiConnection:
 
             def send() -> None:
                 nonlocal submitted_at
+                if (self._closed or generation != self._connection_generation
+                        or (self._ever_authenticated and (self._recovery_running or self._recovery_failure is not None)
+                            and not recovery_request)):
+                    outcome["error"] = "cTrader session changed or is unavailable"
+                    completed.set()
+                    return
                 submitted_at = time.monotonic()
                 deferred = self._client.send(
                     message,
@@ -778,11 +1046,13 @@ class CTraderOpenApiConnection:
                         outcome["response"] = self._protobuf.extract(envelope)
                     except Exception as exc:
                         outcome["error"] = exc
+                    self._mark_request_timing(client_message_id, "callback_done_at")
                     completed.set()
                     return envelope
 
                 def failed(failure):
                     outcome["error"] = failure
+                    self._mark_request_timing(client_message_id, "failed_at")
                     completed.set()
                     return None
 
@@ -807,17 +1077,41 @@ class CTraderOpenApiConnection:
             return response
         finally:
             finished = time.monotonic()
+            with self._request_timing_lock:
+                measured = dict(self._request_timings.pop(client_message_id, timing))
+            def duration(start, end):
+                return "na" if start is None or end is None else f"{(end - start) * 1000:.1f}"
+            sent_at = measured.get("sent_at")
+            received_at = measured.get("received_at")
+            callback_done_at = measured.get("callback_done_at")
+            phase = ("completed" if success else "callback" if received_at is not None
+                     else "response_wait" if sent_at is not None
+                     else "send_queue" if measured.get("queued_at") is not None
+                     else "sdk_handoff" if submitted_at is not None
+                     else "reactor_dispatch" if connected_at is not None else "connection_wait")
             self._logger.log(
-                logging.DEBUG if success and client_message_id.startswith("dashboard-") else logging.INFO,
+                logging.DEBUG,
                 "cTrader API timing | request=%s request_id=%s account=%s thread=%s "
                 "success=%s total_ms=%.1f connection_wait_ms=%.1f "
-                "dispatch_ms=%.1f sdk_round_trip_ms=%.1f",
+                "dispatch_ms=%.1f sdk_round_trip_ms=%.1f environment=%s phase=%s "
+                "sdk_handoff_ms=%s send_queue_ms=%s response_wait_ms=%s callback_ms=%s "
+                "caller_resume_ms=%s priority_pending=%s dashboard_pending=%s "
+                "window_used=%s send_limit=%s rate_class=%s historical_pending=%s",
                 message_name, client_message_id, fields.get("ctidTraderAccountId"),
                 threading.current_thread().name, success, (finished - started) * 1000,
                 ((finished if connected_at is None else connected_at) - started) * 1000,
                 0.0 if connected_at is None else
                 ((finished if submitted_at is None else submitted_at) - connected_at) * 1000,
                 0.0 if submitted_at is None else (finished - submitted_at) * 1000,
+                self.environment, phase,
+                duration(submitted_at, measured.get("queued_at")),
+                duration(measured.get("queued_at"), sent_at or measured.get("cancelled_at") or finished),
+                duration(sent_at, received_at or finished),
+                duration(received_at, callback_done_at or finished),
+                duration(callback_done_at, finished),
+                measured.get("priority_pending", "na"), measured.get("dashboard_pending", "na"),
+                measured.get("window_used", "na"), measured.get("send_limit", "na"),
+                measured.get("rate_class", "na"), measured.get("historical_pending", "na"),
             )
 
     def request(
@@ -827,16 +1121,33 @@ class CTraderOpenApiConnection:
         client_message_id: str | None = None,
         **fields,
     ):
-        if message_name not in self._AUTHENTICATION_MESSAGES:
-            if not self._application_authenticated.wait(self._timeout):
-                raise ConnectionError("cTrader application session is not authorized")
-            account_id = fields.get("ctidTraderAccountId")
-            if (
-                account_id is not None
-                and int(account_id) not in self._authenticated_account_ids
-            ):
-                raise ConnectionError(
-                    f"cTrader account {int(account_id)} is not authenticated on this connection"
+        if self._closed or (self._ever_authenticated and not self.trading_ready
+                            and threading.current_thread() is not self._recovery_thread):
+            raise CTraderConnectionUnavailable(self._recovery_failure or "cTrader session is unavailable")
+        client_message_id = client_message_id or str(uuid.uuid4())
+        authentication_started = time.monotonic()
+        authorized = False
+        try:
+            if message_name not in self._AUTHENTICATION_MESSAGES:
+                if not self._application_authenticated.wait(self._timeout):
+                    raise ConnectionError("cTrader application session is not authorized")
+                account_id = fields.get("ctidTraderAccountId")
+                if (
+                    account_id is not None
+                    and int(account_id) not in self._authenticated_account_ids
+                ):
+                    raise ConnectionError(
+                        f"cTrader account {int(account_id)} is not authenticated on this connection"
+                    )
+            authorized = True
+        finally:
+            authentication_ms = (time.monotonic() - authentication_started) * 1000
+            if not authorized or authentication_ms >= 50:
+                self._logger.info(
+                    "cTrader session wait | request=%s request_id=%s account=%s environment=%s "
+                    "authorized=%s authentication_wait_ms=%.1f",
+                    message_name, client_message_id, fields.get("ctidTraderAccountId"),
+                    self.environment, authorized, authentication_ms,
                 )
         return self._send_request(
             message_name,
@@ -845,7 +1156,7 @@ class CTraderOpenApiConnection:
         )
 
     def _start_heartbeat_timer(self) -> None:
-        if self._closed:
+        if self._closed or self._transport_paused:
             return
         if self._heartbeat_timer is not None:
             self._heartbeat_timer.cancel()
@@ -857,12 +1168,14 @@ class CTraderOpenApiConnection:
         self._heartbeat_timer.start()
 
     def _heartbeat_timer_handler(self) -> None:
-        if self._closed:
+        if self._closed or self._transport_paused:
             return
         try:
             if self._connected.is_set():
 
                 def send() -> None:
+                    if self._closed or self._transport_paused:
+                        return
                     connected = self._client.whenConnected(failAfterFailures=1)
                     connected.addCallbacks(
                         lambda protocol: protocol.heartbeat(),
@@ -879,7 +1192,7 @@ class CTraderOpenApiConnection:
             self._start_heartbeat_timer()
 
     def _start_token_check_timer(self) -> None:
-        if self._closed:
+        if self._closed or self._transport_paused:
             return
         if self._token_check_timer is not None:
             self._token_check_timer.cancel()
@@ -891,12 +1204,13 @@ class CTraderOpenApiConnection:
         self._token_check_timer.start()
 
     def _token_check_timer_handler(self) -> None:
-        if self._closed:
+        if self._closed or self._transport_paused:
             return
         try:
             self._check_access_token(force_if_expiry_unknown=True)
         except Exception:
             self._logger.exception("cTrader access token check failed")
+            self._start_recovery()
         finally:
             self._start_token_check_timer()
 
@@ -948,14 +1262,17 @@ class CTraderOpenApiConnection:
 
     @property
     def granted_account_ids(self) -> tuple[int, ...]:
-        return tuple(sorted(self._granted_account_ids))
+        with self._authentication_lock:
+            return tuple(sorted(self._granted_account_ids))
 
     @property
     def authenticated_account_ids(self) -> tuple[int, ...]:
         with self._authentication_lock:
             return tuple(sorted(self._authenticated_account_ids))
 
-    def _stop_connection(self) -> None:
+    def _stop_transport(self):
+        """Stop network activity while retaining account and subscription ownership."""
+        stopped = threading.Event()
         if self._heartbeat_timer is not None:
             self._heartbeat_timer.cancel()
             self._heartbeat_timer = None
@@ -964,7 +1281,25 @@ class CTraderOpenApiConnection:
             self._token_check_timer = None
         client = getattr(self, "_client", None)
         if client is not None:
-            self._call_in_reactor(client.stopService)
+            def stop_service():
+                # The SDK override skips stopping while disconnected.
+                if client.running:
+                    pending = ClientService.stopService(client)
+                    pending.addCallbacks(
+                        lambda result: stopped.set(),
+                        lambda failure: self._logger.error("cTrader transport stop failed | environment=%s error=%s", self.environment, failure),
+                    )
+                else:
+                    stopped.set()
+            self._call_in_reactor(stop_service)
+        else:
+            stopped.set()
+        return stopped
+
+    def _stop_connection(self) -> None:
+        self._recovery_stop.set()
+        self._next_recovery_at = None
+        self._stop_transport()
 
     def shutdown(self) -> None:
         """Force-close the connection and discard every account reference."""
@@ -973,6 +1308,8 @@ class CTraderOpenApiConnection:
             if self._closed:
                 return
             self._closed = True
+            self._connected.clear()
+            self._application_authenticated.clear()
             self._account_ref_counts.clear()
             self._registered_account_ids.clear()
             self._authenticated_account_ids.clear()
@@ -996,7 +1333,7 @@ class CTraderVenue(VenueBase, AccountDashboard):
         logger: logging.Logger | None = None,
         trader_login: int | str | None = None,
         environment: str = "live",
-        timeout: float = 10.0,
+        timeout: float = 3.0,
         api: Any = None,
         firm: Firm,
     ):
@@ -1150,12 +1487,34 @@ class CTraderVenue(VenueBase, AccountDashboard):
             "ProtoOATraderReq",
             ctidTraderAccountId=self.account_id,
         )
-        trader = trader_response.trader
-        balance = self._money(trader.balance, getattr(trader, "moneyDigits", 0))
         pnl_response = self.api.request(
             "ProtoOAGetPositionUnrealizedPnLReq",
             ctidTraderAccountId=self.account_id,
         )
+        return self._equity_from_responses(trader_response, pnl_response)
+
+    def get_execution_state(self) -> tuple[PositionView, AccountView]:
+        """Fetch fresh strategy inputs concurrently; never use dashboard caches."""
+        names = ("ProtoOAReconcileReq", "ProtoOATraderReq", "ProtoOAGetPositionUnrealizedPnLReq")
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix=f"ctrader-execution-read-{self.account_id}") as workers:
+            pending = {
+                name: workers.submit(self.api.request, name, ctidTraderAccountId=self.account_id)
+                for name in names
+            }
+            responses = {name: future.result() for name, future in pending.items()}
+        position = self._state_from_positions(self._filter_positions(responses["ProtoOAReconcileReq"]))
+        equity = self._equity_from_responses(
+            responses["ProtoOATraderReq"], responses["ProtoOAGetPositionUnrealizedPnLReq"],
+        )
+        trader = responses["ProtoOATraderReq"].trader
+        balance = self._money(trader.balance, getattr(trader, "moneyDigits", 0))
+        if not math.isfinite(balance) or balance < 0:
+            raise RuntimeError("cTrader returned invalid account balance")
+        return position, AccountView(equity=equity, balance=balance)
+
+    def _equity_from_responses(self, trader_response, pnl_response) -> float:
+        trader = trader_response.trader
+        balance = self._money(trader.balance, getattr(trader, "moneyDigits", 0))
         pnl = sum(
             self._money(item.netUnrealizedPnL, pnl_response.moneyDigits)
             for item in pnl_response.positionUnrealizedPnL
@@ -1168,7 +1527,9 @@ class CTraderVenue(VenueBase, AccountDashboard):
     def _dashboard_request(self, message_name, **fields):
         pending = getattr(self._dashboard_local, "pending", None)
         if pending is not None:
-            return pending(message_name)
+            response = pending(message_name)
+            self._dashboard_local.read_times.append(pending.updated_at(message_name))
+            return response
         return self.api.request(
             message_name, client_message_id=f"dashboard-{uuid.uuid4()}", **fields,
         )
@@ -1180,16 +1541,41 @@ class CTraderVenue(VenueBase, AccountDashboard):
     def get_dashboard_snapshot(self):
         # All three reads are independent. Each response is reused by both cards.
         names = ("ProtoOATraderReq", "ProtoOAGetPositionUnrealizedPnLReq", "ProtoOAReconcileReq")
+        started = time.monotonic()
+        request_ids = {name: f"dashboard-{uuid.uuid4()}" for name in names}
         self._dashboard_local.pending = self.dashboard_reads.batch({
             name: lambda name=name: self.api.request(
-                name, client_message_id=f"dashboard-{uuid.uuid4()}",
+                name, client_message_id=request_ids[name],
                 ctidTraderAccountId=self.account_id,
             ) for name in names
-        })
+        }, logger=self.logger, context=f"ctrader:{self.account_id}:{self.label}", request_ids=request_ids)
+        updated_at = {}
+
+        def collect(component, operation):
+            self._dashboard_local.read_times = []
+            value = operation()
+            updated_at[component] = min(self._dashboard_local.read_times)
+            return value
+
         try:
-            return collect_dashboard(self.get_dashboard_balance, self.get_dashboard_position)
+            snapshot = collect_dashboard(
+                lambda: collect("account", self.get_dashboard_balance),
+                lambda: collect("position", self.get_dashboard_position),
+                updated_at=updated_at.__getitem__,
+            )
+            elapsed_ms = (time.monotonic() - started) * 1000
+            self.logger.log(
+                logging.INFO if snapshot.errors or elapsed_ms >= 500 else logging.DEBUG,
+                "cTrader dashboard timing | account=%s label=%s total_ms=%.1f deadline_ms=1000 "
+                "account_available=%s position_available=%s requests=%s",
+                self.account_id, self.label, elapsed_ms, snapshot.account_available,
+                snapshot.position_available,
+                ",".join(f"{name}:{self._dashboard_local.pending.request_id(name)}" for name in names),
+            )
+            return snapshot
         finally:
             del self._dashboard_local.pending
+            del self._dashboard_local.read_times
 
     def get_dashboard_balance(self) -> AccountBalance:
         trader_response = self._dashboard_request(
@@ -1368,7 +1754,9 @@ class CTraderVenue(VenueBase, AccountDashboard):
         ]
 
     def get_current_state(self) -> PositionView:
-        positions = self._positions()
+        return self._state_from_positions(self._positions())
+
+    def _state_from_positions(self, positions) -> PositionView:
         if not positions:
             return PositionView()
         sides = {int(position.tradeData.tradeSide) for position in positions}
@@ -1589,15 +1977,19 @@ class CTraderVenue(VenueBase, AccountDashboard):
         order_type = int(getattr(order, "orderType", 0) or 0)
         with self._execution_event_lock:
             order_role = self._execution_roles.get(execution_id)
-        if order_role is None:
-            order_role = (
-                "exit"
-                if is_closing
-                or order_type == OpenApiModelMessages_pb2.STOP_LOSS_TAKE_PROFIT
-                else "entry"
-            )
+        if is_closing or order_type == OpenApiModelMessages_pb2.STOP_LOSS_TAKE_PROFIT:
+            if order_role == "entry":
+                # A protection may echo the entry client ID. It is a separate order.
+                execution_id = f"ctrader-{self.account_id}-exit-{order_id or deal_id}"
+                if order_id:
+                    with self._execution_event_lock:
+                        self._execution_ids_by_order_id[order_id] = execution_id
+            order_role = "exit"
+        elif order_role is None:
+            order_role = "entry"
         trade_side = int(
-            getattr(deal, "tradeSide", 0) or getattr(trade_data, "tradeSide", 0) or 0
+            (getattr(deal, "tradeSide", 0) if deal_id else 0)
+            or getattr(trade_data, "tradeSide", 0) or 0
         )
         side = (
             "buy"
@@ -1838,9 +2230,10 @@ class CTraderVenue(VenueBase, AccountDashboard):
                         if raw_volume > 0
                         else submitted_quantity / max(1, len(responses))
                     ),
-                    status=self._normalized_order_status(
-                        int(getattr(order, "orderStatus", 0) or 0)
-                    ),
+                    status=order_status([
+                        self._normalized_order_status(int(getattr(order, "orderStatus", 0) or 0)),
+                        self._normalized_execution_status(int(getattr(response, "executionType", 0) or 0)),
+                    ]),
                 )
             )
         return tuple(orders)
@@ -1865,9 +2258,9 @@ class CTraderVenue(VenueBase, AccountDashboard):
         result = kwargs["result"]
         responses = result if isinstance(result, list) else [result]
         errors = [
-            response.rejection_reason
+            str(getattr(response, "rejection_reason", "") or getattr(response, "errorCode", ""))
             for response in responses
-            if getattr(response, "rejection_reason", "")
+            if getattr(response, "rejection_reason", "") or getattr(response, "errorCode", "")
         ]
         if errors:
             report = replace(
@@ -1888,7 +2281,7 @@ class CTraderVenue(VenueBase, AccountDashboard):
         is_buy,
         stop_loss_pct=None,
         take_profit_pct=None,
-        interval_ms=500,
+        interval_ms=0,
         *,
         order_type=OrderType.MARKET,
         price=None,
@@ -1992,8 +2385,10 @@ class CTraderVenue(VenueBase, AccountDashboard):
                 # Keep earlier child fills and stop submitting further batches.
                 break
             responses.append(response)
-            if index + 1 < len(batches):
-                time.sleep(max(0.0, float(interval_ms) / 1000.0))
+            if self._normalized_execution_status(int(getattr(response, "executionType", 0) or 0)) == "rejected":
+                break
+            if index + 1 < len(batches) and float(interval_ms) > 0:
+                time.sleep(float(interval_ms) / 1000.0)
         return responses
 
     def close_position(self, size=None, execution_id=None, **kwargs):

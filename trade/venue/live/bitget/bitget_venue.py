@@ -28,6 +28,7 @@ from trade.core.dashboard_base import (
     AccountPositionComponent,
     MarginMode,
     PositionSide,
+    collect_dashboard,
 )
 from trade.core.execution import ExecutionEvent, ExecutionFill, ExecutionOrder
 from trade.core.protocol import OrderType, PositionDir, PositionView
@@ -69,6 +70,7 @@ class BitgetVenue(VenueBase, AccountDashboard):
         *,
         logger: logging.Logger | None = None,
         session: requests.Session | None = None,
+        session_factory=None,
         timeout: float = 10.0,
         enable_user_stream: bool = True,
         read_only: bool = False,
@@ -79,8 +81,13 @@ class BitgetVenue(VenueBase, AccountDashboard):
         self.timeout = float(timeout)
         self.read_only = bool(read_only)
         self.session = session or requests.Session()
-        self._request_lock = threading.RLock()
-        self._operation_lock = threading.RLock()
+        self._state_lock = threading.RLock()
+        self._rate_lock = threading.Lock()
+        self._session_condition = threading.Condition()
+        self._session_factory = session_factory or requests.Session
+        self._idle_sessions = [self.session]
+        self._active_requests = 0
+        self._protection_version = 0
         self._stream_lock = threading.RLock()
         self._last_request: dict[str, float] = {}
         self._execution_ids: dict[str, str] = {}
@@ -94,6 +101,7 @@ class BitgetVenue(VenueBase, AccountDashboard):
         self._stream_messages: queue.Queue = queue.Queue()
         self._subscribed_channels: set[str] = set()
         self._last_pong = time.monotonic()
+        self._stream_attempt = 0
         self._reconcile_since = datetime.now(timezone.utc)
         try:
             self.api_key = self._load_credential(key_path, "apikey")
@@ -138,6 +146,34 @@ class BitgetVenue(VenueBase, AccountDashboard):
             raise RuntimeError("Bitget venue is read-only")
 
     def _request(self, method, path, params=None, *, signed=False):
+        # A session is exclusively leased, never shared by concurrent requests.
+        with self._session_condition:
+            if self._stream_stop.is_set():
+                raise RuntimeError("Bitget venue has been shut down")
+            session = self._idle_sessions.pop() if self._idle_sessions else self._session_factory()
+            self._active_requests += 1
+        try:
+            return self._request_with_session(session, method, path, params, signed=signed)
+        finally:
+            with self._session_condition:
+                self._idle_sessions.append(session)
+                self._active_requests -= 1
+                self._session_condition.notify_all()
+
+    def _wait_for_request_slot(self, path):
+        # Share endpoint pacing, but never hold a lock while sleeping or doing I/O.
+        while not self._stream_stop.is_set():
+            with self._rate_lock:
+                now = time.monotonic()
+                delay = self.REQUEST_INTERVAL_SECONDS - (now - self._last_request.get(path, 0.0))
+                if delay <= 0:
+                    self._last_request[path] = now
+                    return
+            if self._stream_stop.wait(delay):
+                break
+        raise RuntimeError("Bitget venue has been shut down")
+
+    def _request_with_session(self, session, method, path, params=None, *, signed=False):
         method = method.upper()
         if method != "GET":
             self._require_writable()
@@ -145,59 +181,51 @@ class BitgetVenue(VenueBase, AccountDashboard):
         query = urlencode(payload) if method == "GET" else ""
         body = json.dumps(payload, separators=(",", ":")) if method != "GET" else ""
         request_path = path + (f"?{query}" if query else "")
-        with self._request_lock:
-            if self._stream_stop.is_set():
-                raise RuntimeError("Bitget venue has been shut down")
-            delay = self.REQUEST_INTERVAL_SECONDS - (
-                time.monotonic() - self._last_request.get(path, 0.0)
+        self._wait_for_request_slot(path)
+        headers = {"Content-Type": "application/json", "locale": "en-US"}
+        if signed:
+            timestamp = str(int(time.time() * 1000))
+            headers.update(
+                {
+                    "ACCESS-KEY": self.api_key,
+                    "ACCESS-PASSPHRASE": self.passphrase,
+                    "ACCESS-TIMESTAMP": timestamp,
+                    "ACCESS-SIGN": self._sign(
+                        timestamp + method + request_path + body
+                    ),
+                }
             )
-            if delay > 0:
-                time.sleep(delay)
-            headers = {"Content-Type": "application/json", "locale": "en-US"}
-            if signed:
-                timestamp = str(int(time.time() * 1000))
-                headers.update(
-                    {
-                        "ACCESS-KEY": self.api_key,
-                        "ACCESS-PASSPHRASE": self.passphrase,
-                        "ACCESS-TIMESTAMP": timestamp,
-                        "ACCESS-SIGN": self._sign(
-                            timestamp + method + request_path + body
-                        ),
-                    }
-                )
-            self._last_request[path] = time.monotonic()
-            try:
-                response = self.session.request(
-                    method,
-                    self.BASE_URL + request_path,
-                    data=body or None,
-                    headers=headers,
-                    timeout=self.timeout,
-                    allow_redirects=False,
-                )
-            except requests.RequestException as exc:
-                # Requests exceptions retain headers; do not propagate credential objects.
-                raise RuntimeError(
-                    f"Bitget transport failed for {path}: {type(exc).__name__}"
-                ) from None
-            try:
-                result = response.json()
-            except ValueError:
-                raise RuntimeError(
-                    f"Bitget returned non-JSON data for {path}: HTTP {response.status_code}"
-                ) from None
-            if not isinstance(result, dict):
-                raise RuntimeError(f"Bitget returned invalid response data for {path}")
-            if not 200 <= response.status_code < 300 or result.get("code") != "00000":
-                raise BitgetAPIError(
-                    path,
-                    str(result.get("code", response.status_code)),
-                    self._redact(result.get("msg", "Request rejected")),
-                )
-            if "data" not in result:
-                raise RuntimeError(f"Bitget response has no data for {path}")
-            return result["data"]
+        try:
+            response = session.request(
+                method,
+                self.BASE_URL + request_path,
+                data=body or None,
+                headers=headers,
+                timeout=self.timeout,
+                allow_redirects=False,
+            )
+        except requests.RequestException as exc:
+            # Requests exceptions retain headers; do not propagate credential objects.
+            raise RuntimeError(
+                f"Bitget transport failed for {path}: {type(exc).__name__}"
+            ) from None
+        try:
+            result = response.json()
+        except ValueError:
+            raise RuntimeError(
+                f"Bitget returned non-JSON data for {path}: HTTP {response.status_code}"
+            ) from None
+        if not isinstance(result, dict):
+            raise RuntimeError(f"Bitget returned invalid response data for {path}")
+        if not 200 <= response.status_code < 300 or result.get("code") != "00000":
+            raise BitgetAPIError(
+                path,
+                str(result.get("code", response.status_code)),
+                self._redact(result.get("msg", "Request rejected")),
+            )
+        if "data" not in result:
+            raise RuntimeError(f"Bitget response has no data for {path}")
+        return result["data"]
 
     def _symbol_params(self, **extra) -> dict[str, Any]:
         return {"symbol": self.symbol, "productType": self.PRODUCT_TYPE, **extra}
@@ -287,7 +315,8 @@ class BitgetVenue(VenueBase, AccountDashboard):
     def _new_client_order_id(self, action: str, execution_id=None) -> str:
         client_id = self._client_order_prefix(action) + uuid.uuid4().hex[:12]
         if execution_id:
-            self._execution_ids[client_id] = str(execution_id)
+            with self._state_lock:
+                self._execution_ids[client_id] = str(execution_id)
         return client_id
 
     def _order_action(self, client_id: str) -> str | None:
@@ -355,21 +384,18 @@ class BitgetVenue(VenueBase, AccountDashboard):
         return AccountBalance(balance=balance, equity=equity, used_margin=used_margin)
 
     def get_current_state(self) -> PositionView:
-        with self._operation_lock:
-            position = self._position()
-            if position is None:
-                if self._protective_orders and not self.read_only:
-                    self._cancel_owned_protective_orders()
-                return PositionView()
-            return PositionView(
-                dir=(
-                    PositionDir.POSITIVE
-                    if position["holdSide"] == "long"
-                    else PositionDir.NEGATIVE
-                ),
-                size=float(position["total"]),
-                price=float(position["openPriceAvg"]),
-            )
+        position = self._position()
+        if position is None:
+            return PositionView()
+        return PositionView(
+            dir=(
+                PositionDir.POSITIVE
+                if position["holdSide"] == "long"
+                else PositionDir.NEGATIVE
+            ),
+            size=float(position["total"]),
+            price=float(position["openPriceAvg"]),
+        )
 
     @staticmethod
     def _timestamp(value) -> datetime:
@@ -450,12 +476,17 @@ class BitgetVenue(VenueBase, AccountDashboard):
         )
 
     def _sync_protective_orders(self) -> list[dict]:
+        with self._state_lock:
+            self._protection_version += 1
+            version = self._protection_version
         orders = [
             row
             for row in self._pending_plans()
             if self._order_action(str(row.get("clientOid", ""))) in {"sl", "tp"}
         ]
-        self._protective_orders = {str(row["orderId"]): row for row in orders}
+        with self._state_lock:
+            if version == self._protection_version:
+                self._protective_orders = {str(row["orderId"]): row for row in orders}
         return orders
 
     def _restore_triggered_order_owners(self, **filters) -> list[dict]:
@@ -476,12 +507,14 @@ class BitgetVenue(VenueBase, AccountDashboard):
                 and child_id
                 and child_id != "0"
             ):
-                self._protective_clients_by_order_id[child_id] = client_id
+                with self._state_lock:
+                    self._protective_clients_by_order_id[child_id] = client_id
                 owned.append(plan)
         return owned
 
     def _attribute_order(self, order: dict) -> dict:
-        client_id = self._protective_clients_by_order_id.get(str(order.get("orderId")))
+        with self._state_lock:
+            client_id = self._protective_clients_by_order_id.get(str(order.get("orderId")))
         return {**order, "clientOid": client_id} if client_id else order
 
     def _cancel_triggered_protective_orders(self) -> None:
@@ -513,37 +546,6 @@ class BitgetVenue(VenueBase, AccountDashboard):
             )
             self._wait_for_order(order)
 
-    def _cancel_owned_protective_orders(self) -> None:
-        self._require_writable()
-        failures = []
-        for order in self._sync_protective_orders():
-            try:
-                result = self._request(
-                    "POST",
-                    "/api/v2/mix/order/cancel-plan-order",
-                    self._symbol_params(
-                        marginCoin=self.MARGIN_COIN,
-                        planType=order["planType"],
-                        orderIdList=[{"orderId": str(order["orderId"])}],
-                    ),
-                    signed=True,
-                )
-                if (
-                    not isinstance(result, dict)
-                    or result.get("failureList")
-                    or not result.get("successList")
-                ):
-                    raise RuntimeError(
-                        "Bitget did not confirm protective order cancellation"
-                    )
-                self._protective_orders.pop(str(order["orderId"]), None)
-            except Exception as exc:
-                failures.append(exc)
-        if failures:
-            raise RuntimeError(
-                f"Failed to cancel {len(failures)} Bitget protective orders"
-            ) from failures[0]
-
     def _assert_no_open_orders(self) -> None:
         regular = list(
             self._pages(
@@ -563,50 +565,65 @@ class BitgetVenue(VenueBase, AccountDashboard):
             )
 
     def _protective_price(self, action: str) -> float | None:
+        with self._state_lock:
+            orders = tuple(self._protective_orders.values())
         prices = {
             float(order["triggerPrice"])
-            for order in self._protective_orders.values()
+            for order in orders
             if self._order_action(str(order.get("clientOid", ""))) == action
         }
         return prices.pop() if len(prices) == 1 else None
 
+    def get_dashboard_overview(self):
+        result = self.dashboard_reads.batch({
+            "account": self.get_dashboard_balance,
+            "overview_position": lambda: self._dashboard_position(include_protection=False),
+        })
+        return collect_dashboard(
+            lambda: result("account"), lambda: result("overview_position"),
+            updated_at=lambda component: result.updated_at("account" if component == "account" else "overview_position"),
+        )
+
     def get_dashboard_position(self) -> AccountPosition | None:
-        with self._operation_lock:
-            position = self._position()
-            if position is None:
-                return None
+        return self._dashboard_position(include_protection=True)
+
+    def _dashboard_position(self, *, include_protection) -> AccountPosition | None:
+        position = self._position()
+        if position is None:
+            return None
+        if include_protection:
             self._sync_protective_orders()
-            quantity = float(position["total"])
-            entry = float(position["openPriceAvg"])
-            mark = self._positive(position["markPrice"], "mark price")
-            pnl = float(position["unrealizedPL"])
-            sl, tp = self._protective_price("sl"), self._protective_price("tp")
-            liquidation = float(position.get("liquidationPrice") or 0)
-            return AccountPosition(
-                symbol=self.symbol,
-                side=(
-                    PositionSide.LONG
-                    if position["holdSide"] == "long"
-                    else PositionSide.SHORT
-                ),
-                quantity=quantity,
-                entry_price=entry,
-                mark_price=mark,
-                notional=quantity * mark,
-                unrealized_pnl=pnl,
-                unrealized_pnl_pct=pnl / (quantity * entry),
-                leverage=float(position["leverage"]),
-                liquidation_price=liquidation if liquidation > 0 else None,
-                margin_mode=(
-                    MarginMode.CROSS
-                    if position["marginMode"] == "crossed"
-                    else MarginMode.ISOLATED
-                ),
-                opened_at=self._timestamp(position["cTime"]),
-                stop_loss_price=sl,
-                take_profit_price=tp,
-                components=(AccountPositionComponent(quantity, entry, sl, tp),),
-            )
+        quantity = float(position["total"])
+        entry = float(position["openPriceAvg"])
+        mark = self._positive(position["markPrice"], "mark price")
+        pnl = float(position["unrealizedPL"])
+        sl, tp = (self._protective_price("sl"), self._protective_price("tp")) if include_protection else (None, None)
+        liquidation = float(position.get("liquidationPrice") or 0)
+        return AccountPosition(
+            symbol=self.symbol,
+            side=(
+                PositionSide.LONG
+                if position["holdSide"] == "long"
+                else PositionSide.SHORT
+            ),
+            quantity=quantity,
+            entry_price=entry,
+            mark_price=mark,
+            notional=quantity * mark,
+            unrealized_pnl=pnl,
+            unrealized_pnl_pct=pnl / (quantity * entry),
+            leverage=float(position["leverage"]),
+            liquidation_price=liquidation if liquidation > 0 else None,
+            margin_mode=(
+                MarginMode.CROSS
+                if position["marginMode"] == "crossed"
+                else MarginMode.ISOLATED
+            ),
+            opened_at=self._timestamp(position["cTime"]),
+            stop_loss_price=sl,
+            take_profit_price=tp,
+            components=(AccountPositionComponent(quantity, entry, sl, tp),),
+        )
 
     def _order_detail(self, order: dict) -> dict:
         identifier = (
@@ -690,7 +707,9 @@ class BitgetVenue(VenueBase, AccountDashboard):
         )
         if not isinstance(data, dict) or not data.get("orderId"):
             raise RuntimeError("Bitget did not acknowledge protective order")
-        self._protective_orders[str(data["orderId"])] = {**params, **data}
+        with self._state_lock:
+            self._protection_version += 1
+            self._protective_orders[str(data["orderId"])] = {**params, **data}
 
     def submit_order(
         self,
@@ -736,108 +755,100 @@ class BitgetVenue(VenueBase, AccountDashboard):
         ):
             if pct:
                 self._trigger_price(reference * (1 + direction * float(pct)))
-        with self._operation_lock:
-            self._load_account_mode()
-            if self._position() is not None:
-                raise RuntimeError(
-                    f"Refusing to open over an existing Bitget position: {self.symbol}"
-                )
-            self._cancel_owned_protective_orders()
-            self._assert_no_open_orders()
-            client_id = self._new_client_order_id("open", execution_id)
-            params = self._symbol_params(
-                marginCoin=self.MARGIN_COIN,
-                marginMode=self.margin_mode,
-                size=self._decimal_string(quantity),
-                side="buy" if is_buy else "sell",
-                orderType=order_type.value,
-                clientOid=client_id,
+        self._load_account_mode()
+        if self._position() is not None:
+            raise RuntimeError(
+                f"Refusing to open over an existing Bitget position: {self.symbol}"
             )
-            if self.hedge_mode:
-                params["tradeSide"] = "open"
+        self._assert_no_open_orders()
+        client_id = self._new_client_order_id("open", execution_id)
+        params = self._symbol_params(
+            marginCoin=self.MARGIN_COIN,
+            marginMode=self.margin_mode,
+            size=self._decimal_string(quantity),
+            side="buy" if is_buy else "sell",
+            orderType=order_type.value,
+            clientOid=client_id,
+        )
+        if self.hedge_mode:
+            params["tradeSide"] = "open"
+        if order_type == OrderType.LIMIT:
+            params.update(price=self._trigger_price(price), force="gtc")
+        try:
+            result = self._place_order(params, wait=order_type == OrderType.MARKET)
             if order_type == OrderType.LIMIT:
-                params.update(price=self._trigger_price(price), force="gtc")
-            try:
-                result = self._place_order(params, wait=order_type == OrderType.MARKET)
-                if order_type == OrderType.LIMIT:
-                    return result
-                filled = Decimal(str(result.get("baseVolume") or "0"))
-                if filled <= 0:
-                    raise RuntimeError("Bitget entry completed without a fill")
-                executed_price = self._positive(
-                    result["priceAvg"], "average fill price"
-                )
-                for action, pct, direction in (
-                    ("sl", stop_loss_pct, -1 if is_buy else 1),
-                    ("tp", take_profit_pct, 1 if is_buy else -1),
-                ):
-                    if pct:
-                        self._place_protection(
-                            action,
-                            self._trigger_price(
-                                executed_price * (1 + direction * float(pct))
-                            ),
-                            is_buy,
-                            execution_id,
-                        )
                 return result
-            except Exception:
-                self.logger.error(
-                    "Bitget entry/protection failed; reconciling entry and closing its fills"
-                )
-                try:
-                    self._cancel_entry_and_flatten(client_id)
-                except Exception as cleanup_error:
-                    self.logger.error(
-                        "Bitget entry recovery failed: %s", self._redact(cleanup_error)
+            filled = Decimal(str(result.get("baseVolume") or "0"))
+            if filled <= 0:
+                raise RuntimeError("Bitget entry completed without a fill")
+            executed_price = self._positive(
+                result["priceAvg"], "average fill price"
+            )
+            for action, pct, direction in (
+                ("sl", stop_loss_pct, -1 if is_buy else 1),
+                ("tp", take_profit_pct, 1 if is_buy else -1),
+            ):
+                if pct:
+                    self._place_protection(
+                        action,
+                        self._trigger_price(
+                            executed_price * (1 + direction * float(pct))
+                        ),
+                        is_buy,
+                        execution_id,
                     )
-                    raise RuntimeError(
-                        "Bitget entry failed and recovery could not confirm a flat position"
-                    ) from cleanup_error
-                raise
+            return result
+        except Exception:
+            self.logger.error(
+                "Bitget entry/protection failed; reconciling entry and closing its fills"
+            )
+            try:
+                self._cancel_entry_and_flatten(client_id)
+            except Exception as cleanup_error:
+                self.logger.error(
+                    "Bitget entry recovery failed: %s", self._redact(cleanup_error)
+                )
+                raise RuntimeError(
+                    "Bitget entry failed and recovery could not confirm a flat position"
+                ) from cleanup_error
+            raise
 
     def close_position(self, size=None, execution_id=None):
         self._require_writable()
         if size is not None:
             self._positive(size, "close quantity")
-        with self._operation_lock:
-            position = self._position()
-            if position is None:
-                self._cancel_owned_protective_orders()
-                return None
-            self._load_account_mode()
-            self._cancel_triggered_protective_orders()
-            # A triggered protection may have filled while its cancellation was in flight.
-            position = self._position()
-            if position is None:
-                self._cancel_owned_protective_orders()
-                return None
-            available = Decimal(str(position["total"]))
-            quantity = self._floor_to_step(
-                available if size is None else min(available, Decimal(str(size))),
-                self.quantity_step,
-            )
-            if quantity <= 0 or quantity > self.maximum_market_quantity:
-                raise ValueError("Bitget close quantity is outside the contract limits")
-            is_long = position["holdSide"] == "long"
-            params = self._symbol_params(
-                marginCoin=self.MARGIN_COIN,
-                marginMode=position["marginMode"],
-                size=self._decimal_string(quantity),
-                orderType="market",
-                clientOid=self._new_client_order_id("close", execution_id),
-            )
-            if self.hedge_mode:
-                params.update(side="buy" if is_long else "sell", tradeSide="close")
-            else:
-                params.update(side="sell" if is_long else "buy", reduceOnly="YES")
-            result = self._place_order(params, wait=True)
-            if float(result.get("baseVolume") or 0) <= 0:
-                raise RuntimeError("Bitget close completed without a fill")
-            # Preserve protection if a partial close leaves any exposure.
-            if self._position() is None:
-                self._cancel_owned_protective_orders()
-            return result
+        position = self._position()
+        if position is None:
+            return None
+        self._load_account_mode()
+        self._cancel_triggered_protective_orders()
+        # A triggered protection may have filled while its cancellation was in flight.
+        position = self._position()
+        if position is None:
+            return None
+        available = Decimal(str(position["total"]))
+        quantity = self._floor_to_step(
+            available if size is None else min(available, Decimal(str(size))),
+            self.quantity_step,
+        )
+        if quantity <= 0 or quantity > self.maximum_market_quantity:
+            raise ValueError("Bitget close quantity is outside the contract limits")
+        is_long = position["holdSide"] == "long"
+        params = self._symbol_params(
+            marginCoin=self.MARGIN_COIN,
+            marginMode=position["marginMode"],
+            size=self._decimal_string(quantity),
+            orderType="market",
+            clientOid=self._new_client_order_id("close", execution_id),
+        )
+        if self.hedge_mode:
+            params.update(side="buy" if is_long else "sell", tradeSide="close")
+        else:
+            params.update(side="sell" if is_long else "buy", reduceOnly="YES")
+        result = self._place_order(params, wait=True)
+        if float(result.get("baseVolume") or 0) <= 0:
+            raise RuntimeError("Bitget close completed without a fill")
+        return result
 
     @staticmethod
     def _status(raw: str) -> str:
@@ -928,12 +939,12 @@ class BitgetVenue(VenueBase, AccountDashboard):
             if fill
             else f"{status}:{int(timestamp.timestamp() * 1000)}"
         )
+        with self._state_lock:
+            execution_id = self._execution_ids.get(client_id, f"bitget-{account_id}-{order_id}")
         self._emit_execution_event(
             ExecutionEvent(
                 event_id=f"bitget:{account_id}:{self.symbol}:{order_id}:{identity}",
-                execution_id=self._execution_ids.get(
-                    client_id, f"bitget-{account_id}-{order_id}"
-                ),
+                execution_id=execution_id,
                 status=status,
                 event_at_utc=timestamp,
                 order_role="entry" if action == "open" else "exit",
@@ -986,6 +997,36 @@ class BitgetVenue(VenueBase, AccountDashboard):
     def wait_for_user_stream(self, timeout: float = 15.0) -> bool:
         return self._stream_ready.wait(timeout)
 
+    def _stream_diagnostics(self, app):
+        state = getattr(app, "_bitget_diagnostics", None)
+        if not isinstance(state, dict):
+            self._stream_attempt += 1
+            state = {
+                "attempt": self._stream_attempt,
+                "started": time.monotonic(),
+                "stage": "connecting",
+                "local_close": "none",
+                "channels": [],
+            }
+            app._bitget_diagnostics = state
+        return state
+
+    def _stream_context(self, app):
+        state = self._stream_diagnostics(app)
+        now = time.monotonic()
+
+        def age(key):
+            value = state.get(key)
+            return "never" if value is None else f"{max(0, now - value):.3f}"
+
+        return (
+            f"symbol={self.symbol} attempt={state['attempt']} stage={state['stage']} "
+            f"attempt_age_s={age('started')} connected_age_s={age('opened')} "
+            f"last_ping_age_s={age('ping')} last_pong_age_s={age('pong')} "
+            f"last_message_age_s={age('message')} local_close={state['local_close']} "
+            f"subscribed_channels={','.join(state['channels']) or 'none'}"
+        )
+
     def _run_user_stream(self):
         while not self._stream_stop.is_set():
             app = websocket.WebSocketApp(
@@ -999,6 +1040,7 @@ class BitgetVenue(VenueBase, AccountDashboard):
                 if self._stream_stop.is_set():
                     return
                 self._stream_app = app
+                self._stream_diagnostics(app)
             try:
                 app.run_forever(ping_interval=0)
             except Exception as exc:
@@ -1010,6 +1052,8 @@ class BitgetVenue(VenueBase, AccountDashboard):
             self._stream_stop.wait(self.USER_STREAM_RECONNECT_SECONDS)
 
     def _on_stream_open(self, app):
+        state = self._stream_diagnostics(app)
+        state.update(opened=time.monotonic(), stage="login")
         self._subscribed_channels.clear()
         self._stream_error = None
         self._last_pong = time.monotonic()
@@ -1031,8 +1075,11 @@ class BitgetVenue(VenueBase, AccountDashboard):
         )
 
     def _on_stream_message(self, app, raw_message):
+        state = self._stream_diagnostics(app)
+        state["message"] = time.monotonic()
         if raw_message == "pong":
             self._last_pong = time.monotonic()
+            state["pong"] = self._last_pong
             return
         try:
             payload = json.loads(raw_message)
@@ -1040,12 +1087,14 @@ class BitgetVenue(VenueBase, AccountDashboard):
             if event == "error" or (
                 event == "login" and str(payload.get("code")) != "0"
             ):
-                self._stream_error = (
+                self._stream_error = self._redact(
                     f"Bitget user stream rejected: code={payload.get('code')}"
                 )
-                self.logger.error(self._stream_error)
+                state["local_close"] = "server_rejection"
+                self.logger.error("%s | %s", self._stream_error, self._stream_context(app))
                 app.close()
             elif event == "login":
+                state["stage"] = "subscribing"
                 app.send(
                     json.dumps(
                         {
@@ -1063,23 +1112,35 @@ class BitgetVenue(VenueBase, AccountDashboard):
                 )
             elif event == "subscribe":
                 self._subscribed_channels.add(payload.get("arg", {}).get("channel"))
+                state["channels"] = sorted(str(channel) for channel in self._subscribed_channels)
                 if self._subscribed_channels >= {"orders", "positions", "orders-algo"}:
+                    state["stage"] = "ready"
                     self._stream_ready.set()
-                    self._stream_messages.put({"reconcile": True})
+                    self._stream_messages.put({"reconcile": True, "trigger": "subscription"})
             elif "data" in payload:
                 self._stream_messages.put(payload)
         except Exception as exc:
             self.logger.warning(
-                "Bitget user stream message failed: %s", self._redact(exc)
+                "Bitget user stream message failed: %s | %s",
+                self._redact(exc), self._stream_context(app),
             )
 
-    def _on_stream_error(self, _app, error):
+    def _on_stream_error(self, app, error):
         self._stream_error = self._redact(error)
         if not self._stream_stop.is_set():
-            self.logger.warning("Bitget user stream error: %s", self._stream_error)
+            self.logger.warning(
+                "Bitget user stream error: %s | error_type=%s %s",
+                self._stream_error, type(error).__name__, self._stream_context(app),
+            )
 
-    def _on_stream_close(self, _app, _status, _message):
+    def _on_stream_close(self, app, status, message):
         self._stream_ready.clear()
+        if not self._stream_stop.is_set():
+            self.logger.warning(
+                "Bitget user stream closed | close_code=%s reason=%s %s reconnect_delay_s=%.1f",
+                status, self._redact(message), self._stream_context(app),
+                self.USER_STREAM_RECONNECT_SECONDS,
+            )
 
     def _run_heartbeat(self):
         while not self._stream_stop.wait(self.USER_STREAM_PING_SECONDS):
@@ -1092,10 +1153,19 @@ class BitgetVenue(VenueBase, AccountDashboard):
                     time.monotonic() - self._last_pong
                     > self.USER_STREAM_PONG_TIMEOUT_SECONDS
                 ):
+                    state = self._stream_diagnostics(app)
+                    if state["local_close"] != "pong_timeout":
+                        state["local_close"] = "pong_timeout"
+                        self.logger.warning(
+                            "Bitget user stream pong timeout | threshold_s=%.1f %s",
+                            self.USER_STREAM_PONG_TIMEOUT_SECONDS, self._stream_context(app),
+                        )
                     app.close()
                 else:
                     app.send("ping")
+                    self._stream_diagnostics(app)["ping"] = time.monotonic()
             except Exception as exc:
+                self._stream_diagnostics(app)["local_close"] = "heartbeat_error"
                 self._on_stream_error(app, exc)
                 app.close()
 
@@ -1106,80 +1176,83 @@ class BitgetVenue(VenueBase, AccountDashboard):
                 payload = self._stream_messages.get(timeout=0.5)
             except queue.Empty:
                 payload = None
+            started = time.monotonic()
+            reconcile_since = self._reconcile_since
+            trigger = "stream_event"
             try:
                 if payload is not None:
+                    trigger = payload.get("trigger", "reconcile" if payload.get("reconcile") else "stream_event")
                     self._handle_user_stream_event(payload)
                 if self._stream_ready.is_set() and (
                     time.monotonic() - last_reconciliation
                     >= self.RECONCILIATION_INTERVAL_SECONDS
                 ):
                     last_reconciliation = time.monotonic()
+                    trigger = "periodic"
                     self._handle_user_stream_event({"reconcile": True})
             except Exception as exc:
                 self.logger.error(
-                    "Bitget event reconciliation failed: %s", self._redact(exc)
+                    "Bitget event reconciliation failed: %s | symbol=%s trigger=%s "
+                    "elapsed_s=%.3f reconcile_since=%s stream_ready=%s",
+                    self._redact(exc), self.symbol, trigger,
+                    time.monotonic() - started, reconcile_since.isoformat(),
+                    self._stream_ready.is_set(),
                 )
 
     def _handle_user_stream_event(self, payload):
-        with self._operation_lock:
-            if payload.get("reconcile"):
-                now = datetime.now(timezone.utc)
-                self.reconcile_execution_events(self._reconcile_since)
-                # Overlap avoids losing fills that reach REST just after the previous scan.
-                self._reconcile_since = now - timedelta(seconds=5)
-                self._sync_protective_orders()
-                relevant = True
-            else:
-                channel = payload.get("arg", {}).get("channel")
-                relevant = False
-                for order in payload.get("data", []):
-                    if (
-                        str(order.get("instId") or order.get("symbol") or "").upper()
-                        != self.symbol
+        if payload.get("reconcile"):
+            now = datetime.now(timezone.utc)
+            self.reconcile_execution_events(self._reconcile_since)
+            # Overlap avoids losing fills that reach REST just after the previous scan.
+            self._reconcile_since = now - timedelta(seconds=5)
+            self._sync_protective_orders()
+        else:
+            channel = payload.get("arg", {}).get("channel")
+            for order in payload.get("data", []):
+                if (
+                    str(order.get("instId") or order.get("symbol") or "").upper()
+                    != self.symbol
+                ):
+                    continue
+                if channel == "orders":
+                    if not self._order_action(
+                        str(order.get("clientOid") or "")
+                    ) and (
+                        "profit" in str(order.get("orderSource"))
+                        or "loss" in str(order.get("orderSource"))
                     ):
-                        continue
-                    relevant = True
-                    if channel == "orders":
-                        if not self._order_action(
-                            str(order.get("clientOid") or "")
-                        ) and (
-                            "profit" in str(order.get("orderSource"))
-                            or "loss" in str(order.get("orderSource"))
+                        self._restore_triggered_order_owners()
+                    order = self._attribute_order(order)
+                    fill = None
+                    if float(order.get("baseVolume") or 0) > 0 and order.get(
+                        "tradeId"
+                    ):
+                        fill = self._fill(
+                            {
+                                **order,
+                                "price": order["fillPrice"],
+                                "cTime": order["fillTime"],
+                            },
+                            str(order.get("clientOid") or ""),
+                        )
+                    self._emit_order_event(order, fill)
+                elif channel == "orders-algo":
+                    if order.get("status") == "executed" and self._order_action(
+                        str(order.get("clientOid") or "")
+                    ) in {"sl", "tp"}:
+                        for plan in self._restore_triggered_order_owners(
+                            orderId=str(order["orderId"])
                         ):
-                            self._restore_triggered_order_owners()
-                        order = self._attribute_order(order)
-                        fill = None
-                        if float(order.get("baseVolume") or 0) > 0 and order.get(
-                            "tradeId"
-                        ):
-                            fill = self._fill(
-                                {
-                                    **order,
-                                    "price": order["fillPrice"],
-                                    "cTime": order["fillTime"],
-                                },
-                                str(order.get("clientOid") or ""),
-                            )
-                        self._emit_order_event(order, fill)
-                    elif channel == "orders-algo":
-                        if order.get("status") == "executed" and self._order_action(
-                            str(order.get("clientOid") or "")
-                        ) in {"sl", "tp"}:
-                            for plan in self._restore_triggered_order_owners(
-                                orderId=str(order["orderId"])
-                            ):
-                                child = self._attribute_order(
-                                    self._order_detail(
-                                        {"orderId": plan["executeOrderId"]}
-                                    )
+                            child = self._attribute_order(
+                                self._order_detail(
+                                    {"orderId": plan["executeOrderId"]}
                                 )
-                                for fill in self._execution_fills(
-                                    child, is_buy=child["side"] == "buy"
-                                ):
-                                    self._emit_order_event(child, fill)
-                        self._sync_protective_orders()
-            if relevant and not self.read_only and self._position() is None:
-                self._cancel_owned_protective_orders()
+                            )
+                            for fill in self._execution_fills(
+                                child, is_buy=child["side"] == "buy"
+                            ):
+                                self._emit_order_event(child, fill)
+                    self._sync_protective_orders()
 
     def shutdown(self):
         self._stream_stop.set()
@@ -1192,4 +1265,9 @@ class BitgetVenue(VenueBase, AccountDashboard):
             if thread is not threading.current_thread():
                 thread.join(timeout=self.timeout + 1)
         self._stream_threads.clear()
-        self.session.close()
+        with self._session_condition:
+            while self._active_requests:
+                self._session_condition.wait()
+            sessions, self._idle_sessions = self._idle_sessions, []
+        for session in sessions:
+            session.close()

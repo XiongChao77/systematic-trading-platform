@@ -70,7 +70,7 @@ def main():
     torch.set_num_threads(args.threads)
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    specs = {s.strategy_id: s for s in load_live_strategy_specs(args.config)}
+    specs = {s.instance_id: s for s in load_live_strategy_specs(args.config)}
     summary = {
         "method": "Captured market bars -> full-history features -> TimeSeriesWindowDataset -> predict_with_ds(is_live=False)",
         "scope": "Model output parity only; no labels, historical report replay, or execution simulation",
@@ -102,9 +102,10 @@ def main():
         ids = [c.removesuffix("__pred") for c in trace.columns if c.endswith("__pred")]
         if not ids:
             raise ValueError(f"No strategy predictions found: {path}")
-        for strategy_id in ids:
-            spec = specs[strategy_id]
-            print(f"Verifying {strategy_id}", flush=True)
+        for instance_id in ids:
+            from trade.runner.identity import spec_for_trace
+            spec = spec_for_trace(specs.values(), instance_id)
+            print(f"Verifying {instance_id}", flush=True)
             model = LiveRunner._load_model(spec)
             factory = LiveRunner._create_feature_generator(spec)
             features = factory.generate(
@@ -132,11 +133,11 @@ def main():
                 live_mask,
                 [
                     "close_time_ms_utc",
-                    *[f"{strategy_id}__{c}" for c in PREDICTION_COLUMNS],
+                    *[f"{instance_id}__{c}" for c in PREDICTION_COLUMNS],
                 ],
-            ].rename(columns={f"{strategy_id}__{c}": c for c in PREDICTION_COLUMNS})
+            ].rename(columns={f"{instance_id}__{c}": c for c in PREDICTION_COLUMNS})
             detail = compare_rows(live, offline, rtol=args.rtol, atol=args.atol)
-            detail.to_csv(output / f"{strategy_id}.csv", index=False)
+            detail.to_csv(output / f"{instance_id}.csv", index=False)
             artifacts = {}
             for artifact in sorted(Path(spec.model_path).rglob("*")):
                 if artifact.is_file() and artifact.suffix in {
@@ -149,7 +150,7 @@ def main():
                         hashlib.sha256(artifact.read_bytes()).hexdigest()
                     )
             record = {
-                "strategy_id": strategy_id,
+                "instance_id": instance_id,
                 "hash_id": spec.hash_id,
                 "model_path": spec.model_path,
                 "model_sha256": artifacts,
@@ -192,7 +193,7 @@ def main():
                     {
                         k: record[k]
                         for k in [
-                            "strategy_id",
+                            "instance_id",
                             "live_rows",
                             "mismatched_rows",
                             "max_abs_diff",

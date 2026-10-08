@@ -811,7 +811,7 @@ class BinanceVenue(VenueBase, AccountDashboard):
             "account": lambda: self._dashboard_read(self.get_dashboard_balance),
             "position": lambda: self._dashboard_read(self.get_dashboard_position),
         })
-        return collect_dashboard(lambda: result("account"), lambda: result("position"))
+        return collect_dashboard(lambda: result("account"), lambda: result("position"), updated_at=result.updated_at)
 
     def get_dashboard_position_open_time(self, position):
         result = self.dashboard_reads.batch({"position_timing": lambda: self._dashboard_read(self.get_last_position_open_time)})

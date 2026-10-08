@@ -7,6 +7,7 @@ import math
 import threading
 import time
 import uuid
+from urllib.parse import quote, urljoin
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -16,6 +17,7 @@ from typing import Any, Mapping, Optional
 import requests
 
 from data_process import common
+from trade.runner.connection_state import pipeline_connection
 from trade.core.dashboard_base import AccountDashboard
 from trade.core.dashboard_reads import DashboardReads
 
@@ -61,7 +63,7 @@ class LiveStateRegistry:
 
     def __init__(self, pipelines) -> None:
         self._lock = threading.Lock()
-        self._pipelines = {pipeline.spec.strategy_id: pipeline for pipeline in pipelines}
+        self._pipelines = {pipeline.spec.instance_id: pipeline for pipeline in pipelines}
         self._signals: dict[str, dict[str, Any]] = {}
         self._position_open_times: dict[str, tuple[str, datetime]] = {}
         self.collection_timings: dict[str, float] = {}
@@ -69,8 +71,58 @@ class LiveStateRegistry:
         self._collection_stop = threading.Event()
         self._collectors: list[threading.Thread] = []
         self.updated = threading.Event()
-        self._timing_reads = DashboardReads()
-        self._snapshot_reads = DashboardReads()
+        self._timing_reads = DashboardReads(max_age_seconds=0)
+        self._snapshot_reads = DashboardReads(max_age_seconds=0)
+        self._overview_until = 0.0
+        self._detail_until = {}
+        self._collection_wake = {identity: threading.Event() for identity in self._pipelines}
+
+    def connection_changed(self, pipelines):
+        with self._lock:
+            for pipeline in pipelines:
+                identity = pipeline.spec.instance_id
+                connection = pipeline_connection(pipeline)
+                if connection is None or connection.trading_ready:
+                    self._snapshots.pop(identity, None)
+                self._position_open_times.pop(identity, None)
+                self._signals.pop(identity, None)
+                wake = self._collection_wake.get(identity)
+                if wake is not None:
+                    wake.set()
+        self.updated.set()
+
+    @staticmethod
+    def _connection_state(pipeline):
+        connection = pipeline_connection(pipeline)
+        return None if connection is None else connection.recovery_state()
+
+    @staticmethod
+    def _runtime_status(pipeline, status, connection):
+        if status == "stopped":
+            return status
+        if not pipeline.enable:
+            return "disabled"
+        if connection is not None and connection["status"] != "ready":
+            return "paused"
+        return status
+
+    def record_prediction(self, pipeline, predicted_row, market, updated_at):
+        payload = {
+            "model_output": market.signal.name.lower(),
+            "raw_model_output": _finite_number(predicted_row.get("pred")),
+            "probability": _finite_number(predicted_row.get("pred_prob")),
+            "net_score": _finite_number(predicted_row.get("net_score")),
+            "decision": "pending", "target_side": "pending", "quantity": None,
+            "reason": "Waiting for strategy execution", "updated_at": _iso(updated_at),
+        }
+        with self._lock:
+            self._signals[pipeline.spec.instance_id] = payload
+
+    def record_execution_status(self, pipeline, updated_at, status, reason):
+        with self._lock:
+            signal = self._signals.get(pipeline.spec.instance_id)
+            if signal is not None and signal["updated_at"] == _iso(updated_at):
+                signal.update(decision=status, reason=reason)
 
     def record_cycle(
         self,
@@ -93,44 +145,87 @@ class LiveStateRegistry:
             "updated_at": _iso(updated_at),
         }
         with self._lock:
-            self._signals[pipeline.spec.strategy_id] = payload
+            current = self._signals.get(pipeline.spec.instance_id)
+            if current is not None and current["updated_at"] > payload["updated_at"]:
+                return
+            self._signals[pipeline.spec.instance_id] = payload
             if intent.action.value in {"open", "close"}:
-                self._position_open_times.pop(pipeline.spec.strategy_id, None)
+                self._position_open_times.pop(pipeline.spec.instance_id, None)
+
+    def update_demand(self, demand) -> None:
+        now = time.monotonic()
+        with self._lock:
+            def scope(identity):
+                return ("detail" if self._detail_until.get(identity, 0) > now else
+                        "overview" if self._overview_until > now else None)
+            previous = {identity: scope(identity) for identity in self._pipelines}
+            self._overview_until = now + max(0.0, min(10.0, float(demand.get("overview_seconds", 0))))
+            self._detail_until = {
+                identity: now + max(0.0, min(10.0, float(seconds)))
+                for identity, seconds in demand.get("detail_seconds", {}).items()
+                if identity in self._pipelines
+            }
+            for identity, wake in self._collection_wake.items():
+                if scope(identity) != previous[identity]:
+                    wake.set()
+
+    def collection_scope(self, instance_id):
+        now = time.monotonic()
+        with self._lock:
+            if self._detail_until.get(instance_id, 0) > now:
+                return "detail"
+            if self._overview_until > now:
+                return "overview"
+        return None
 
     def start_collection(self, interval_seconds: float, logger: logging.Logger) -> None:
         if self._collectors:
             return
         self._collection_stop.clear()
-        for strategy_id, pipeline in self._pipelines.items():
+        for instance_id, pipeline in self._pipelines.items():
             thread = threading.Thread(
-                target=self._collect_strategy, args=(strategy_id, pipeline, interval_seconds, logger),
-                name=f"dashboard-{strategy_id}", daemon=True,
+                target=self._collect_strategy, args=(instance_id, pipeline, interval_seconds, logger),
+                name=f"dashboard-{instance_id}", daemon=True,
             )
             self._collectors.append(thread)
             thread.start()
 
-    def _collect_strategy(self, strategy_id, pipeline, interval_seconds, logger):
+    def _collect_strategy(self, instance_id, pipeline, interval_seconds, logger):
+        wake = self._collection_wake[instance_id]
         while not self._collection_stop.is_set():
+            wake.clear()
+            scope = self.collection_scope(instance_id)
+            connection = self._connection_state(pipeline)
+            if connection is not None and connection["status"] != "ready":
+                wake.wait(interval_seconds)
+                continue
+            if scope is None:
+                with self._lock:
+                    self._snapshots.pop(instance_id, None)
+                wake.wait(interval_seconds)
+                continue
             started = time.monotonic()
             try:
-                snapshot = self._snapshot_pipeline(pipeline, None, "running")
+                snapshot = self._snapshot_pipeline(pipeline, None, "running", scope=scope)
                 with self._lock:
                     if self._collection_stop.is_set():
                         return
-                    self._snapshots[strategy_id] = (started, snapshot)
+                    self._snapshots[instance_id] = (started, snapshot)
             except Exception as exc:
-                logger.exception("Dashboard collection failed | strategy=%s", strategy_id)
+                logger.exception("Dashboard collection failed | strategy=%s", instance_id)
                 snapshot = self._snapshot_pipeline(pipeline, None, "running", collect=False)
                 snapshot["errors"].append({"component": "dashboard", "message": str(exc) or type(exc).__name__})
                 with self._lock:
-                    self._snapshots[strategy_id] = (started, snapshot)
+                    self._snapshots[instance_id] = (started, snapshot)
             self.updated.set()
             elapsed = time.monotonic() - started
-            logger.debug("Dashboard collection timing | strategy=%s total_ms=%.1f", strategy_id, elapsed * 1000)
-            self._collection_stop.wait(max(0.0, interval_seconds - elapsed))
+            logger.debug("Dashboard collection timing | strategy=%s total_ms=%.1f", instance_id, elapsed * 1000)
+            wake.wait(max(0.0, interval_seconds - elapsed))
 
     def stop_collection(self) -> None:
         self._collection_stop.set()
+        for wake in self._collection_wake.values():
+            wake.set()
         deadline = time.monotonic() + 2.0
         for thread in self._collectors:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -142,13 +237,19 @@ class LiveStateRegistry:
             cached = deepcopy(self._snapshots)
             signals = deepcopy(self._signals)
         results = []
-        for strategy_id, pipeline in self._pipelines.items():
-            entry = cached.get(strategy_id)
+        for instance_id, pipeline in self._pipelines.items():
+            entry = cached.get(instance_id)
+            connection = self._connection_state(pipeline)
             snapshot = entry[1] if entry else self._snapshot_pipeline(pipeline, None, status, collect=False)
             snapshot["dashboard_age_seconds"] = None if entry is None else max(0.0, now - entry[0])
-            snapshot["status"] = status if status == "stopped" or bool(getattr(pipeline, "enable", True)) else "disabled"
-            snapshot["latest_signal"] = signals.get(strategy_id)
-            snapshot["availability"]["latest_signal"] = strategy_id in signals
+            snapshot["status"] = self._runtime_status(pipeline, status, connection)
+            snapshot["connection"] = connection
+            if connection is not None and connection["status"] != "ready":
+                snapshot["collection_scope"] = "idle"
+                snapshot["availability"]["account"] = False
+                snapshot["availability"]["position"] = False
+            snapshot["latest_signal"] = signals.get(instance_id)
+            snapshot["availability"]["latest_signal"] = instance_id in signals
             position = snapshot["position"]
             if position and position.get("opened_at") and snapshot["max_holding_seconds"] is not None:
                 opened_at = datetime.fromisoformat(position["opened_at"])
@@ -162,27 +263,27 @@ class LiveStateRegistry:
             return dict(self.collection_timings)
 
     @contextmanager
-    def _time_component(self, strategy_id: str, component: str):
+    def _time_component(self, instance_id: str, component: str):
         started = time.monotonic()
         try:
             yield
         finally:
             elapsed = time.monotonic() - started
             with self._lock:
-                self.collection_timings[f"{strategy_id}/{component}"] = elapsed
+                self.collection_timings[f"{instance_id}/{component}"] = elapsed
 
     def _position_opened_at(self, pipeline, dashboard_position) -> datetime | None:
-        strategy_id = pipeline.spec.strategy_id
+        instance_id = pipeline.spec.instance_id
         side = dashboard_position.side.value
         with self._lock:
-            cached = self._position_open_times.get(strategy_id)
+            cached = self._position_open_times.get(instance_id)
         if cached is not None and cached[0] == side:
             return cached[1]
 
         opened_at = dashboard_position.opened_at
         if opened_at is None:
-            result = self._timing_reads.batch({strategy_id: lambda: pipeline.venue.get_dashboard_position_open_time(dashboard_position)})
-            opened_at = result(strategy_id)
+            result = self._timing_reads.batch({instance_id: lambda: pipeline.venue.get_dashboard_position_open_time(dashboard_position)})
+            opened_at = result(instance_id)
         if opened_at is None:
             return None
         if not isinstance(opened_at, datetime):
@@ -192,12 +293,12 @@ class LiveStateRegistry:
         else:
             opened_at = opened_at.astimezone(UTC)
         with self._lock:
-            self._position_open_times[strategy_id] = (side, opened_at)
+            self._position_open_times[instance_id] = (side, opened_at)
         return opened_at
 
-    def _clear_position_opened_at(self, strategy_id: str) -> None:
+    def _clear_position_opened_at(self, instance_id: str) -> None:
         with self._lock:
-            self._position_open_times.pop(strategy_id, None)
+            self._position_open_times.pop(instance_id, None)
 
     @staticmethod
     def _max_holding_seconds(pipeline) -> float | None:
@@ -217,13 +318,17 @@ class LiveStateRegistry:
         interval_ms = int(interval_ms)
         return bars * interval_ms / 1000.0
 
-    def _snapshot_pipeline(self, pipeline, signal, status: str, *, collect: bool = True) -> dict[str, Any]:
+    def _snapshot_pipeline(self, pipeline, signal, status: str, *, collect: bool = True, scope: str = "detail") -> dict[str, Any]:
         account = None
         position = None
         dashboard_position = None
+        account_updated_at = position_updated_at = None
         account_available = False
         position_available = False
         errors = []
+        connection = self._connection_state(pipeline)
+        if connection is not None and connection["status"] != "ready":
+            collect = False
         venue = pipeline.venue
         venue_name = str(
             getattr(
@@ -244,28 +349,37 @@ class LiveStateRegistry:
         if collect and not isinstance(venue, AccountDashboard):
             errors.append({"component": "dashboard", "message": f"{type(venue).__name__} has no dashboard interface"})
         elif collect:
-            with self._time_component(pipeline.spec.strategy_id, "dashboard"):
+            with self._time_component(pipeline.spec.instance_id, "dashboard"):
                 result = self._snapshot_reads.batch(
-                    {pipeline.spec.strategy_id: venue.get_dashboard_snapshot}, timeout=1.25,
+                    {(pipeline.spec.instance_id, scope): (venue.get_dashboard_snapshot if scope == "detail"
+                                                        else venue.get_dashboard_overview)}, timeout=1.25,
+                    logger=logging.getLogger(__name__) if venue_name.casefold() == "ctrader" else None,
+                    context=f"snapshot:{pipeline.spec.instance_id}:{scope}",
                 )
-                dashboard = result(pipeline.spec.strategy_id)
+                dashboard = result((pipeline.spec.instance_id, scope))
             account = None if dashboard.account is None else asdict(dashboard.account)
             dashboard_position = dashboard.position
+            account_updated_at = dashboard.account_updated_at
+            position_updated_at = dashboard.position_updated_at
             account_available = dashboard.account_available
             position_available = dashboard.position_available
             errors.extend(dashboard.errors)
             if dashboard_position is not None:
                 position = asdict(dashboard_position)
+                position["opened_at"] = (
+                    _iso(dashboard_position.opened_at)
+                    if dashboard_position.opened_at is not None else None
+                )
                 position["side"] = dashboard_position.side.value
                 position["margin_mode"] = dashboard_position.margin_mode.value
 
         if dashboard_position is None:
             if position_available:
-                self._clear_position_opened_at(pipeline.spec.strategy_id)
-        else:
+                self._clear_position_opened_at(pipeline.spec.instance_id)
+        elif scope == "detail":
             opened_at = None
             try:
-                with self._time_component(pipeline.spec.strategy_id, "position_timing"):
+                with self._time_component(pipeline.spec.instance_id, "position_timing"):
                     opened_at = self._position_opened_at(
                         pipeline,
                         dashboard_position,
@@ -295,7 +409,11 @@ class LiveStateRegistry:
             )
 
         return {
-            "strategy_id": pipeline.spec.strategy_id,
+            "collection_scope": scope if collect else "idle",
+            "instance_id": pipeline.spec.instance_id,
+            "strategy_hash": pipeline.spec.hash_id,
+            "account_id": "" if venue_name == "ctrader" else pipeline.spec.account_id,
+            "trader_login": str(pipeline.spec.venue_config.trader_login) if venue_name == "ctrader" else "",
             "model_type": pipeline.spec.train_config.model_cfg.model_type,
             "venue": venue_name,
             "symbol": pipeline.spec.base_define.symbol,
@@ -305,7 +423,10 @@ class LiveStateRegistry:
             "risk_per_trade_pct": risk_per_trade_pct,
             "max_daily_loss_pct": max_daily_loss_pct,
             "max_holding_seconds": max_holding_seconds,
-            "status": (status if bool(getattr(pipeline, "enable", True)) else "disabled"),
+            "status": self._runtime_status(pipeline, status, connection),
+            "connection": connection,
+            "account_updated_at": _iso(account_updated_at) if account_updated_at else None,
+            "position_updated_at": _iso(position_updated_at) if position_updated_at else None,
             "account": account,
             "position": position,
             "latest_signal": signal,
@@ -340,13 +461,19 @@ class LiveMonitoringService:
         self._sequence = 0
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._demand_thread: threading.Thread | None = None
         self._last_error_log_at = 0.0
+        self._last_publish_started = None
         self._last_component_error_logs: dict[tuple[str, str], float] = {}
 
     def start(self) -> None:
         if self._thread is not None:
             return
         self.registry.start_collection(self.config.publish_interval_seconds, self.logger)
+        self._demand_thread = threading.Thread(target=self._watch_demand,
+                                               name=f"live-demand-{self.config.runner_id}", daemon=True)
+        self._demand_thread.start()
+        self.registry.updated.set()
         self._thread = threading.Thread(
             target=self._run,
             name=f"live-monitoring-{self.config.runner_id}",
@@ -354,13 +481,40 @@ class LiveMonitoringService:
         )
         self._thread.start()
 
+    def _watch_demand(self) -> None:
+        version = -1
+        last_error = 0.0
+        url = urljoin(self.config.publish_url, f"demand/{quote(self.config.runner_id, safe='')}")
+        with requests.Session() as session:
+            while not self._stop_event.is_set():
+                try:
+                    response = session.get(url, params={"version": version},
+                                           timeout=(self.config.request_timeout_seconds, 4.0))
+                    response.raise_for_status()
+                    result = response.json()
+                    if self._stop_event.is_set():
+                        break
+                    self.registry.update_demand(result["monitoring_demand"])
+                    version = int(result["version"])
+                except Exception as exc:
+                    now = time.monotonic()
+                    if now - last_error >= self.ERROR_LOG_INTERVAL_SECONDS:
+                        self.logger.warning("Live monitoring demand failed | runner=%s error=%s",
+                                            self.config.runner_id, exc)
+                        last_error = now
+                    self._stop_event.wait(1.0)
+
     def _run(self) -> None:
-        while not self._stop_event.is_set():
-            self.registry.updated.wait()
+        # Publish one combined snapshot per interval, never once per collector.
+        interval = self.config.publish_interval_seconds
+        next_publish = time.monotonic()
+        while not self._stop_event.wait(max(0.0, next_publish - time.monotonic())):
             self.registry.updated.clear()
-            if self._stop_event.is_set():
-                break
             self.publish_once()
+            next_publish += interval
+            if next_publish <= time.monotonic():
+                # Skip missed ticks instead of sending catch-up bursts.
+                next_publish = time.monotonic() + interval
 
     def _payload(self, status: str) -> dict[str, Any]:
         self._sequence += 1
@@ -379,20 +533,23 @@ class LiveMonitoringService:
         now = time.monotonic()
         for strategy in strategies:
             for error in strategy.get("errors", []):
-                key = (strategy["strategy_id"], error["component"])
+                key = (strategy["instance_id"], error["component"])
                 last_log = self._last_component_error_logs.get(key, 0.0)
                 if now - last_log < self.ERROR_LOG_INTERVAL_SECONDS:
                     continue
                 self._last_component_error_logs[key] = now
-                self.logger.error(
+                self.logger.info(
                     "Live dashboard data unavailable | strategy=%s component=%s error=%s",
-                    strategy["strategy_id"],
+                    strategy["instance_id"],
                     error["component"],
                     error["message"],
                 )
 
     def publish_once(self, status: str = "running") -> bool:
         started = time.monotonic()
+        publish_gap_ms = (None if self._last_publish_started is None else
+                          (started - self._last_publish_started) * 1000)
+        self._last_publish_started = started
         collection_finished = None
         accepted = False
         try:
@@ -439,15 +596,18 @@ class LiveMonitoringService:
             self.logger.log(
                 logging.WARNING if elapsed > self.config.publish_interval_seconds else logging.DEBUG,
                 "Live monitoring timing | runner=%s accepted=%s total=%.3fs "
-                "collect=%.3fs post=%.3fs interval=%.3fs components=[%s]",
+                "collect=%.3fs post=%.3fs interval=%.3fs publish_gap_ms=%s components=[%s]",
                 self.config.runner_id, accepted, elapsed, collect_seconds,
-                post_seconds, self.config.publish_interval_seconds, components,
+                post_seconds, self.config.publish_interval_seconds,
+                "na" if publish_gap_ms is None else f"{publish_gap_ms:.1f}", components,
             )
 
     def stop(self) -> None:
         self._stop_event.set()
         self.registry.updated.set()
         self.registry.stop_collection()
+        if self._demand_thread is not None:
+            self._demand_thread.join(timeout=0.5)
         if self._thread is not None:
             thread = self._thread
             thread.join(timeout=(self.config.publish_interval_seconds + self.config.request_timeout_seconds + 0.5))

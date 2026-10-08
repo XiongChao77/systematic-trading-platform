@@ -21,22 +21,9 @@ launch.json
 #label_viewer
 node_modules
 data_process/label_viewer/public
-tests/*
-!tests/test_kline_source_validation.py
-!tests/test_binance_zip_downloader_manifest.py
 dow
-tests/*
 .venv/*
 *test*
-!trade/runner/test_live_runner.py
-!trade/runner/test_initial_state.py
-!trade/monitoring/test_live_monitoring.py
-!trade/monitoring/test_api_timing.py
-!trade/monitoring/test_dashboard_collection.py
-!trade/venue/live/bitget/test_bitget_venue.py
-!trade/venue/live/bitget/test_diagnose_account.py
-!trade/venue/live/bitget/test_market_round_trip.py
-!trade/venue/live/bitget/smoke_test.py
 
 # Local experiment sweeps. Keep the tracked example as the default fallback.
 /experiment/task_constructors.py
@@ -44,11 +31,6 @@ PropTrading
 LiveTrading
 live_config.json
 account*
-# Report explorer service regression coverage.
-!tests/
-!tests/test_report_service.py
-!tests/test_frontend_report_store.py
-!tests/test_detail_report_api.py
 
 # Backtests is an application module, not a test directory.
 !UI/backend/modules/backtests/
@@ -57,3 +39,9 @@ account*
 !UI/quant-ui/src/modules/backtests/**
 *__pycache__*
 orderbook_output
+
+# Keep archived test sources; ignore only their generated caches.
+!/test/
+!/test/**
+**/__pycache__/
+.pytest_cache/

@@ -72,15 +72,19 @@ class DashboardSnapshot:
     position: Optional[AccountPosition] = None
     account_available: bool = False
     position_available: bool = False
+    account_updated_at: Optional[datetime] = None
+    position_updated_at: Optional[datetime] = None
     errors: list[dict[str, str]] = field(default_factory=list)
 
 
-def collect_dashboard(balance, position) -> DashboardSnapshot:
+def collect_dashboard(balance, position, *, updated_at=None) -> DashboardSnapshot:
     """Preserve partial dashboard results when either component fails."""
     snapshot = DashboardSnapshot()
     for component, collect in (("account", balance), ("position", position)):
         try:
             setattr(snapshot, component, collect())
+            if updated_at is not None:
+                setattr(snapshot, f"{component}_updated_at", updated_at(component))
             setattr(snapshot, f"{component}_available", True)
         except Exception as exc:
             snapshot.errors.append({"component": component, "message": str(exc) or type(exc).__name__})
@@ -99,10 +103,14 @@ class AccountDashboard(ABC):
     def dashboard_reads(self):
         return DashboardReads()
 
+    def get_dashboard_overview(self) -> DashboardSnapshot:
+        """Read list metrics; override when full snapshots require extra requests."""
+        return self.get_dashboard_snapshot()
+
     def get_dashboard_snapshot(self) -> DashboardSnapshot:
         """Venues may combine independent reads and reuse shared responses."""
         result = self.dashboard_reads.batch({"account": self.get_dashboard_balance, "position": self.get_dashboard_position})
-        return collect_dashboard(lambda: result("account"), lambda: result("position"))
+        return collect_dashboard(lambda: result("account"), lambda: result("position"), updated_at=result.updated_at)
 
     def get_dashboard_position_open_time(self, position: AccountPosition) -> Optional[datetime]:
         """Use timing supplied by the dashboard response where available."""

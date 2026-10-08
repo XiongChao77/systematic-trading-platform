@@ -99,9 +99,9 @@ class DiagnosticClient:
             check["elapsed_ms"] = round((time.monotonic() - started) * 1000, 2)
 
 
-def diagnose(client, strategy_id, symbol, *, include_uta=False):
+def diagnose(client, instance_id, symbol, *, include_uta=False):
     result = {
-        "strategy_id": strategy_id,
+        "instance_id": instance_id,
         "symbol": symbol,
         "api_key_fingerprint": fingerprint(client.secrets[0]),
         "read_only": True,
@@ -218,16 +218,17 @@ def diagnose(client, strategy_id, symbol, *, include_uta=False):
     return result
 
 
-def select_targets(config_path, strategy_ids):
-    path = Path(config_path).resolve()
-    rows = json.loads(path.read_text())["strategy"]
+def select_targets(config_path, instance_ids):
+    from trade.runner.live_runner import load_live_strategy_specs
+
+    specs = {spec.instance_id: spec for spec in load_live_strategy_specs(str(config_path))}
     targets = []
-    for strategy_id in dict.fromkeys(strategy_ids):
-        row = rows[strategy_id]
-        venue = str(row["venue"]).lower()
+    for instance_id in dict.fromkeys(instance_ids):
+        spec = specs[instance_id]
+        venue = spec.venue_config.venue
         if venue != "bitget":
-            raise ValueError(f"Strategy does not use Bitget: {strategy_id}")
-        targets.append((strategy_id, (path.parent / row[venue]["path"]).resolve()))
+            raise ValueError(f"Strategy does not use Bitget: {instance_id}")
+        targets.append((instance_id, Path(spec.venue_config.path).resolve()))
     return targets
 
 
@@ -236,24 +237,24 @@ def main():
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--key-path")
     source.add_argument("--config", help="Current live runner configuration")
-    parser.add_argument("--strategy-id", action="append", default=[])
+    parser.add_argument("--instance-id", action="append", default=[])
     parser.add_argument(
         "--symbol", default="DOGEUSDT", help="Contract checked for every selected key"
     )
     parser.add_argument("--include-uta", action="store_true")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
-    if args.config and not args.strategy_id:
-        parser.error("--config requires at least one --strategy-id")
-    if args.key_path and len(args.strategy_id) > 1:
-        parser.error("--key-path accepts at most one --strategy-id")
+    if args.config and not args.instance_id:
+        parser.error("--config requires at least one --instance-id")
+    if args.key_path and len(args.instance_id) > 1:
+        parser.error("--key-path accepts at most one --instance-id")
     try:
         targets = (
-            select_targets(args.config, args.strategy_id)
+            select_targets(args.config, args.instance_id)
             if args.config
             else [
                 (
-                    args.strategy_id[0] if args.strategy_id else "manual-check",
+                    args.instance_id[0] if args.instance_id else "manual-check",
                     Path(args.key_path),
                 )
             ]
@@ -265,13 +266,13 @@ def main():
         "note": "Current read-only observations cannot reconstruct past restrictions or prove order access.",
         "accounts": [],
     }
-    for strategy_id, key_path in targets:
+    for instance_id, key_path in targets:
         client = None
         try:
             client = DiagnosticClient(key_path)
             result = diagnose(
                 client,
-                strategy_id,
+                instance_id,
                 args.symbol.strip().upper(),
                 include_uta=args.include_uta,
             )
@@ -279,7 +280,7 @@ def main():
             result = json.loads(client.redact(json.dumps(result)))
         except Exception as exc:
             result = {
-                "strategy_id": strategy_id,
+                "instance_id": instance_id,
                 "checks_passed": False,
                 "error_type": type(exc).__name__,
             }

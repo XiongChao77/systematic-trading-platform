@@ -57,7 +57,7 @@ class PredictionRecorder:
             )
         candle_close_time_ms = int(row["close_time_ms_utc"])
         record = {
-            "strategy_id": pipeline.spec.strategy_id,
+            "instance_id": pipeline.spec.instance_id,
             "hash_id": pipeline.spec.hash_id,
             "close_time_ms_utc": int(candle_close_time_ms),
             "close_time_date_utc": pd.Timestamp(
@@ -73,7 +73,7 @@ class PredictionRecorder:
 
     def to_frame(self) -> pd.DataFrame:
         columns = [
-            "strategy_id",
+            "instance_id",
             "hash_id",
             "close_time_ms_utc",
             "close_time_date_utc",
@@ -152,7 +152,7 @@ def _with_candle_close_times(frame: pd.DataFrame, name: str) -> pd.DataFrame:
 def prediction_frame_for_strategy(
     frame: pd.DataFrame,
     *,
-    strategy_id: Optional[str],
+    instance_id: Optional[str],
     name: str,
 ) -> pd.DataFrame:
     """Select standard prediction columns from long or captured wide data."""
@@ -160,10 +160,10 @@ def prediction_frame_for_strategy(
     prepared = frame.copy()
     wide_columns = (
         {
-            column: f"{strategy_id}__{column}"
+            column: f"{instance_id}__{column}"
             for column in PREDICTION_COLUMNS
         }
-        if strategy_id is not None
+        if instance_id is not None
         else {}
     )
     if wide_columns and all(
@@ -178,20 +178,20 @@ def prediction_frame_for_strategy(
             inplace=True,
         )
         prepared = prepared.loc[prepared["pred"].notna()].copy()
-        prepared["strategy_id"] = str(strategy_id)
+        prepared["instance_id"] = str(instance_id)
         return prepared
 
-    if "strategy_id" in prepared.columns:
-        strategy_ids = prepared["strategy_id"].dropna().astype(str).unique()
-        selected_strategy_id = strategy_id
-        if selected_strategy_id is None:
-            if len(strategy_ids) != 1:
+    if "instance_id" in prepared.columns:
+        instance_ids = prepared["instance_id"].dropna().astype(str).unique()
+        selected_instance_id = instance_id
+        if selected_instance_id is None:
+            if len(instance_ids) != 1:
                 raise ValueError(
-                    f"strategy_id is required when {name} contains multiple strategies"
+                    f"instance_id is required when {name} contains multiple strategies"
                 )
-            selected_strategy_id = strategy_ids[0]
+            selected_instance_id = instance_ids[0]
         prepared = prepared.loc[
-            prepared["strategy_id"].astype(str) == str(selected_strategy_id)
+            prepared["instance_id"].astype(str) == str(selected_instance_id)
         ].copy()
     return prepared
 
@@ -200,7 +200,7 @@ def compare_prediction_frames(
     replay: pd.DataFrame,
     backtest: pd.DataFrame,
     *,
-    strategy_id: Optional[str] = None,
+    instance_id: Optional[str] = None,
     rtol: float = 1e-6,
     atol: float = 1e-7,
 ) -> PredictionComparison:
@@ -208,12 +208,12 @@ def compare_prediction_frames(
 
     replay_frame = prediction_frame_for_strategy(
         replay,
-        strategy_id=strategy_id,
+        instance_id=instance_id,
         name="Replay",
     )
     backtest_frame = prediction_frame_for_strategy(
         backtest,
-        strategy_id=strategy_id,
+        instance_id=instance_id,
         name="Backtest",
     )
     replay_frame = _with_candle_close_times(replay_frame, "Replay")
@@ -276,7 +276,7 @@ def compare_prediction_files(
     replay_path: str,
     backtest_path: str,
     *,
-    strategy_id: Optional[str] = None,
+    instance_id: Optional[str] = None,
     rtol: float = 1e-6,
     atol: float = 1e-7,
 ) -> PredictionComparison:
@@ -285,7 +285,7 @@ def compare_prediction_files(
     return compare_prediction_frames(
         read_prediction_frame(replay_path),
         read_prediction_frame(backtest_path),
-        strategy_id=strategy_id,
+        instance_id=instance_id,
         rtol=rtol,
         atol=atol,
     )
@@ -379,11 +379,27 @@ def main() -> None:
         default=None,
         help="Optional backtest prediction file to compare",
     )
-    parser.add_argument("--strategy-id", default=None)
+    parser.add_argument("--instance-id", default=None)
     args = parser.parse_args()
 
     logger = logging.getLogger("trade.live_replay")
     specs = load_live_strategy_specs(args.config)
+    if args.backtest_predictions:
+        from trade.runner.identity import spec_for_trace
+
+        reference = read_prediction_frame(args.backtest_predictions)
+        trace_ids = {column.removesuffix("__pred") for column in reference.columns if column.endswith("__pred")}
+        if "instance_id" in reference:
+            trace_ids.update(reference["instance_id"].dropna().astype(str))
+        if args.instance_id:
+            trace_ids = {args.instance_id}
+        for trace_id in sorted(trace_ids):
+            if not trace_id.startswith("ctrader|"):
+                continue
+            matched = spec_for_trace(specs, trace_id)
+            specs = [matched if (spec.venue_config.venue == "ctrader"
+                                 and spec.venue_config.trader_login == matched.venue_config.trader_login
+                                 and spec.hash_id == matched.hash_id) else spec for spec in specs]
     resolver = None
     if args.market_trace:
         market_keys = {
@@ -416,7 +432,7 @@ def main() -> None:
         comparison = compare_prediction_frames(
             replay,
             read_prediction_frame(args.backtest_predictions),
-            strategy_id=args.strategy_id,
+            instance_id=args.instance_id,
         )
         print(json.dumps(asdict(comparison), separators=(",", ":")))
         if not comparison.matches:

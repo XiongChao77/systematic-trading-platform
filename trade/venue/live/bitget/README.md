@@ -72,13 +72,13 @@ existing positions or pending orders prevent a new entry.
 Run the offline contract tests from the repository root:
 
 ```bash
-.venv/bin/python -m pytest -q trade/venue/live/bitget/test_bitget_venue.py
+.venv/bin/python -m pytest -q test/regression/test_bitget_venue.py
 ```
 
 For a later check against the real account:
 
 ```bash
-.venv/bin/python -m trade.venue.live.bitget.smoke_test \
+.venv/bin/python -m test.manual.test_bitget_connectivity \
   --key-path /home/chao/work/financial-ml-system/LiveTrading/bitget/trading1
 ```
 
@@ -97,7 +97,7 @@ it does not initialize a live venue, open a WebSocket, or submit/cancel orders.
 From the repository root, select the exact strategy from the current live config:
 
 ```bash
-.venv/bin/python -m trade.venue.live.bitget.diagnose_account \
+.venv/bin/python -m test.manual.test_bitget_account_diagnostics \
   --config LiveTrading/live_config.json \
   --strategy-id Doge-bitget-1 \
   --symbol DOGEUSDT \
@@ -121,9 +121,6 @@ Exit code zero means all requested reads succeeded, not that order placement is
 allowed. Missing write permission is recorded in `findings`; `trading_access`
 always remains `unverified`. Current reads cannot reconstruct historical access.
 
-```bash
-.venv/bin/python -m pytest -q trade/venue/live/bitget/test_diagnose_account.py
-```
 
 ## Small market round-trip test
 
@@ -135,7 +132,7 @@ fills. Actual fill notional can differ due to market movement. Do not run it
 alongside another trader using the same account and symbol.
 
 ```bash
-.venv/bin/python -m trade.venue.live.bitget.market_round_trip \
+.venv/bin/python -m test.manual.test_bitget_market_round_trip \
   --key-path LiveTrading/bitget/trading7 \
   --strategy-id Doge-bitget-1 --symbol DOGEUSDT \
   --execute \
@@ -157,3 +154,27 @@ the original exchange error chain. Existing output files are not overwritten.
 - [Position protection](https://www.bitget.com/api-doc/classic/contract/plan/Place-Tpsl-Order)
 - [Trigger history and executable order IDs](https://www.bitget.com/api-doc/classic/contract/plan/orders-plan-history)
 - [Private WebSocket authentication and heartbeats](https://www.bitget.com/api-doc/classic/quickStart/websocket-intro)
+
+## Execution and background reads
+
+The live runner's account worker owns order submission, closing and failed-entry
+recovery. Callers outside that runner must also serialize trading operations for
+an account. The venue no longer holds an operation-wide lock across trading,
+dashboard reads or reconciliation. Background position events never initiate
+flat-position protective-order cancellation. Position TP/SL cancellation after
+full closure is handled by Bitget. Existing pending orders still block a new
+entry; they are not automatically removed. Triggered protective limit orders
+may still be cancelled during an explicit close to release reserved exposure.
+
+Protection snapshots and order attribution maps use short memory-only locks.
+Snapshot versions prevent an older refresh from overwriting a newer refresh or
+a locally recorded protection order. Dashboard data may briefly lag trading.
+
+Each concurrent REST request leases an exclusive Session from a reusable pool.
+Slow dashboard/history responses cannot hold the trading request's Session.
+Endpoint pacing remains shared within the venue, with waits outside locks;
+requests to the same endpoint can still wait for their permitted send time.
+This does not increase exchange limits or coordinate limits across venue instances.
+Custom transports can supply `session_factory` to create additional independent
+sessions with matching configuration. Shutdown rejects new requests, interrupts
+pacing waits, waits for in-flight requests, and closes pooled sessions.

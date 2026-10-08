@@ -3,8 +3,8 @@
 
 Pipeline:
 
-    shared data feed -> feature generation -> model inference -> MarketView
-    -> strategy intent -> configured live venue
+    shared data feed -> serial feature generation and model inference
+    -> bounded account queues -> strategy intent -> configured live venue
 
 Each strategy is restored from a shared canonical JSONL backtest report and
 selected by its live-config hash.  Live-only settings choose the model artifact,
@@ -15,12 +15,14 @@ owned by the report.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
 import ntpath
 import os, sys
 import queue
+import select
 import time
 from numbers import Real
 from dataclasses import dataclass, field, fields, replace
@@ -47,7 +49,12 @@ from trade.core.protocol import (
     TradeIntent,
 )
 from trade.core.execution import ExecutionEvent, ExecutionReport
+from trade.runner.connection_state import pipeline_can_trade, pipeline_connection
+from trade.runner.account_execution import AccountExecution
+from trade.runner.stage_timing import StageTiming
 from trade.runner.config import BrokerConfig
+from trade.runner.identity import instance_key, display_name
+from trade.venue.mock_venue import MockVenue
 from trade.runner.initial_state import initialize_strategies
 from trade.monitoring.live_monitoring import (
     LiveMonitoringConfig,
@@ -59,12 +66,14 @@ from trade.recording.prediction_trace import (
     LivePredictionTraceRecorder,
     PredictionTraceConfig,
 )
+from trade.recording.persistent_output import OutputLease, prepare_output
 from trade.recording.execution_trace import (
     ExecutionTraceConfig,
     LiveExecutionTraceRecorder,
 )
 from trade.notification.notify import Notify
 from trade.notification.telegram_notify import TelegramNotify
+from trade.notification.execution_failure import ExecutionFailureNotifications
 from trade.venue.live.binance_data_feed import BinanceDataFeed
 from trade.core.venue_base import VenueBase
 from trade.core.strategy_base import StrategyBase
@@ -106,6 +115,7 @@ class LiveVenueConfigBase:
 
     venue: str
     path: str
+    telegram_token_path: str | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -143,10 +153,12 @@ class LiveVenueConfigCtrader(LiveVenueConfigBase, LiveVenueConfigHedge):
 
     profit_target: float
     max_loss: float
-    telegram_token_path: str
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if isinstance(self.trader_login, bool) or not str(self.trader_login).isdigit() or int(self.trader_login) <= 0:
+            raise ValueError("cTrader trader_login must be a positive integer")
+        object.__setattr__(self, "trader_login", str(int(self.trader_login)))
         profit_target = float(self.profit_target)
         max_loss = float(self.max_loss)
         if not math.isfinite(profit_target) or profit_target <= 0:
@@ -169,10 +181,11 @@ SUPPORTED_VENUES = {
 
 @dataclass
 class LiveStrategySpec:
-    strategy_id: str
+    instance_id: str
     hash_id: str
     run_live: bool
     model_path: str
+    account_id: str = ""
     device: str = "auto"
     compound: bool = True
     enable: bool = True
@@ -181,6 +194,10 @@ class LiveStrategySpec:
     strategy_config: Any = None
     broker_config: BrokerConfig = None
     venue_config: LiveVenueConfigBase = None
+
+    @property
+    def display_name(self) -> str:
+        return display_name(self.base_define.symbol, self.base_define.interval, self.venue_config.venue, self.hash_id)
 
     def __post_init__(self) -> None:
         if not isinstance(self.run_live, bool):
@@ -207,6 +224,7 @@ class StrategyPipeline:
     notifier: Notify | None = None
     initial_balance: float | None = None
     start_time: str | None = None
+    connection_sync_monotonic: float = 0.0
     notification_keys: set[str] = field(default_factory=set, repr=False)
 
     PROFIT_TARGET_OVERSHOOT_MULTIPLIER: ClassVar[float] = 1.02
@@ -288,7 +306,6 @@ class StrategyPipeline:
 
         loss_floor = initial_equity * (1.0 - float(config.max_loss))
         profit_target_equity = initial_equity * (1.0 + float(config.profit_target))
-        profit_ceiling = initial_equity * (1.0 + float(config.profit_target) * self.PROFIT_TARGET_OVERSHOOT_MULTIPLIER)
         if current_equity <= loss_floor:
             return None, "max_loss_reached"
         if current_equity >= profit_target_equity:
@@ -300,16 +317,8 @@ class StrategyPipeline:
         )
         round_trip_commission = commission_rate * self.ROUND_TRIP_COMMISSION_SIDES
         loss_per_unit = price * (stop_loss_pct + round_trip_commission)
-        profit_per_unit = price * max(
-            0.0,
-            take_profit_pct - round_trip_commission,
-        )
-
         max_loss_quantity = (current_equity - loss_floor) / loss_per_unit
         quantity = min(requested_quantity, max_loss_quantity)
-        if profit_per_unit > 0:
-            max_profit_quantity = (profit_ceiling - current_equity) / profit_per_unit
-            quantity = min(quantity, max_profit_quantity)
 
         try:
             normalized_quantity = float(self.venue.normalize_order_quantity(quantity))
@@ -319,8 +328,8 @@ class StrategyPipeline:
             return None, "entry_quantity_below_minimum"
         return normalized_quantity, None
 
-    def _execute_intent(self, observation: Observation, intent: TradeIntent):
-        if not self.enable:
+    def _execute_intent(self, observation: Observation, intent: TradeIntent, *, expired=None):
+        if not pipeline_can_trade(self) or (expired is not None and expired()):
             return None
         venue_name = str(getattr(self.spec.venue_config, "venue", "")).strip().casefold()
         if venue_name != "ctrader" or intent.action != ActionType.OPEN:
@@ -338,7 +347,7 @@ class StrategyPipeline:
             message = (
                 f"date={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} | "
                 f"runner_id={self.runner_id} | "
-                f"strategy_id={self.spec.strategy_id} | "
+                f"instance_id={self.spec.instance_id} | "
                 f"event={rejection_reason} | "
                 f"initial_equity={initial_equity:.2f} | "
                 f"current_equity={current_equity:.2f}"
@@ -351,7 +360,7 @@ class StrategyPipeline:
             logger = getattr(self.venue, "logger", None) or logging.getLogger("trade.live")
             logger.info(
                 "cTrader entry quantity reduced by account boundary | " "strategy=%s hash=%s symbol=%s requested=%g submitted=%g " "equity=%.2f",
-                self.spec.strategy_id,
+                self.spec.instance_id,
                 self.spec.hash_id,
                 self.spec.base_define.symbol,
                 original_quantity,
@@ -398,16 +407,16 @@ class StrategyPipeline:
                 raise RuntimeError("Could not verify an affordable quantity after scaling")
         except Exception:
             logger.exception(
-                "cTrader margin precheck failed; entry rejected | strategy_id=%s symbol=%s",
-                self.spec.strategy_id, self.spec.base_define.symbol,
+                "cTrader margin precheck failed; entry rejected | instance_id=%s symbol=%s",
+                self.spec.instance_id, self.spec.base_define.symbol,
             )
             return self._rejected_entry(intent, "margin_precheck_failed")
 
         if quantity < margin_quantity:
             message = (
                 f"WARNING | event=margin_quantity_reduced | runner_id={self.runner_id} | "
-                f"strategy_id={self.spec.strategy_id} | symbol={self.spec.base_define.symbol} | "
-                f"account_id={self.venue.get_execution_account_id()} | "
+                f"instance_id={self.spec.instance_id} | symbol={self.spec.base_define.symbol} | "
+                f"trader_login={self.spec.venue_config.trader_login} | "
                 f"required_margin={required_margin:.8g} | available_margin={available_margin:.8g} | "
                 f"margin_limit={margin_limit:.8g} | max_margin_ratio={self.MAX_MARGIN_RATIO:.8g} | "
                 f"final_required_margin={final_margin:.8g} | margin_currency=account_deposit | "
@@ -424,6 +433,25 @@ class StrategyPipeline:
         if quantity == 0:
             return self._rejected_entry(intent, "insufficient_margin_below_minimum")
 
+        if not pipeline_can_trade(self) or (expired is not None and expired()):
+            return None
+        # Use the final quantity after loss, volume and margin limits.
+        initial_equity = float(self.spec.broker_config.initial_equity)
+        current_equity = float(observation.account.equity)
+        profit_ceiling = initial_equity * (
+            1.0 + float(self.spec.venue_config.profit_target) * self.PROFIT_TARGET_OVERSHOOT_MULTIPLIER
+        )
+        round_trip_commission = (
+            float(self.spec.broker_config.commission_pct) / 100.0 * self.ROUND_TRIP_COMMISSION_SIDES
+        )
+        max_take_profit_pct = (profit_ceiling - current_equity) / (float(intent.price) * quantity) + round_trip_commission
+        if intent.take_profit_pct > max_take_profit_pct:
+            logger.info(
+                "cTrader take profit reduced by account boundary | "
+                "instance_id=%s original_take_profit_pct=%g submitted_take_profit_pct=%g quantity=%g",
+                self.spec.instance_id, intent.take_profit_pct, max_take_profit_pct, quantity,
+            )
+            intent.take_profit_pct = max_take_profit_pct
         intent.order_qty = quantity
         report = self.venue.execute_action(intent)
         if isinstance(report, ExecutionReport) and quantity < original_quantity:
@@ -442,6 +470,7 @@ class FeedGroup:
     required_bars: int
     pipelines: list[StrategyPipeline]
     last_processed_candle_open_time_ms: Optional[int] = None
+    last_received_candle_open_time_ms: Optional[int] = None
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -603,7 +632,7 @@ def _parse_venue_config(
     if not os.path.isdir(path):
         raise FileNotFoundError(f"{venue_name} key directory not found: {path}")
     values = {field.name: section.get(field.name) for field in fields(venue_class) if field.name not in {"venue", "path"}}
-    if venue_name == "ctrader":
+    if venue_name != "mock":
         values["telegram_token_path"] = os.path.realpath(_resolve_path(config_path, telegram_token_path))
     return venue_class(
         venue=venue_name,
@@ -612,10 +641,10 @@ def _parse_venue_config(
     )
 
 
-def _strategy_entries(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+def _strategy_entries(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     strategies = payload.get("strategy")
-    if not isinstance(strategies, Mapping):
-        raise TypeError("Live configuration strategy must be an object")
+    if not isinstance(strategies, list) or not all(isinstance(item, Mapping) for item in strategies):
+        raise TypeError("Live configuration strategy must be a list of objects")
     return strategies
 
 
@@ -652,8 +681,8 @@ def _new_live_run_id() -> str:
 
 
 def _live_run_output_dir(runner_output_dir: str, run_id: str) -> str:
-    normalized_run_id = _validate_runner_id(run_id)
-    return os.path.join(runner_output_dir, normalized_run_id)
+    _validate_runner_id(run_id)
+    return os.path.abspath(runner_output_dir)
 
 
 def load_live_runner_identity(
@@ -723,20 +752,30 @@ def load_live_runner_configuration(
     telegram_token_path = payload.get("telegram_token")
     strategy_entries: list[LiveStrategySpec] = []
     strategies_by_report: dict[str, list[LiveStrategySpec]] = {}
-    for raw_id, raw_entry in raw_strategy_entries.items():
-        strategy_id = str(raw_id).strip()
+    for raw_entry in raw_strategy_entries:
+        if "instance_id" in raw_entry or "strategy_id" in raw_entry:
+            raise ValueError("Instance identity is generated; do not configure an ID")
+        instance_id = str(raw_entry.get("hash", ""))
         entry = dict(raw_entry)
+        if str(entry.get("venue", "")).strip().casefold() == "ctrader":
+            if "account_id" in entry:
+                raise ValueError("cTrader account_id is resolved at runtime; remove it from configuration")
+            account_id = ""
+        else:
+            account_id = entry.get("account_id")
+            if isinstance(account_id, bool) or not isinstance(account_id, (str, int)) or not str(account_id).strip():
+                raise ValueError("Live strategy requires a nonempty account_id")
         run_live = entry["run_live"]
         compound = entry.get("compound", True)
         enable = entry.get("enable", True)
         if not isinstance(run_live, bool):
-            raise TypeError(f"Live strategy {strategy_id!r} run_live must be a JSON boolean")
+            raise TypeError(f"Live strategy {instance_id!r} run_live must be a JSON boolean")
         if not run_live:
             continue
         if not isinstance(compound, bool):
-            raise TypeError(f"Live strategy {strategy_id!r} compound must be a JSON boolean")
+            raise TypeError(f"Live strategy {instance_id!r} compound must be a JSON boolean")
         if not isinstance(enable, bool):
-            raise TypeError(f"Live strategy {strategy_id!r} enable must be a JSON boolean")
+            raise TypeError(f"Live strategy {instance_id!r} enable must be a JSON boolean")
         hash_id = entry["hash"]
         report_path = _resolve_path(config_path, entry["config_path"])
         if not report_path.lower().endswith(".jsonl"):
@@ -746,7 +785,8 @@ def load_live_runner_configuration(
             raise FileNotFoundError(f"Model artifact directory not found: {model_path}")
         strategy_entries.append(
             LiveStrategySpec(
-                strategy_id=strategy_id,
+                instance_id=instance_id,
+                account_id=str(account_id).strip(),
                 hash_id=hash_id,
                 run_live=run_live,
                 model_path=model_path,
@@ -769,6 +809,16 @@ def load_live_runner_configuration(
 
     for report_path, specs in strategies_by_report.items():
         load_params_from_report(specs, report_path)
+
+    identities = set()
+    for spec in strategy_entries:
+        account_key = (str(spec.venue_config.trader_login)
+                       if spec.venue_config.venue == "ctrader" else spec.account_id)
+        spec.instance_id = instance_key(spec.venue_config.venue, account_key,
+                                        spec.base_define.symbol, spec.base_define.interval, spec.hash_id)
+        if spec.instance_id in identities:
+            raise ValueError(f"Duplicate live instance: {spec.instance_id}")
+        identities.add(spec.instance_id)
 
     monitoring = monitoring_config_from_mapping(
         payload.get("monitoring"),
@@ -869,6 +919,8 @@ class LiveRunner:
         prediction_callback: Optional[Callable[[StrategyPipeline, int, pd.Series], None]] = None,
         runner_id: str | None = None,
         output_dir: str | None = None,
+        run_id: str | None = None,
+        output_lease: OutputLease | None = None,
         monitoring_config: LiveMonitoringConfig | None = None,
         prediction_trace_config: PredictionTraceConfig | None = None,
         execution_trace_config: ExecutionTraceConfig | None = None,
@@ -877,13 +929,14 @@ class LiveRunner:
             raise ValueError("LiveRunner requires at least one strategy")
         self.logger = logger or logging.getLogger("trade.live")
         self._feed_factory = feed_factory or self._create_feed
-        self._ctrader_connections: dict[str, CTraderOpenApiConnection] = {}
-        self._ctrader_connection_path: str | None = None
+        self._ctrader_connections: dict[tuple[str, str], CTraderOpenApiConnection] = {}
         self._venue_factory = venue_factory or self._create_venue
         self._notify_factory = notify_factory or self._create_notifier
         self._prediction_callback = prediction_callback
         self.runner_id = _validate_runner_id(runner_id or (monitoring_config.runner_id if monitoring_config is not None else None))
         self.output_dir = os.path.abspath(output_dir) if output_dir is not None else None
+        self.run_id = run_id or _new_live_run_id()
+        self._output_lease = output_lease
         self._monitoring_config = monitoring_config
         self._prediction_trace_config = prediction_trace_config
         self._execution_trace_config = execution_trace_config
@@ -894,9 +947,13 @@ class LiveRunner:
         self._prediction_trace_failed = False
         self._initialized = False
         self._closed = False
+        self._stop_requested = threading.Event()
         self.strategy_pipelines: list[StrategyPipeline] = []
         self.feed_groups: list[FeedGroup] = []
-        self._events: queue.Queue[RunnerEvent] = queue.Queue()
+        self._events: queue.Queue[RunnerEvent | None] = queue.Queue()
+        self._calculation_lock = threading.RLock()
+        self._account_execution = AccountExecution(self.logger)
+        self._failure_notifications = ExecutionFailureNotifications(self.runner_id, self.logger)
         self.data_check_timer = None
         self._data_check_timer_interval_ms = 0
         self._next_min_expect_candle_open_time = 0
@@ -904,7 +961,12 @@ class LiveRunner:
         self._data_check_timer_max_cycle_ms = 0
         self._data_check_timer_cycle_count = 0
         try:
+            if self.output_dir is not None and self._output_lease is None:
+                self._output_lease = OutputLease(self.output_dir)
+                prepare_output(self.output_dir)
             self._build(specs)
+            for connection in self._ctrader_connections.values():
+                connection.set_recovery_callbacks(self._on_ctrader_recovery_failed, self._on_ctrader_recovery_succeeded)
             if self._prediction_trace_config is not None:
                 self._prediction_trace = LivePredictionTraceRecorder(
                     self._prediction_trace_config,
@@ -914,26 +976,27 @@ class LiveRunner:
                 self._execution_trace = LiveExecutionTraceRecorder(
                     self._execution_trace_config,
                     runner_id=self.runner_id,
-                    run_id=(os.path.basename(self.output_dir) if self.output_dir is not None else None),
+                    run_id=self.run_id,
                     logger=self.logger,
                 )
-                for pipeline in self.strategy_pipelines:
-                    register = getattr(
-                        pipeline.venue,
-                        "set_execution_event_callback",
-                        None,
-                    )
-                    if callable(register):
-                        register(
-                            lambda event, current=pipeline: self._record_execution_event(
-                                current,
-                                event,
-                            )
-                        )
                 self.logger.info(
                     "Live execution trace started | files=%s",
                     self._execution_trace.paths,
                 )
+            for pipeline in self.strategy_pipelines:
+                register = getattr(
+                    pipeline.venue,
+                    "set_execution_event_callback",
+                    None,
+                )
+                if callable(register):
+                    register(
+                        lambda event, current=pipeline: self._record_execution_event(
+                            current,
+                            event,
+                        )
+                    )
+            if self._execution_trace is not None:
                 self._reconcile_execution_events()
             self._live_registry = LiveStateRegistry(self.strategy_pipelines)
             if self._monitoring_config is not None:
@@ -968,12 +1031,15 @@ class LiveRunner:
         configuration: LiveRunnerConfiguration,
         *,
         logger: Optional[logging.Logger] = None,
+        output_lease: OutputLease | None = None,
     ) -> "LiveRunner":
         return cls(
             configuration.strategies,
             logger=logger,
             runner_id=configuration.runner_id,
             output_dir=configuration.output_dir,
+            run_id=configuration.run_id,
+            output_lease=output_lease,
             monitoring_config=configuration.monitoring,
             prediction_trace_config=configuration.prediction_trace,
             execution_trace_config=configuration.execution_trace,
@@ -1011,12 +1077,36 @@ class LiveRunner:
         logger: logging.Logger,
     ) -> Notify | None:
         config = spec.venue_config
-        if str(getattr(config, "venue", "")).strip().casefold() != "ctrader":
+        if str(getattr(config, "venue", "")).strip().casefold() == "mock":
             return None
         return TelegramNotify(
             config.telegram_token_path,
             logger=logger,
         )
+
+    def _order_owner(self, spec: LiveStrategySpec) -> str:
+        """Keep exchange-side ownership stable for migrated live positions."""
+        output_dir = getattr(self, "output_dir", None)
+        if output_dir is not None:
+            path = os.path.join(output_dir, "order_owners.json")
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as handle:
+                    owners = json.load(handle)
+                if not isinstance(owners, dict) or not all(isinstance(v, str) and v for v in owners.values()):
+                    raise ValueError("Invalid exchange order ownership mapping")
+                if spec.instance_id in owners:
+                    return owners[spec.instance_id]
+        return spec.instance_id
+
+    @staticmethod
+    def _bind_ctrader_account(spec: LiveStrategySpec, account_id, logger) -> None:
+        if isinstance(account_id, bool) or not str(account_id).isdigit() or int(account_id) <= 0:
+            raise ValueError("Resolved cTrader account ID must be a positive integer")
+        spec.account_id = str(int(account_id))
+        spec.instance_id = instance_key("ctrader", str(spec.venue_config.trader_login),
+                                        spec.base_define.symbol, spec.base_define.interval, spec.hash_id)
+        if isinstance(logger, logging.LoggerAdapter):
+            logger.extra["instance_id"] = spec.instance_id
 
     def _create_venue(self, spec: LiveStrategySpec, logger: logging.Logger):
         config = spec.venue_config
@@ -1025,14 +1115,12 @@ class LiveRunner:
 
             return MockVenue(initial_equity=spec.broker_config.initial_equity)
         if config.venue == "mt5":
-            if not spec.strategy_id.isascii() or not spec.strategy_id.isdigit():
-                raise ValueError("MT5 strategy_id must contain ASCII digits only; " f"got {spec.strategy_id!r}")
             from trade.venue.live.mt5.mt5_venue import MT5Venue
 
             return MT5Venue(
                 config.path,
                 spec.base_define.symbol,
-                int(spec.strategy_id),
+                int(hashlib.sha256(self._order_owner(spec).encode()).hexdigest()[:8], 16),
                 logger=logger,
                 login=config.login,
                 password=config.password,
@@ -1045,23 +1133,20 @@ class LiveRunner:
             return BybitVenue(
                 config.path,
                 spec.base_define.symbol,
-                f"{spec.strategy_id}:{spec.hash_id}",
+                self._order_owner(spec),
                 logger=logger,
             )
         if config.venue == "ctrader":
             connection_path = os.path.realpath(config.path)
-            if self._ctrader_connection_path is not None and connection_path != self._ctrader_connection_path:
-                raise ValueError(
-                    "All cTrader venues must use the same credential path; " f"expected {self._ctrader_connection_path!r}, " f"got {connection_path!r}"
-                )
-            self._ctrader_connection_path = connection_path
-
             discovery_connection = self._ctrader_connection(
                 connection_path,
                 "live",
                 self.logger,
             )
             account_id, environment = discovery_connection.resolve_account(config.trader_login)
+            self._bind_ctrader_account(spec, account_id, logger)
+            if any(pipeline.spec.instance_id == spec.instance_id for pipeline in self.strategy_pipelines):
+                raise ValueError(f"Duplicate live instance after account resolution: {spec.instance_id}")
             logger.info(
                 "cTrader account route resolved | trader_login=%s account=%s environment=%s",
                 config.trader_login,
@@ -1076,7 +1161,7 @@ class LiveRunner:
             ctrader_venue = CTraderVenue(
                 connection_path,
                 spec.base_define.symbol,
-                f"{spec.strategy_id}:{spec.hash_id}",
+                self._order_owner(spec),
                 logger=logger,
                 trader_login=config.trader_login,
                 environment=environment,
@@ -1091,7 +1176,7 @@ class LiveRunner:
             return BinanceVenue(
                 config.path,
                 spec.base_define.symbol,
-                f"{spec.strategy_id}:{spec.hash_id}",
+                self._order_owner(spec),
                 logger=logger,
             )
         if config.venue == "bitget":
@@ -1100,7 +1185,7 @@ class LiveRunner:
             return BitgetVenue(
                 config.path,
                 spec.base_define.symbol,
-                f"{spec.strategy_id}:{spec.hash_id}",
+                self._order_owner(spec),
                 logger=logger,
             )
         raise ValueError(f"Unsupported venue: {config.venue}")
@@ -1111,14 +1196,17 @@ class LiveRunner:
         environment: str,
         logger: logging.Logger,
     ) -> CTraderOpenApiConnection:
-        connection = self._ctrader_connections.get(environment)
+        connection_path = os.path.realpath(connection_path)
+        environment = str(environment).strip().casefold()
+        connection_key = (connection_path, environment)
+        connection = self._ctrader_connections.get(connection_key)
         if connection is None:
             connection = CTraderOpenApiConnection(
                 connection_path,
                 environment=environment,
                 logger=logger,
             )
-            self._ctrader_connections[environment] = connection
+            self._ctrader_connections[connection_key] = connection
         return connection
 
     @staticmethod
@@ -1127,7 +1215,7 @@ class LiveRunner:
 
         equity = float(venue.get_account_equity())
         if equity <= 0:
-            raise RuntimeError("Venue returned invalid account equity for " f"{spec.strategy_id} ({spec.hash_id})")
+            raise RuntimeError("Venue returned invalid account equity for " f"{spec.instance_id} ({spec.hash_id})")
         leverage = float(spec.broker_config.leverage)
         data_interval_ms = common.get_interval_ms(spec.base_define.interval)
 
@@ -1139,7 +1227,7 @@ class LiveRunner:
                 logger = logging.getLogger("trade")
                 logger.warning(
                     "Open position has no opening timestamp | strategy=%s hash=%s",
-                    spec.strategy_id,
+                    spec.instance_id,
                     spec.hash_id,
                 )
             else:
@@ -1191,19 +1279,22 @@ class LiveRunner:
             raise ValueError(
                 "cTrader account balance is outside the configured initial_equity "
                 "tolerance: "
-                f"strategy={spec.strategy_id!r}, initial_equity={initial_equity:g}, "
+                f"strategy={spec.instance_id!r}, initial_equity={initial_equity:g}, "
                 f"actual_balance={actual_balance:g}, "
                 f"allowed_range=[{lower_balance:g}, {upper_balance:g}]"
             )
 
     def _build(self, specs: list[LiveStrategySpec]) -> None:
+        active_ids = [spec.instance_id for spec in specs if spec.run_live]
+        if len(active_ids) != len(set(active_ids)):
+            raise ValueError("Duplicate live instance")
         grouped_pipelines: list[tuple[common.MarketDataSourceConfig, list[StrategyPipeline]]] = []
 
         for spec in specs:
             if not spec.run_live:
                 self.logger.info(
                     "Non-live strategy skipped | id=%s hash=%s",
-                    spec.strategy_id,
+                    spec.instance_id,
                     spec.hash_id,
                 )
                 continue
@@ -1211,7 +1302,7 @@ class LiveRunner:
             strategy_logger = StrategyLoggerAdapter(
                 self.logger,
                 {
-                    "strategy_id": spec.strategy_id,
+                    "instance_id": spec.instance_id,
                     "hash": spec.hash_id,
                     "symbol": spec.base_define.symbol,
                 },
@@ -1240,13 +1331,24 @@ class LiveRunner:
             venue = None
             try:
                 venue = self._venue_factory(spec, strategy_logger)
+                if spec.venue_config.venue == "ctrader" and not isinstance(venue, MockVenue):
+                    actual_account = str(venue.get_execution_account_id())
+                    if spec.account_id and actual_account != spec.account_id:
+                        raise ValueError("cTrader account changed between discovery and venue initialization")
+                    self._bind_ctrader_account(spec, actual_account, strategy_logger)
+                if any(pipeline.spec.instance_id == spec.instance_id for pipeline in self.strategy_pipelines):
+                    raise ValueError(f"Duplicate live instance after account resolution: {spec.instance_id}")
+                if getattr(spec, "account_id", "") and not isinstance(venue, MockVenue):
+                    actual_account = str(venue.get_execution_account_id())
+                    if actual_account != spec.account_id:
+                        raise ValueError(f"Configured account does not match venue for {spec.instance_id}")
                 self._validate_ctrader_initial_balance(spec, venue)
                 notifier = self._notify_factory(spec, strategy_logger)
                 strategy = self._create_strategy(spec, venue)
                 strategy.logger = strategy_logger
                 self.logger.info(
                     "Strategy created | id=%s hash=%s venue=%s",
-                    spec.strategy_id,
+                    spec.instance_id,
                     spec.hash_id,
                     type(venue).__name__,
                 )
@@ -1259,7 +1361,7 @@ class LiveRunner:
                     except Exception:
                         self.logger.exception(
                             "Venue cleanup failed during construction: %s",
-                            spec.strategy_id,
+                            spec.instance_id,
                         )
                 raise
 
@@ -1301,20 +1403,38 @@ class LiveRunner:
             len(self.feed_groups),
         )
 
-    def set_strategy_enabled(self, strategy_id: str, enable: bool) -> None:
+    def _on_ctrader_recovery_failed(self, connection, reason: str) -> None:
+        self._connection_transition(connection, "paused", reason)
+
+    def _on_ctrader_recovery_succeeded(self, connection) -> None:
+        self._connection_transition(connection, "recovered", "Connection, authentication and account synchronization succeeded")
+
+    def _connection_transition(self, connection, event, reason):
+        if self._closed:
+            return
+        affected = [pipeline for pipeline in self.strategy_pipelines
+                    if pipeline_connection(pipeline) is connection]
+        registry = getattr(self, "_live_registry", None)
+        if registry is not None:
+            registry.connection_changed(affected)
+        self._failure_notifications.connection_transition(
+            connection, affected, event, reason,
+        )
+
+    def set_strategy_enabled(self, instance_id: str, enable: bool) -> None:
         """Enable or disable one constructed strategy while the runner is active."""
 
         if not isinstance(enable, bool):
             raise TypeError("Strategy enable must be a boolean")
-        matches = [pipeline for pipeline in self.strategy_pipelines if pipeline.spec.strategy_id == strategy_id]
+        matches = [pipeline for pipeline in self.strategy_pipelines if pipeline.spec.instance_id == instance_id]
         if not matches:
-            raise KeyError(f"Unknown live strategy ID: {strategy_id!r}")
+            raise KeyError(f"Unknown live strategy ID: {instance_id!r}")
         if len(matches) > 1:
-            raise ValueError(f"Duplicate live strategy ID: {strategy_id!r}")
+            raise ValueError(f"Duplicate live strategy ID: {instance_id!r}")
         matches[0].set_enabled(enable)
         self.logger.info(
-            "Live strategy runtime state changed | strategy_id=%s enable=%s",
-            strategy_id,
+            "Live strategy runtime state changed | instance_id=%s enable=%s",
+            instance_id,
             enable,
         )
 
@@ -1362,6 +1482,9 @@ class LiveRunner:
         for group in self.feed_groups:
             with group.lock:
                 last_processed_candle_open_time_ms = group.last_processed_candle_open_time_ms
+                last_received = group.last_received_candle_open_time_ms
+                if last_received is not None and last_processed_candle_open_time_ms is not None:
+                    last_processed_candle_open_time_ms = max(last_processed_candle_open_time_ms, last_received)
             expected_open_time_ms = _expected_closed_candle_open_time_ms(
                 check_boundary_ms,
                 group.interval_ms,
@@ -1410,7 +1533,7 @@ class LiveRunner:
                         continue
                     message = (
                         "WARNING: Candle missing at DATA_CHECK | "
-                        f"strategy_id={pipeline.spec.strategy_id} hash={pipeline.spec.hash_id} "
+                        f"instance_id={pipeline.spec.instance_id} hash={pipeline.spec.hash_id} "
                         f"symbol={group.market_config.symbol} interval={group.market_config.interval} "
                         f"expected_open_time_utc={_format_utc_ms(expected_open_time_ms)} "
                         f"last_processed_open_time_utc={_format_utc_ms(last_processed_candle_open_time_ms)} "
@@ -1463,19 +1586,13 @@ class LiveRunner:
 
         if self.output_dir is not None:
             initialize_strategies(
-                os.path.join(os.path.dirname(self.output_dir), "initial.json"),
+                os.path.join(self.output_dir, "initial.json"),
                 self.strategy_pipelines,
             )
 
         for group in self.feed_groups:
             group.feed.start(
-                lambda open_time_ms, target=group: self._events.put(
-                    RunnerEvent(
-                        e_type=RunnerEventType.CLOSED_CANDLE,
-                        group=target,
-                        timestamp_ms=open_time_ms,
-                    )
-                )
+                lambda open_time_ms, target=group: self._receive_closed_candle(target, open_time_ms)
             )
         self._start_data_check_timer()
         self._initialized = True
@@ -1486,6 +1603,17 @@ class LiveRunner:
             self._data_check_timer_interval_ms,
             DATA_CHECK_TIMER_DELAY_MS,
         )
+
+    def _receive_closed_candle(self, group, open_time_ms):
+        received = time.monotonic()
+        if self._closed:
+            return
+        with group.lock:
+            previous = group.last_received_candle_open_time_ms
+            group.last_received_candle_open_time_ms = max(previous or open_time_ms, open_time_ms)
+        self._events.put(RunnerEvent(
+            RunnerEventType.CLOSED_CANDLE, group, open_time_ms, received,
+        ))
 
     def _record_prediction_trace(self, method: str, *args) -> None:
         recorder = self._prediction_trace
@@ -1513,6 +1641,7 @@ class LiveRunner:
             is_live=True,
             batch_size=1,
             diff_thresh=None,
+            show_feature_distribution = False
         )
         return predicted
 
@@ -1536,55 +1665,97 @@ class LiveRunner:
             tz="UTC",
         ).to_pydatetime()
         for pipeline in group.pipelines:
-            if not bool(getattr(pipeline, "enable", True)):
+            if not pipeline_can_trade(pipeline, received_monotonic):
                 continue
-            if self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
-                continue
-            try:
-                observation = Observation(
-                    market=market,
-                    position=pipeline.venue.get_current_state(),
-                    account=AccountView(equity=float(pipeline.venue.get_account_equity())),
-                    candle_open_time_utc=candle_open_time_utc,
-                    daily_reset_date=pipeline.venue.get_daily_reset_date(candle_open_time_utc),
-                )
-                if self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
-                    continue
-                intent = pipeline.strategy.process(observation)
-                if self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
-                    continue
-                execution_report = pipeline._execute_intent(observation, intent)
-                self._record_execution(pipeline, execution_report)
-                self._record_live_cycle(
-                    pipeline,
-                    pd.Series({"pred": Signal.INVALID.value}),
-                    market,
-                    intent,
-                    candle_open_time_utc,
-                )
-                self.logger.warning(
-                    "Invalid candle processed | id=%s hash=%s symbol=%s " "open_time_utc=%s action=%s",
-                    pipeline.spec.strategy_id,
-                    pipeline.spec.hash_id,
-                    pipeline.spec.base_define.symbol,
-                    _format_utc_ms(candle_open_time_ms),
-                    intent.action.value,
-                )
-            except Exception:
-                self.logger.exception(
-                    "Invalid signal dispatch failed | strategy_id=%s hash=%s symbol=%s",
-                    pipeline.spec.strategy_id,
-                    pipeline.spec.hash_id,
-                    pipeline.spec.base_define.symbol,
-                )
+            self._submit_strategy(
+                pipeline, market, pd.Series({"pred": Signal.INVALID.value}),
+                candle_open_time_utc, received_monotonic,
+            )
+
+    @staticmethod
+    def _execution_account(pipeline):
+        spec = pipeline.spec
+        venue = spec.venue_config.venue.casefold()
+        if venue == "mt5":
+            # MT5 uses a process-wide terminal connection.
+            return (venue, "terminal")
+        account = spec.venue_config.trader_login if venue == "ctrader" else spec.account_id
+        return venue, str(account)
+
+    def _submit_strategy(self, pipeline, market, prediction, candle_at, received_monotonic):
+        received = time.monotonic() if received_monotonic is None else received_monotonic
+        if not pipeline_can_trade(pipeline, received):
+            return None
+        prediction = prediction.copy(deep=True)
+        market = replace(market)
+
+        registry = getattr(self, "_live_registry", None)
+        if registry is not None:
+            registry.record_prediction(pipeline, prediction, market, candle_at)
+
+        def record_status(status, reason):
+            if registry is not None:
+                registry.record_execution_status(pipeline, candle_at, status, reason)
+
+        queued_at = time.monotonic()
+
+        def execute():
+            with StageTiming(self.logger, "account_execution", pipeline.spec.instance_id, candle_at,
+                             received_monotonic=received, queued_monotonic=queued_at) as timing:
+                timing.outcome = "skipped"
+                if self._closed or not pipeline_can_trade(pipeline, received):
+                    record_status("skipped", "Runner stopped, strategy disabled or connection unavailable")
+                    return
+                try:
+                    intent = self._dispatch(pipeline, market, candle_at, received)
+                    if intent is not None:
+                        timing.call("live_record", self._record_live_cycle, pipeline, prediction, market, intent, candle_at)
+                        timing.outcome = "completed"
+                    else:
+                        record_status("skipped", "Signal expired or strategy disabled")
+                except Exception as exc:
+                    timing.outcome = "failed"
+                    record_status("failed", "Strategy execution failed; see runner logs")
+                    self.logger.exception(
+                        "Strategy dispatch or recording failed; skipping candle without retry | "
+                        "instance_id=%s hash=%s symbol=%s open_time_utc=%s",
+                        pipeline.spec.instance_id, pipeline.spec.hash_id,
+                        pipeline.spec.base_define.symbol, candle_at.isoformat(),
+                    )
+                    if not pipeline_can_trade(pipeline, received):
+                        return
+                    self._failure_notifications.notify(
+                        pipeline, execution_id=f"candle-{candle_at.isoformat()}",
+                        status="failed", event_at=candle_at,
+                        reason=f"Account query, decision or submission raised {self._failure_notifications.exception_reason(exc)}; "
+                               "execution outcome may be unknown; see runner logs before retrying",
+                    )
+
+        try:
+            return self._account_execution.submit(self._execution_account(pipeline), execute)
+        except (queue.Full, RuntimeError):
+            record_status("skipped", "Execution queue unavailable")
+            self._failure_notifications.notify(
+                pipeline, execution_id=f"candle-{candle_at.isoformat()}",
+                status="failed", reason="Execution queue unavailable", event_at=candle_at,
+            )
+            self.logger.exception(
+                "Strategy task rejected; execution queue unavailable | instance_id=%s",
+                pipeline.spec.instance_id,
+            )
+            return None
+
+    def wait_for_execution(self):
+        """Wait for submitted strategy tasks without changing their order."""
+        self._account_execution.wait()
 
     def _send_warning(self, pipeline: StrategyPipeline, message: str, category: str) -> None:
         try:
             notifier = pipeline.notifier
             if notifier is None or not notifier.send(message):
-                self.logger.error("%s warning delivery failed | strategy_id=%s", category, pipeline.spec.strategy_id)
+                self.logger.error("%s warning delivery failed | instance_id=%s", category, pipeline.spec.instance_id)
         except Exception:
-            self.logger.exception("%s warning delivery failed | strategy_id=%s", category, pipeline.spec.strategy_id)
+            self.logger.exception("%s warning delivery failed | instance_id=%s", category, pipeline.spec.instance_id)
 
     def _skip_expired_market(
         self,
@@ -1599,7 +1770,7 @@ class LiveRunner:
             return False
         message = (
             "WARNING: Strategy execution skipped because market data is too old | "
-            f"strategy_id={pipeline.spec.strategy_id} hash={pipeline.spec.hash_id} "
+            f"instance_id={pipeline.spec.instance_id} hash={pipeline.spec.hash_id} "
             f"symbol={pipeline.spec.base_define.symbol} "
             f"candle_open_time_utc={candle_open_time_utc.isoformat()} "
             f"receipt_age_seconds={age_seconds:.3f} "
@@ -1609,6 +1780,33 @@ class LiveRunner:
         self._send_warning(pipeline, message, "Market age")
         return True
 
+    @staticmethod
+    def _sync_recovered_position(pipeline, observation):
+        connection = pipeline_connection(pipeline)
+        if connection is None:
+            return
+        recovered_at = connection.last_recovered_monotonic
+        if recovered_at <= pipeline.connection_sync_monotonic:
+            return
+        from trade.strategy.strategy_bbm import BbmSignalStrategy
+
+        strategy = pipeline.strategy
+        if isinstance(strategy, BbmSignalStrategy):
+            held_bars = 0
+            if observation.position.dir != PositionDir.FLAT:
+                opened_at = pipeline.venue.get_last_position_open_time()
+                if opened_at is None:
+                    raise RuntimeError("Cannot resume a held position without its opening timestamp")
+                if opened_at.tzinfo is None:
+                    opened_at = opened_at.replace(tzinfo=timezone.utc)
+                candle_end = observation.candle_open_time_utc + timedelta(milliseconds=pipeline.interval_ms)
+                held_bars = max(0, int((candle_end - opened_at).total_seconds() * 1000) // pipeline.interval_ms)
+            # The next strategy.process call increments the observed holding count.
+            strategy.position_hold_bars = max(0, held_bars - 1)
+            strategy.previous_position_dir = observation.position.dir
+            strategy._last_candle_open_time_utc = None
+        pipeline.connection_sync_monotonic = recovered_at
+
     def _dispatch(
         self,
         pipeline: StrategyPipeline,
@@ -1616,56 +1814,101 @@ class LiveRunner:
         candle_open_time_utc: datetime,
         received_monotonic: float | None = None,
     ) -> TradeIntent | None:
-        if self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
-            return None
-        observation = Observation(
-            market=market,
-            position=pipeline.venue.get_current_state(),
-            account=AccountView(equity=float(pipeline.venue.get_account_equity())),
-            candle_open_time_utc=candle_open_time_utc,
-            daily_reset_date=pipeline.venue.get_daily_reset_date(candle_open_time_utc),
-        )
-        if self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
-            return None
-        intent = pipeline.strategy.process(observation)
-        if self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
-            return None
-        execution_report = pipeline._execute_intent(observation, intent)
-        self._record_execution(pipeline, execution_report)
-        self.logger.info(
-            "Strategy processed | id=%s hash=%s symbol=%s signal=%s action=%s",
-            pipeline.spec.strategy_id,
-            pipeline.spec.hash_id,
-            pipeline.spec.base_define.symbol,
-            market.signal.name,
-            intent.action.value,
-        )
-        return intent
+        with StageTiming(self.logger, "dispatch", pipeline.spec.instance_id, candle_open_time_utc) as timing:
+            timing.outcome = "skipped"
+            receipt = time.monotonic() if received_monotonic is None else received_monotonic
+            if not pipeline_can_trade(pipeline, receipt) or self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
+                return None
+            if isinstance(pipeline.venue, CTraderVenue):
+                position, account = timing.call("account_snapshot", pipeline.venue.get_execution_state)
+            else:
+                position = timing.call("position", pipeline.venue.get_current_state)
+                equity = timing.call("equity", pipeline.venue.get_account_equity)
+                account = AccountView(equity=float(equity))
+            observation = Observation(
+                market=market,
+                position=position,
+                account=account,
+                candle_open_time_utc=candle_open_time_utc,
+                daily_reset_date=timing.call("daily_reset", pipeline.venue.get_daily_reset_date, candle_open_time_utc),
+            )
+            if not pipeline_can_trade(pipeline, receipt) or self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
+                return None
+            timing.call("recovery_sync", self._sync_recovered_position, pipeline, observation)
+            if not pipeline_can_trade(pipeline, receipt):
+                return None
+            intent = timing.call("decision", pipeline.strategy.process, observation)
+            if not pipeline_can_trade(pipeline, receipt) or self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
+                return None
+            expired_before_order = False
+
+            def expired():
+                nonlocal expired_before_order
+                expired_before_order = not pipeline_can_trade(pipeline, receipt) or self._skip_expired_market(
+                    pipeline, candle_open_time_utc, received_monotonic,
+                )
+                return expired_before_order
+
+            execution_report = timing.call("execute_intent", pipeline._execute_intent, observation, intent, expired=expired)
+            connection = pipeline_connection(pipeline)
+            if expired_before_order or (connection is not None and not connection.accepts_market(receipt)):
+                if isinstance(execution_report, ExecutionReport):
+                    timing.call("execution_record", self._record_execution, pipeline, execution_report)
+                return None
+            if intent.action != ActionType.NOOP and not isinstance(execution_report, ExecutionReport):
+                self._failure_notifications.notify(
+                    pipeline, execution_id=f"candle-{candle_open_time_utc.isoformat()}",
+                    status="unknown", order_role=intent.action.value,
+                    quantity=intent.order_qty,
+                    reason="Order execution returned no report; verify exchange state before retrying",
+                )
+            timing.call("execution_record", self._record_execution, pipeline, execution_report)
+            self.logger.info(
+                "Strategy processed | id=%s hash=%s symbol=%s signal=%s action=%s",
+                pipeline.spec.instance_id,
+                pipeline.spec.hash_id,
+                pipeline.spec.base_define.symbol,
+                market.signal.name,
+                intent.action.value,
+            )
+            timing.outcome = "completed"
+            return intent
+
+    @staticmethod
+    def _trace_account_fields(pipeline):
+        config = getattr(pipeline.spec, "venue_config", None)
+        if getattr(config, "venue", "") == "ctrader":
+            return {"account_id": "", "trader_login": str(config.trader_login)}
+        return {"account_id": pipeline.venue.get_execution_account_id(), "trader_login": ""}
 
     def _record_execution(
         self,
         pipeline: StrategyPipeline,
         report: Any,
     ) -> None:
-        recorder = getattr(self, "_execution_trace", None)
-        if recorder is None or not isinstance(report, ExecutionReport):
+        if not isinstance(report, ExecutionReport):
             return
+        connection = pipeline_connection(pipeline)
+        if connection is None or connection.trading_ready:
+            self._failure_notifications.report(pipeline, report)
+        recorder = getattr(self, "_execution_trace", None)
         try:
-            account_id = pipeline.venue.get_execution_account_id()
+            if recorder is None:
+                return
             venue_symbol = pipeline.venue.get_execution_symbol()
             recorder.record(
                 report,
-                strategy_id=pipeline.spec.strategy_id,
+                instance_id=pipeline.spec.instance_id,
                 strategy_hash=pipeline.spec.hash_id,
                 venue=type(pipeline.venue).__name__,
-                account_id=account_id,
+                **self._trace_account_fields(pipeline),
                 strategy_symbol=pipeline.spec.base_define.symbol,
                 venue_symbol=venue_symbol,
             )
         except Exception:
             self.logger.exception(
                 "Live execution trace enqueue failed | strategy=%s",
-                pipeline.spec.strategy_id,
+                pipeline.spec.instance_id,
             )
         finally:
             activate = getattr(
@@ -1681,23 +1924,24 @@ class LiveRunner:
         pipeline: StrategyPipeline,
         event: ExecutionEvent,
     ) -> None:
+        self._failure_notifications.event(pipeline, event)
         recorder = getattr(self, "_execution_trace", None)
         if recorder is None:
             return
         try:
             recorder.record_event(
                 event,
-                strategy_id=pipeline.spec.strategy_id,
+                instance_id=pipeline.spec.instance_id,
                 strategy_hash=pipeline.spec.hash_id,
                 venue=type(pipeline.venue).__name__,
-                account_id=pipeline.venue.get_execution_account_id(),
+                **self._trace_account_fields(pipeline),
                 strategy_symbol=pipeline.spec.base_define.symbol,
                 venue_symbol=pipeline.venue.get_execution_symbol(),
             )
         except Exception:
             self.logger.exception(
                 "Live execution event trace enqueue failed | strategy=%s",
-                pipeline.spec.strategy_id,
+                pipeline.spec.instance_id,
             )
 
     def _reconcile_execution_events(self) -> None:
@@ -1715,14 +1959,14 @@ class LiveRunner:
                 if count:
                     self.logger.info(
                         "Live execution history reconciled | strategy=%s " "events=%s since_utc=%s",
-                        pipeline.spec.strategy_id,
+                        pipeline.spec.instance_id,
                         count,
                         since_utc.isoformat(),
                     )
             except Exception:
                 self.logger.exception(
                     "Live execution history reconciliation failed | strategy=%s",
-                    pipeline.spec.strategy_id,
+                    pipeline.spec.instance_id,
                 )
 
     def _record_live_cycle(
@@ -1749,7 +1993,7 @@ class LiveRunner:
         except Exception:
             self.logger.exception(
                 "Live UI cycle recording failed | strategy=%s",
-                pipeline.spec.strategy_id,
+                pipeline.spec.instance_id,
             )
 
     @staticmethod
@@ -1780,6 +2024,8 @@ class LiveRunner:
         candle_open_time_ms: int,
         received_monotonic: float | None = None,
     ) -> None:
+        if received_monotonic is None:
+            received_monotonic = time.monotonic()
         expected_open_time_ms = last_processed_candle_open_time_ms + group.interval_ms
         if candle_open_time_ms > expected_open_time_ms:
             missed_count = (candle_open_time_ms - expected_open_time_ms) // group.interval_ms
@@ -1793,6 +2039,8 @@ class LiveRunner:
             )
 
         frame = group.feed.get_latest_data()
+        if frame is not None and not frame.empty:
+            frame = frame.loc[frame["open_time_ms_utc"] <= candle_open_time_ms].copy()
         if frame is None or frame.empty:
             self.logger.error(
                 "Closed-kline event has no cached data | symbol=%s interval=%s " "candle_open_time_utc=%s",
@@ -1814,64 +2062,45 @@ class LiveRunner:
                 trace_predictions: dict[str, pd.Series] = {}
                 candle_open_time_utc = pd.Timestamp(candle_open_time_ms, unit="ms", tz="UTC").to_pydatetime()
                 for pipeline in group.pipelines:
-                    if not bool(getattr(pipeline, "enable", True)):
+                    if not pipeline_can_trade(pipeline, received_monotonic):
                         continue
                     if self._skip_expired_market(pipeline, candle_open_time_utc, received_monotonic):
                         continue
-                    try:
-                        prepared = _prepare_market_frame(frame, pipeline.spec.base_define)
-                        features = pipeline.feature_factory.generate(prepared)
-                        predicted = self._predict(pipeline, features)
-                        latest_prediction = predicted.iloc[-1]
-                        trace_predictions[pipeline.spec.strategy_id] = latest_prediction.copy()
-                        if self._prediction_callback is not None:
-                            self._prediction_callback(pipeline, candle_open_time_ms, latest_prediction.copy())
-                        market = _market_view(predicted)
-                    except Exception:
-                        self.logger.exception(
-                            "Market preparation failed; dispatching INVALID | strategy_id=%s hash=%s symbol=%s",
-                            pipeline.spec.strategy_id,
-                            pipeline.spec.hash_id,
-                            pipeline.spec.base_define.symbol,
-                        )
+                    with StageTiming(self.logger, "calculation", pipeline.spec.instance_id,
+                                     candle_open_time_utc, received_monotonic=received_monotonic) as timing:
                         try:
-                            market = self._invalid_market_view(frame)
-                            latest_prediction = pd.Series({"pred": Signal.INVALID.value})
+                            prepared = timing.call("prepare", _prepare_market_frame, frame, pipeline.spec.base_define)
+                            features = timing.call("features", pipeline.feature_factory.generate, prepared)
+                            predicted = timing.call("inference", self._predict, pipeline, features)
+                            latest_prediction = predicted.iloc[-1]
+                            trace_predictions[pipeline.spec.instance_id] = latest_prediction.copy()
+                            if self._prediction_callback is not None:
+                                timing.call("prediction_callback", self._prediction_callback, pipeline, candle_open_time_ms, latest_prediction.copy())
+                            market = timing.call("market_view", _market_view, predicted)
                         except Exception:
+                            timing.outcome = "invalid"
                             self.logger.exception(
-                                "Invalid market preparation failed; skipping candle | strategy_id=%s hash=%s symbol=%s",
-                                pipeline.spec.strategy_id,
+                                "Market preparation failed; dispatching INVALID | instance_id=%s hash=%s symbol=%s",
+                                pipeline.spec.instance_id,
                                 pipeline.spec.hash_id,
                                 pipeline.spec.base_define.symbol,
                             )
-                            continue
+                            try:
+                                market = self._invalid_market_view(frame)
+                                latest_prediction = pd.Series({"pred": Signal.INVALID.value})
+                            except Exception:
+                                self.logger.exception(
+                                    "Invalid market preparation failed; skipping candle | instance_id=%s hash=%s symbol=%s",
+                                    pipeline.spec.instance_id,
+                                    pipeline.spec.hash_id,
+                                    pipeline.spec.base_define.symbol,
+                                )
+                                continue
 
-                    # Dispatch only once: strategy state may change before execution fails.
-                    try:
-                        intent = self._dispatch(
-                            pipeline,
-                            market,
-                            candle_open_time_utc,
-                            received_monotonic,
-                        )
-                        if intent is None:
-                            continue
-                        self._record_live_cycle(
-                            pipeline,
-                            latest_prediction,
-                            market,
-                            intent,
-                            candle_open_time_utc,
-                        )
-                    except Exception:
-                        self.logger.exception(
-                            "Strategy dispatch or recording failed; skipping candle without retry | "
-                            "strategy_id=%s hash=%s symbol=%s open_time_utc=%s",
-                            pipeline.spec.strategy_id,
-                            pipeline.spec.hash_id,
-                            pipeline.spec.base_define.symbol,
-                            _format_utc_ms(candle_open_time_ms),
-                        )
+                    self._submit_strategy(
+                        pipeline, market, latest_prediction, candle_open_time_utc,
+                        received_monotonic,
+                    )
                 self._record_prediction_trace(
                     "record_live",
                     group,
@@ -1880,6 +2109,18 @@ class LiveRunner:
                 )
 
     def _process_event(self, event: RunnerEvent) -> bool:
+        # All feature generation and inference stays on one serial path.
+        with self._calculation_lock:
+            if self._closed:
+                return False
+            with StageTiming(self.logger, "event", event.group.market_config.symbol,
+                             pd.Timestamp(event.timestamp_ms, unit="ms", tz="UTC"),
+                             received_monotonic=event.received_monotonic) as timing:
+                processed = self._process_event_serial(event)
+                timing.outcome = "completed" if processed else "stale"
+                return processed
+
+    def _process_event_serial(self, event: RunnerEvent) -> bool:
         with event.group.lock:
             last_processed_candle_open_time_ms = event.group.last_processed_candle_open_time_ms
             if last_processed_candle_open_time_ms is not None and event.timestamp_ms <= last_processed_candle_open_time_ms:
@@ -1906,6 +2147,7 @@ class LiveRunner:
             self._dispatch_invalid_to_group(
                 event.group,
                 event.timestamp_ms,
+                event.received_monotonic,
             )
         else:
             raise ValueError(f"Unsupported runner event type: {event.e_type!r}")
@@ -1921,20 +2163,55 @@ class LiveRunner:
                 event = self._events.get_nowait()
             except queue.Empty:
                 return processed_count
+            if event is None:
+                return processed_count
             if self._process_event(event):
                 processed_count += 1
 
+    def request_stop(self) -> None:
+        """Wake the main loop so it can shut down without an interrupt."""
+        self._stop_requested.set()
+        self._events.put(None)
+
+    def _read_exit_commands(self, stopped: threading.Event) -> None:
+        """Read complete terminal commands without taking over signal handling."""
+        try:
+            while not stopped.is_set():
+                readable, _, _ = select.select([sys.stdin], [], [], 0.2)
+                if not readable:
+                    continue
+                command = sys.stdin.readline()
+                if not command:
+                    return
+                if command.strip().casefold() in {"q", "quit", "exit"}:
+                    self.logger.info("Terminal exit requested; waiting for active tasks and cleanup")
+                    self.request_stop()
+                    return
+        except (OSError, ValueError):
+            self.logger.exception("Terminal exit input unavailable; use Ctrl+C to stop")
+
     def run_forever(self) -> None:
+        terminal_stopped = threading.Event()
+        terminal_thread = None
         try:
             self.initialize()
             self.logger.info("Live runner started")
+            if sys.stdin is not None and sys.stdin.isatty() and os.name != "nt":
+                terminal_thread = threading.Thread(
+                    target=self._read_exit_commands, args=(terminal_stopped,),
+                    name="live-runner-terminal", daemon=True,
+                )
+                terminal_thread.start()
+                self.logger.info("Type q, quit or exit followed by Enter to shut down gracefully")
             while True:
-                if self._closed:
+                if self._closed or self._stop_requested.is_set():
                     return
                 try:
                     event = self._events.get(
                         timeout=(self._data_check_timer_max_cycle_ms // 1000 + 1),
                     )
+                    if event is None or self._stop_requested.is_set():
+                        return
                     self.logger.info(
                         "Runner event received | group=%s type=%s time_utc=%s",
                         event.group.name,
@@ -1948,7 +2225,11 @@ class LiveRunner:
         except KeyboardInterrupt:
             self.logger.info("Live runner stopped by user")
         finally:
+            terminal_stopped.set()
+            if terminal_thread is not None:
+                terminal_thread.join(timeout=1.0)
             self.close()
+            self.logger.info("Live runner shutdown complete")
 
     def close(self) -> None:
         if self._closed:
@@ -1957,6 +2238,9 @@ class LiveRunner:
         if self.data_check_timer is not None:
             self.data_check_timer.cancel()
             self.data_check_timer = None
+        # Finish calculations and active orders before closing shared resources.
+        with self._calculation_lock:
+            self._account_execution.close()
         if getattr(self, "_monitoring_service", None) is not None:
             try:
                 self._monitoring_service.stop()
@@ -1975,7 +2259,7 @@ class LiveRunner:
             except Exception:
                 self.logger.exception(
                     "Strategy finalization failed: %s",
-                    pipeline.spec.strategy_id,
+                    pipeline.spec.instance_id,
                 )
 
         closed = set()
@@ -1991,10 +2275,10 @@ class LiveRunner:
                 except Exception:
                     self.logger.exception(
                         "Venue shutdown failed: %s",
-                        pipeline.spec.strategy_id,
+                        pipeline.spec.instance_id,
                     )
 
-        for environment, connection in getattr(
+        for connection_key, connection in getattr(
             self,
             "_ctrader_connections",
             {},
@@ -2003,10 +2287,12 @@ class LiveRunner:
                 connection.shutdown()
             except Exception:
                 self.logger.exception(
-                    "cTrader %s connection shutdown failed",
-                    environment,
+                    "cTrader connection shutdown failed | credentials=%s environment=%s",
+                    *connection_key,
                 )
         self._ctrader_connections.clear()
+
+        self._failure_notifications.close()
 
         if getattr(self, "_execution_trace", None) is not None:
             try:
@@ -2027,6 +2313,9 @@ class LiveRunner:
                         "Live feed shutdown failed: %s",
                         feed_group.market_config,
                     )
+        if getattr(self, "_output_lease", None) is not None:
+            self._output_lease.close()
+            self._output_lease = None
 
 
 def main() -> None:
@@ -2054,27 +2343,33 @@ def main() -> None:
     )
     run_id = _new_live_run_id()
     output_dir = _live_run_output_dir(runner_output_dir, run_id)
-    log_dir = os.path.join(output_dir, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    logger, _ = common.setup_session_logger(
-        log_file_path=os.path.join(log_dir, "session.log"),
-        console_level=logging.INFO,
-    )
-    logging.getLogger("urllib3").setLevel(logging.INFO)
-    logging.getLogger("websocket").setLevel(logging.INFO)
-    logger.info(
-        "Live runner output directory | runner_id=%s path=%s",
-        runner_id,
-        output_dir,
-    )
-    configuration = load_live_runner_configuration(
-        args.config,
-        publish_url=args.publish_url,
-        runner_id=runner_id,
-        run_id=run_id,
-    )
-    runner = LiveRunner.from_configuration(configuration, logger=logger)
-    runner.run_forever()
+    with OutputLease(output_dir) as lease:
+        prepare_output(output_dir)
+        log_dir = os.path.join(output_dir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        logger, _ = common.setup_session_logger(
+            log_file_path=os.path.join(log_dir, "session.log"),
+            console_level=logging.INFO,
+        )
+        logger.info("Live runner session started | run_id=%s", run_id)
+        logging.getLogger("urllib3").setLevel(logging.INFO)
+        logging.getLogger("websocket").setLevel(logging.INFO)
+        logger.info(
+            "Live runner output directory | runner_id=%s path=%s",
+            runner_id,
+            output_dir,
+        )
+        configuration = load_live_runner_configuration(
+            args.config,
+            publish_url=args.publish_url,
+            runner_id=runner_id,
+            run_id=run_id,
+        )
+        runner = LiveRunner.from_configuration(configuration, logger=logger, output_lease=lease)
+        try:
+            runner.run_forever()
+        finally:
+            runner.close()
 
 
 if __name__ == "__main__":

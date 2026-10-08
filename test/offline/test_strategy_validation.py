@@ -18,7 +18,7 @@ from queue import Empty
 from typing import Any, Dict, List, Tuple
 
 current_work_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.join(current_work_dir, ".."))
+sys.path.append(os.path.abspath(os.path.join(current_work_dir, "..", "..")))
 
 from data_process import common, preparation
 from data_process.utils import TaskIdentity, config_from_dict_train, load_selected_configs
@@ -1342,26 +1342,26 @@ LIVE_REPRODUCTION_METRICS = (
 )
 
 
-def build_live_reproduction_jobs(live_config_path, strategy_ids=None, settings="original"):
+def build_live_reproduction_jobs(live_config_path, instance_ids=None, settings="original"):
     """Resolve each configured hash in its own report without connecting to venues."""
     from pathlib import Path
+    from trade.runner.identity import instance_key
 
     if settings not in {"original", "live"}:
         raise ValueError("settings must be original or live")
     config_path = Path(live_config_path).resolve()
     payload = json.loads(config_path.read_text(encoding="utf-8"))
-    requested = set(strategy_ids or [])
+    requested = set(instance_ids or [])
     entries = payload["strategy"]
-    unknown = requested - entries.keys()
-    if unknown:
-        raise ValueError(f"Unknown strategy IDs: {sorted(unknown)}")
+    if not isinstance(entries, list):
+        raise TypeError("Live configuration strategy must be a list")
+    found = set()
     records_by_path = {}
     jobs = []
-    for strategy_id, entry in entries.items():
-        if requested and strategy_id not in requested:
-            continue
+    for entry in entries:
+        instance_id = entry["hash"]
         if not isinstance(entry["run_live"], bool):
-            raise TypeError(f"run_live must be boolean: {strategy_id}")
+            raise TypeError(f"run_live must be boolean: {instance_id}")
         if not requested and not entry["run_live"]:
             continue
         source = (config_path.parent / entry["config_path"]).resolve()
@@ -1371,9 +1371,20 @@ def build_live_reproduction_jobs(live_config_path, strategy_ids=None, settings="
             records_by_path[source] = load_jsonl(str(source))
         matches = [record for record in records_by_path[source] if record["params"]["hash"] == entry["hash"]]
         if len(matches) != 1:
-            raise ValueError(f"Expected one report for {strategy_id}, hash={entry['hash']}, found={len(matches)} in {source}")
+            raise ValueError(f"Expected one report for {instance_id}, hash={entry['hash']}, found={len(matches)} in {source}")
         original = matches[0]
         params = validate_record(original)
+        if str(entry["venue"]).strip().casefold() == "ctrader":
+            section = next(value for key, value in entry.items() if key.casefold() == "ctrader")
+            account_key = str(section["trader_login"])
+        else:
+            account_key = entry["account_id"]
+        instance_id = instance_key(entry["venue"], account_key, params["common"]["symbol"], params["common"]["interval"], entry["hash"])
+        if instance_id in found:
+            raise ValueError(f"Duplicate live instance: {instance_id}")
+        found.add(instance_id)
+        if requested and instance_id not in requested:
+            continue
         model_path = (config_path.parent / entry["model_path"]).resolve()
         for filename in ("model.pt", "meta.json", "train_config.json"):
             file_path = model_path / filename
@@ -1383,13 +1394,13 @@ def build_live_reproduction_jobs(live_config_path, strategy_ids=None, settings="
         saved_meta = json.loads((model_path / "meta.json").read_text())
         for key in ("model_cfg", "feature_conf_list"):
             if saved_train[key] != params["train"][key]:
-                raise ValueError(f"Model/report {key} mismatch: {strategy_id}")
+                raise ValueError(f"Model/report {key} mismatch: {instance_id}")
         if saved_meta["model_type"] != params["train"]["model_cfg"]["model_type"]:
-            raise ValueError(f"Model/report type mismatch: {strategy_id}")
+            raise ValueError(f"Model/report type mismatch: {instance_id}")
         live_broker = entry["broker_config"]
         compound = entry.get("compound", True)
         if not isinstance(compound, bool):
-            raise TypeError(f"compound must be boolean: {strategy_id}")
+            raise TypeError(f"compound must be boolean: {instance_id}")
         strategy = copy.deepcopy(params["strategy"])
         if settings == "live":
             strategy["compound"] = compound
@@ -1400,7 +1411,7 @@ def build_live_reproduction_jobs(live_config_path, strategy_ids=None, settings="
         if compound != params["strategy"].get("compound"):
             differences["strategy.compound"] = {"original": params["strategy"].get("compound"), "live": compound}
         jobs.append({
-            "strategy_id": strategy_id,
+            "instance_id": instance_id,
             "hash": entry["hash"],
             "config_path": str(source),
             "model_path": str(model_path),
@@ -1413,6 +1424,9 @@ def build_live_reproduction_jobs(live_config_path, strategy_ids=None, settings="
         })
     if not jobs:
         raise ValueError("No live-config strategies selected for reproduction")
+    if requested - found:
+        raise ValueError(f"Unknown instance IDs: {sorted(requested - found)}")
+
     return jobs
 
 
@@ -1467,7 +1481,7 @@ def run_live_reproduction(jobs, output_dir, logger, experiment_context, *, rtol=
     comparisons = []
     for index, job in enumerate(jobs, start=1):
         params = job["original"]["params"]
-        result = {key: job[key] for key in ("strategy_id", "hash", "config_path", "model_path", "settings", "configuration_differences")}
+        result = {key: job[key] for key in ("instance_id", "hash", "config_path", "model_path", "settings", "configuration_differences")}
         result.update(periods={}, status="error", rtol=rtol, atol=atol)
         try:
             pre_para = common.BaseDefine(**params["common"])
@@ -1507,7 +1521,7 @@ def run_live_reproduction(jobs, output_dir, logger, experiment_context, *, rtol=
                     broker_config=backtest_runner.BrokerConfig(**job["broker"]),
                     data_config=data_config, save_dir=run_dir, experiment_context=experiment_context,
                 )
-                logger.info("Replaying %d/%d | strategy=%s period=%s model=%s", index, len(jobs), job["strategy_id"], period, job["model_path"])
+                logger.info("Replaying %d/%d | strategy=%s period=%s model=%s", index, len(jobs), job["instance_id"], period, job["model_path"])
                 output = backtest_runner.main(logger, runner_config, period)
                 report = output["report"]
                 validate_report_market(report, pre_para.symbol, pre_para.interval)
@@ -1523,10 +1537,10 @@ def run_live_reproduction(jobs, output_dir, logger, experiment_context, *, rtol=
             result["status"] = "matched" if comparison["matches"] else "mismatch"
         except Exception as exc:
             result["error"] = f"{type(exc).__name__}: {exc}"
-            logger.exception("Reproduction failed: %s", job["strategy_id"])
+            logger.exception("Reproduction failed: %s", job["instance_id"])
         logger.info(
             "Live reproduction %d/%d | strategy=%s period=%s | %s | status=%s",
-            index, len(jobs), job["strategy_id"], period,
+            index, len(jobs), job["instance_id"], period,
             "PASS" if result["status"] == "matched" else "FAIL", result["status"],
         )
         comparisons.append(result)
@@ -1537,12 +1551,12 @@ def run_live_reproduction(jobs, output_dir, logger, experiment_context, *, rtol=
     import csv
 
     with open(os.path.join(output_dir, "live_reproduction_metrics.csv"), "w", newline="", encoding="utf-8") as output:
-        writer = csv.DictWriter(output, fieldnames=["strategy_id", "hash", "settings", "status", "period", "metric", "original", "reproduced", "delta", "matches"])
+        writer = csv.DictWriter(output, fieldnames=["instance_id", "hash", "settings", "status", "period", "metric", "original", "reproduced", "delta", "matches"])
         writer.writeheader()
         for result in comparisons:
             for period, comparison in result["periods"].items():
                 for metric, values in comparison["metrics"].items():
-                    writer.writerow({**{key: result[key] for key in ("strategy_id", "hash", "settings", "status")},
+                    writer.writerow({**{key: result[key] for key in ("instance_id", "hash", "settings", "status")},
                                      "period": period, "metric": metric, **values})
     logger.info("Reproduction summary: %s", summary)
     return comparisons
@@ -1576,7 +1590,7 @@ def parse_args() -> argparse.Namespace:
         help="Require a clean Git working tree",
     )
     parser.add_argument("--live-config", help="Replay strategies and model paths from a live_config.json instead of cross-testing")
-    parser.add_argument("--strategy-id", action="append", help="Select a live strategy ID; repeat to select several")
+    parser.add_argument("--instance-id", action="append", help="Select a live instance ID; repeat to select several")
     parser.add_argument("--settings", choices=("original", "live"), default="original",
                         help="Keep original broker/compound settings for reproduction, or apply live overrides")
     parser.add_argument("--rtol", type=float, default=1e-6)
@@ -1589,10 +1603,10 @@ def main() -> None:
     args = parse_args()
 
     if args.live_config:
-        jobs = build_live_reproduction_jobs(args.live_config, args.strategy_id, args.settings)
+        jobs = build_live_reproduction_jobs(args.live_config, args.instance_id, args.settings)
         if args.dry_run:
             for job in jobs:
-                print(json.dumps({key: job[key] for key in ("strategy_id", "hash", "config_path", "model_path", "settings", "configuration_differences")}))
+                print(json.dumps({key: job[key] for key in ("instance_id", "hash", "config_path", "model_path", "settings", "configuration_differences")}))
             print(f"Validated {len(jobs)} live reproduction jobs; no backtests executed")
             return
         output_dir = os.path.abspath(args.output_dir or os.path.join(
@@ -1604,8 +1618,8 @@ def main() -> None:
         if any(item["status"] != "matched" for item in results):
             raise SystemExit(1)
         return
-    if args.dry_run or args.strategy_id:
-        raise ValueError("--dry-run and --strategy-id require --live-config")
+    if args.dry_run or args.instance_id:
+        raise ValueError("--dry-run and --instance-id require --live-config")
 
     if not os.path.isfile(args.selected_configs):
         raise FileNotFoundError(f"Selected config file not found: {args.selected_configs}")

@@ -151,9 +151,16 @@ class BbmSignalStrategy(StrategyBase):
 
         final_qty = self._risk_per_trade(state.account.equity) / (state.market.price * stop_loss_pct)
 
+        # Keep the risk budget independent from the live cash affordability cap.
+        margin_capital = state.account.equity
+        if state.account.balance is not None:
+            margin_capital = float(state.account.balance)
+            if not math.isfinite(margin_capital) or margin_capital < 0:
+                raise ValueError("Margin sizing requires a nonnegative finite account balance")
+
         required_margin = final_qty * state.market.price / self.leverage
-        if required_margin > state.account.equity:
-            final_qty = state.account.equity * self.leverage / state.market.price
+        if required_margin > margin_capital:
+            final_qty = margin_capital * self.leverage / state.market.price
 
         if final_qty <= 0 or not math.isfinite(final_qty):
             self.skipped_size += 1

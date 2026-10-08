@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, computed_field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, computed_field, model_validator
 
 
 class StrictModel(BaseModel):
@@ -80,8 +80,19 @@ class SnapshotError(StrictModel):
     message: str
 
 
+class ConnectionSnapshot(StrictModel):
+    status: Literal["ready", "recovering", "paused", "closed"]
+    reason: str | None = None
+    next_retry_at: AwareDatetime | None = None
+    episode: int = Field(default=0, ge=0)
+
+
 class StrategySnapshot(StrictModel):
-    strategy_id: str = Field(min_length=1)
+    collection_scope: Literal["idle", "overview", "detail"] = "detail"
+    instance_id: str = Field(min_length=1)
+    strategy_hash: str = Field(min_length=1)
+    account_id: str = ""
+    trader_login: str = ""
     model_type: str = Field(min_length=1)
     venue: str = Field(min_length=1)
     symbol: str = Field(min_length=1)
@@ -91,13 +102,30 @@ class StrategySnapshot(StrictModel):
     risk_per_trade_pct: float = Field(ge=0.0, le=1.0)
     max_daily_loss_pct: float = Field(ge=0.0, le=1.0)
     max_holding_seconds: float | None = Field(default=None, ge=0.0)
-    status: Literal["running", "disabled", "stopped"]
+    status: Literal["running", "disabled", "paused", "stopped"]
+    connection: ConnectionSnapshot | None = None
     dashboard_age_seconds: float | None = Field(default=None, ge=0.0)
+    account_updated_at: AwareDatetime | None = None
+    position_updated_at: AwareDatetime | None = None
     account: AccountSnapshot | None = None
     position: PositionSnapshot | None = None
     latest_signal: SignalSnapshot | None = None
     availability: AvailabilitySnapshot
     errors: list[SnapshotError] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_account_identity(self):
+        if self.venue.casefold() == "ctrader":
+            if not self.trader_login or self.account_id:
+                raise ValueError("cTrader snapshots require trader_login and no account_id")
+        elif not self.account_id:
+            raise ValueError("Non-cTrader snapshots require account_id")
+        return self
+
+    @computed_field
+    @property
+    def display_name(self) -> str:
+        return f"{self.symbol.upper()}-{self.interval}-{self.venue.lower()}-{self.strategy_hash}"
 
 
 class RunnerSnapshot(StrictModel):

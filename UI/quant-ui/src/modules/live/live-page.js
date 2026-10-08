@@ -1,31 +1,42 @@
 import "./live.css";
 
 import { escapeHtml, formatPrice } from "../../shared/formatters.js";
-import { loadLiveStrategies, loadLiveStrategy } from "./live-api.js";
+import { loadLiveStrategies, loadLiveStrategy, releaseLiveViewer } from "./live-api.js";
 
 const REFRESH_INTERVAL_MS = 1_000;
 
 export async function mountLivePage(container, context) {
-  const strategyId = context.params.get("strategy_id");
-  return strategyId
-    ? mountDetail(container, context, strategyId)
+  const instanceId = context.params.get("instance_id");
+  return instanceId
+    ? mountDetail(container, context, instanceId)
     : mountList(container, context);
 }
 
 function mountList(container, context) {
+  const viewerId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+  const release = () => { releaseLiveViewer(viewerId).catch(() => {}); };
+  const onVisibilityChange = () => {
+    if (document.hidden) release();
+    else refresh();
+  };
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  window.addEventListener("pagehide", release);
   let disposed = false;
   let activeController = null;
   let hasData = false;
 
   container.innerHTML = `
     <section class="module-page scroll-page live-page">
-      <header class="page-header">
+      <header class="page-header live-list-header">
         <div>
           <p class="page-eyebrow">Live monitoring</p>
           <h1>Strategy List</h1>
           <p class="page-subtitle">Current state reported by live runners</p>
         </div>
-        <span data-role="status" class="status-pill busy">Connecting</span>
+        <div class="live-list-overview">
+          <div data-role="pnl-summary" class="live-pnl-summary" aria-label="Profit and loss by venue group"></div>
+          <span data-role="status" class="status-pill busy">Connecting</span>
+        </div>
       </header>
       <section class="panel live-list-panel">
         <div data-role="state" class="page-state">
@@ -36,11 +47,9 @@ function mountList(container, context) {
           <table class="live-strategy-table">
             <thead>
               <tr>
-                <th>Strategy ID</th>
+                <th>Strategy</th>
+                <th>Account</th>
                 <th>Model</th>
-                <th>Venue</th>
-                <th>Symbol</th>
-                <th>Interval</th>
                 <th>Init Balance</th>
                 <th>Balance</th>
                 <th title="Used position margin / account equity">Margin utilization</th>
@@ -59,10 +68,13 @@ function mountList(container, context) {
   const tableWrap = container.querySelector('[data-role="table-wrap"]');
   const tableBody = container.querySelector("tbody");
   const status = container.querySelector('[data-role="status"]');
+  const summary = container.querySelector('[data-role="pnl-summary"]');
+  renderPnlSummary(summary, null);
 
   function render(payload) {
     const items = Array.isArray(payload?.items) ? payload.items : [];
     hasData = items.length > 0;
+    renderPnlSummary(summary, payload?.pnl_summary);
     const unavailableStrategies = items.filter((item) => item.available !== true).length;
     status.textContent = payload?.runners?.unavailable
       ? `${payload.runners.unavailable} runner unavailable`
@@ -99,25 +111,23 @@ function mountList(container, context) {
           ? "negative"
           : "";
       return `
-        <tr class="live-strategy-row${available ? "" : " unavailable"}" tabindex="0" data-strategy-id="${escapeHtml(item.strategy_id)}">
-          <td class="strategy-id-cell">${escapeHtml(item.strategy_id)}</td>
+        <tr class="live-strategy-row${available ? "" : " unavailable"}" tabindex="0" data-instance-id="${escapeHtml(item.instance_id)}">
+          <td class="instance-id-cell">${escapeHtml(item.display_name)}</td>
+          <td>${escapeHtml(item.trader_login || item.account_id)}</td>
           <td title="${escapeHtml(item.model_type)}">${escapeHtml(shortModelType(item.model_type))}</td>
-          <td>${escapeHtml(formatVenue(item.venue))}</td>
-          <td>${escapeHtml(item.symbol)}</td>
-          <td>${escapeHtml(item.interval)}</td>
           <td>${formatMoney(item.initial_balance)}</td>
           <td class="${balanceAvailable ? "" : "value-unavailable"}">${balanceAvailable ? formatMoney(item.balance) : "—"}</td>
           <td class="${margin === "—" ? "value-unavailable" : ""}">${margin}</td>
           <td class="${pnlAvailable ? tone : "value-unavailable"}">${pnl}</td>
-          <td>${renderStatus(item.status, available)}</td>
+          <td title="${escapeHtml(connectionSummary(item.connection))}">${renderStatus(item.status, available)}</td>
         </tr>
       `;
     }).join("");
   }
 
   function openRow(row) {
-    const selected = row?.dataset.strategyId;
-    if (selected) context.navigate("live", { strategy_id: selected });
+    const selected = row?.dataset.instanceId;
+    if (selected) context.navigate("live", { instance_id: selected });
   }
 
   tableBody.addEventListener("click", (event) => openRow(event.target.closest("tr")));
@@ -129,12 +139,13 @@ function mountList(container, context) {
   });
 
   async function refresh() {
-    if (disposed || activeController) return;
+    if (disposed || activeController || document.hidden) return;
     activeController = new AbortController();
     try {
-      render(await loadLiveStrategies({ signal: activeController.signal }));
+      render(await loadLiveStrategies({ viewerId, signal: activeController.signal }));
     } catch (error) {
       if (disposed || error.name === "AbortError") return;
+      renderPnlSummary(summary, null, "Unavailable");
       status.textContent = "Unavailable";
       status.className = "status-pill";
       if (hasData) {
@@ -152,12 +163,48 @@ function mountList(container, context) {
   const timer = window.setInterval(refresh, REFRESH_INTERVAL_MS);
   return () => {
     disposed = true;
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+    window.removeEventListener("pagehide", release);
+    release();
     window.clearInterval(timer);
     activeController?.abort();
   };
 }
 
-function mountDetail(container, context, strategyId) {
+function renderPnlSummary(container, groups, emptyLabel = "Waiting for data") {
+  const metric = (label, data, title, unit, signed = true) => {
+    const value = data?.value;
+    const available = value !== null && value !== undefined && Number.isFinite(Number(value));
+    const coverage = data?.total > 0
+      ? `${data.included}/${data.total} ${unit}`
+      : groups ? "No strategies" : emptyLabel;
+    return `<div class="live-pnl-metric" title="${escapeHtml(title)}">
+      <dt>${label}</dt>
+      <dd class="${available ? (signed ? pnlTone(value) : "") : "value-unavailable"}">${available ? formatMoney(value, signed) : "—"}</dd>
+      <small class="${data?.included < data?.total ? "live-pnl-partial" : ""}">${escapeHtml(coverage)}${data?.included < data?.total ? " · Partial" : ""}</small>
+    </div>`;
+  };
+  container.innerHTML = [["crypto", "Crypto exchanges"], ["ctrader", "Ctrader Demo"]].map(([key, label]) => `
+    <section class="live-pnl-group" aria-label="${label} profit and loss">
+      <h2>${label}</h2>
+      <dl>
+        ${metric("Initial Value", groups?.[key]?.initial_value, "Sum of recorded initial account balances. Each account is counted once; this baseline remains available when live data is unavailable.", "accounts", false)}
+        ${metric("Total Balance", groups?.[key]?.balance, "Sum of current account balances, excluding unrealized PnL. Each account is counted once; unavailable account data is excluded.", "accounts", false)}
+        ${metric("Unrealized PnL", groups?.[key]?.unrealized_pnl, "Sum of available strategy position unrealized PnL. Unavailable data is excluded.", "strategies")}
+      </dl>
+    </section>
+  `).join("");
+}
+
+function mountDetail(container, context, instanceId) {
+  const viewerId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+  const release = () => { releaseLiveViewer(viewerId).catch(() => {}); };
+  const onVisibilityChange = () => {
+    if (document.hidden) release();
+    else refresh();
+  };
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  window.addEventListener("pagehide", release);
   let disposed = false;
   let activeController = null;
   let hasData = false;
@@ -168,7 +215,7 @@ function mountDetail(container, context, strategyId) {
         <button data-action="back" class="back-button" type="button" aria-label="Back to strategy list">&#8592;</button>
         <div>
           <p class="page-eyebrow">Live strategy</p>
-          <h1>${escapeHtml(strategyId)}</h1>
+          <h1 data-role="strategy-name">Loading strategy...</h1>
           <p data-role="subtitle" class="page-subtitle">Loading current state...</p>
         </div>
         <span data-role="status" class="status-pill busy">Connecting</span>
@@ -196,24 +243,36 @@ function mountDetail(container, context, strategyId) {
     cards.classList.remove("live-request-failed");
     cards.classList.remove("hidden");
     state.classList.add("hidden");
-    subtitle.textContent = `${payload.symbol} · ${payload.interval}`;
+    const connectionPaused = payload.connection && payload.connection.status !== "ready";
+    subtitle.textContent = `${payload.symbol} · ${payload.interval}${connectionPaused
+      ? ` · ${connectionSummary(payload.connection)}`
+      : payload.collection_scope !== "detail" ? " · Loading details…" : ""}`;
+    container.querySelector('[data-role="strategy-name"]').textContent = payload.display_name;
     status.textContent = payload.available
       ? titleCase(payload.status)
       : "Unavailable";
     status.className = `status-pill ${statusPillTone(payload.status, payload.available)}`;
 
     renderCard(container, "strategy", true, [
-      ["Strategy ID", payload.strategy_id],
+      ["Strategy", payload.display_name],
       ["Symbol", payload.symbol],
       ["Interval", payload.interval],
       ["Risk per trade", formatPercent(payload.risk_per_trade_pct)],
       ["Max daily loss", formatPercent(payload.max_daily_loss_pct)],
       ["Max holding time", formatDuration(payload.max_holding_seconds)],
       ["Status", payload.available ? titleCase(payload.status) : null, statusValueTone(payload.status, payload.available)],
+      ...(connectionPaused ? [
+        ["Connection", titleCase(payload.connection.status)],
+        ["Next retry", formatDateTime(payload.connection.next_retry_at)],
+        ["Last account update", formatDateTime(payload.account_updated_at)],
+        ["Pause reason", payload.connection.reason || "Reconnecting and authenticating"],
+      ] : []),
     ]);
 
     const accountAvailable = payload.available && payload.availability?.account;
     renderCard(container, "account", accountAvailable, [
+      ["Updated", formatDateTime(payload.account_updated_at)],
+      [payload.trader_login ? "Trader Login" : "Account", payload.trader_login || payload.account_id, "", "", true],
       ["Init Balance", formatMoney(payload.initial_balance), "", "", true],
       ["Start time", formatDateTime(payload.start_time), "", "", true],
       ["Balance", formatMoney(payload.account?.balance)],
@@ -227,9 +286,10 @@ function mountDetail(container, context, strategyId) {
       ],
     ]);
 
-    const positionAvailable = payload.available && payload.availability?.position;
+    const positionAvailable = payload.available && payload.availability?.position && payload.collection_scope === "detail";
     const position = payload.position;
     renderCard(container, "position", positionAvailable, [
+      ["Updated", formatDateTime(payload.position_updated_at)],
       ["Side", position ? titleCase(position.side) : "Flat"],
       ["Size", position ? formatPrice(position.quantity, 6) : "—"],
       ["Entry", position ? formatPrice(position.entry_price) : "—"],
@@ -263,16 +323,26 @@ function mountDetail(container, context, strategyId) {
     renderCard(container, "signal", signalAvailable, [
       ["Model output", signal ? titleCase(signal.model_output) : null],
       ["Probability", formatProbability(signal?.probability)],
+      ["Net score", signal?.net_score ?? null],
       ["Decision", signal ? titleCase(signal.decision) : null],
-      ["Updated", formatDateTime(signal?.updated_at)],
+      ["Reason", signal?.reason || "—"],
+      ["Candle time", formatDateTime(signal?.updated_at)],
     ]);
+    const signalCard = container.querySelector('[data-card="signal"]');
+    signalCard.querySelector('[data-role="signal-waiting"]')?.remove();
+    if (payload.available && !signalAvailable) {
+      const waiting = document.createElement("p");
+      waiting.dataset.role = "signal-waiting";
+      waiting.textContent = "Waiting for the first closed-candle signal in this runner session.";
+      signalCard.append(waiting);
+    }
   }
 
   async function refresh() {
-    if (disposed || activeController) return;
+    if (disposed || activeController || document.hidden) return;
     activeController = new AbortController();
     try {
-      render(await loadLiveStrategy(strategyId, { signal: activeController.signal }));
+      render(await loadLiveStrategy(instanceId, { viewerId, signal: activeController.signal }));
     } catch (error) {
       if (disposed || error.name === "AbortError") return;
       status.textContent = "Unavailable";
@@ -293,6 +363,9 @@ function mountDetail(container, context, strategyId) {
   const timer = window.setInterval(refresh, REFRESH_INTERVAL_MS);
   return () => {
     disposed = true;
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+    window.removeEventListener("pagehide", release);
+    release();
     window.clearInterval(timer);
     activeController?.abort();
   };
@@ -364,6 +437,13 @@ function renderPositionComponents(container, available, position) {
   card.append(section);
 }
 
+function connectionSummary(connection) {
+  if (!connection || connection.status === "ready") return "";
+  return connection.next_retry_at
+    ? `Connection paused · Next retry: ${formatDateTime(connection.next_retry_at)}`
+    : connection.status === "closed" ? "Connection closed" : "Reconnecting and authenticating";
+}
+
 function renderStatus(value, available) {
   if (!available || !value) return '<span class="status-pill">—</span>';
   return `<span class="status-pill ${statusPillTone(value, available)}">${escapeHtml(titleCase(value))}</span>`;
@@ -371,12 +451,12 @@ function renderStatus(value, available) {
 
 function statusPillTone(value, available) {
   if (!available || !value) return "";
-  return value === "running" ? "success" : "error";
+  return value === "running" ? "success" : value === "paused" ? "busy" : "error";
 }
 
 function statusValueTone(value, available) {
   if (!available || !value) return "";
-  return value === "running" ? "positive" : "negative";
+  return value === "running" ? "positive" : value === "paused" ? "" : "negative";
 }
 
 function pnlTone(value) {
@@ -401,18 +481,6 @@ function shortModelType(value) {
   if (value === null || value === undefined) return "-";
   const modelType = String(value);
   return Object.hasOwn(names, modelType) ? names[modelType] : modelType.slice(0, 8);
-}
-
-function formatVenue(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  return {
-    ctrader: "cTrader",
-    mt5: "MT5",
-    bybit: "Bybit",
-    binance: "Binance",
-    bitget: "Bitget",
-    mock: "Mock",
-  }[normalized] || value || "—";
 }
 
 function formatMoney(value, signed = false) {

@@ -13,33 +13,33 @@ def initialize_strategies(path, pipelines):
     records = json.loads(path.read_text()) if path.exists() else {}
     if not isinstance(records, dict):
         raise ValueError("Initial strategy state must be an object")
-    for strategy_id, record in records.items():
+    for instance_id, record in records.items():
         if not isinstance(record, dict) or set(record) != {
             "initial_balance", "start_time", "strategy_hash"
         }:
-            raise ValueError(f"Invalid initial state for {strategy_id}")
+            raise ValueError(f"Invalid initial state for {instance_id}")
         balance = record["initial_balance"]
         if balance is not None and (
             isinstance(balance, bool) or not isinstance(balance, (int, float))
             or not math.isfinite(balance) or balance < 0
         ):
-            raise ValueError(f"Invalid initial balance for {strategy_id}")
+            raise ValueError(f"Invalid initial balance for {instance_id}")
         if datetime.fromisoformat(record["start_time"]).utcoffset() is None:
-            raise ValueError(f"Initial start time must include a timezone: {strategy_id}")
+            raise ValueError(f"Initial start time must include a timezone: {instance_id}")
         if not isinstance(record["strategy_hash"], str) or not record["strategy_hash"]:
-            raise ValueError(f"Invalid strategy hash for {strategy_id}")
+            raise ValueError(f"Invalid strategy hash for {instance_id}")
     changed = False
     for pipeline in pipelines:
-        strategy_id = pipeline.spec.strategy_id
-        record = records.get(strategy_id)
+        instance_id = pipeline.spec.instance_id
+        record = records.get(instance_id)
         if record is not None:
             if record["strategy_hash"] != pipeline.spec.hash_id:
-                raise ValueError(f"Initial state strategy hash mismatch: {strategy_id}")
+                raise ValueError(f"Initial state strategy hash mismatch: {instance_id}")
         else:
             balance = float(pipeline.venue.get_dashboard_balance().balance)
             if not math.isfinite(balance) or balance < 0:
-                raise ValueError(f"Invalid initial balance for {strategy_id}")
-            records[strategy_id] = {
+                raise ValueError(f"Invalid initial balance for {instance_id}")
+            records[instance_id] = {
                 "initial_balance": balance,
                 "start_time": datetime.now(timezone.utc).isoformat(),
                 "strategy_hash": pipeline.spec.hash_id,
@@ -60,6 +60,6 @@ def initialize_strategies(path, pipelines):
             if temporary is not None and os.path.exists(temporary):
                 os.unlink(temporary)
     for pipeline in pipelines:
-        record = records[pipeline.spec.strategy_id]
+        record = records[pipeline.spec.instance_id]
         pipeline.initial_balance = record["initial_balance"]
         pipeline.start_time = record["start_time"]
