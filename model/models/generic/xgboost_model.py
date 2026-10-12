@@ -33,9 +33,14 @@ class XGBoostAdapter(SklearnEstimatorAdapter):
         reg_lambda: float = 1.0,
         reg_alpha: float = 0.0,
         tree_method: str = "hist",
+        xgb_device: str = "cpu",
         eval_metric: str = "logloss",
         **kwargs,
     ):
+        if xgb_device not in {"cpu", "cuda"}:
+            raise ValueError("xgb_device must be 'cpu' or 'cuda'")
+        if xgb_device == "cuda" and not xgb.build_info().get("USE_CUDA", False):
+            raise RuntimeError("GPU training requested, but this XGBoost build has no CUDA support")
         if kwargs:
             print(f"[XGBoostAdapter] Ignored kwargs: {list(kwargs.keys())}")
         hp = {
@@ -47,6 +52,7 @@ class XGBoostAdapter(SklearnEstimatorAdapter):
             "reg_lambda": reg_lambda,
             "reg_alpha": reg_alpha,
             "tree_method": tree_method,
+            "xgb_device": xgb_device,
             "eval_metric": eval_metric,
         }
         estimator = xgb.XGBClassifier(
@@ -58,6 +64,7 @@ class XGBoostAdapter(SklearnEstimatorAdapter):
             reg_lambda=reg_lambda,
             reg_alpha=reg_alpha,
             tree_method=tree_method,
+            device=xgb_device,
             eval_metric=eval_metric,
             n_jobs=-1,
         )

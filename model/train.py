@@ -5,7 +5,8 @@ import logging
 import os,sys
 import random
 import time
-from dataclasses import asdict, dataclass
+import argparse
+from dataclasses import asdict, dataclass, replace
 
 import numpy as np
 import torch
@@ -23,6 +24,7 @@ from model.train_config import (
     SingleModelConfig,
     TrainConfig,
     TrainTask,
+    XGBoostConfig,
 )
 from model.tasks.strategies import TaskStrategy
 from model.trainer import build_trainer
@@ -292,12 +294,31 @@ def train(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train the configured model.")
+    parser.add_argument(
+        "--xgb-device",
+        choices=("cpu", "cuda"),
+        help="XGBoost execution device (default: cpu); only applies to XGBoost configurations.",
+    )
+    args = parser.parse_args()
+    config = SingleModelConfig
+    if args.xgb_device:
+        if not isinstance(config.model_cfg, XGBoostConfig):
+            parser.error("--xgb-device can only be used when SingleModelConfig selects XGBoost")
+        config = replace(
+            config,
+            model_cfg=replace(config.model_cfg, xgb_device=args.xgb_device),
+        )
+
     started_at = time.perf_counter()
     session_logger, _ = common.setup_session_logger(sub_folder="train", file_level=logging.DEBUG)
     try:
+        save_dir = os.path.join(common.TRAIN_OUT_DIR, config.train_task)
+        if args.xgb_device:
+            save_dir = os.path.join(save_dir, f"xgb_{args.xgb_device}")
         train(
-            config=SingleModelConfig,
-            save_dir=os.path.join(common.TRAIN_OUT_DIR, SingleModelConfig.train_task),
+            config=config,
+            save_dir=save_dir,
             logger=session_logger,
         )
     finally:

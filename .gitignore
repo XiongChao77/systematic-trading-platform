@@ -45,3 +45,4 @@ orderbook_output
 !/test/**
 **/__pycache__/
 .pytest_cache/
+test*

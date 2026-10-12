@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from data_process import feature
+
+
 # ==============================================================================
 # 1. Configuration
 # ==============================================================================
@@ -21,11 +23,13 @@ class DataConfig:
         if self.train_ratio + self.val_ratio >= 1:
             raise ValueError("train_ratio + val_ratio must leave a non-empty test split")
 
+
 @dataclass
 class BaseModelConfig:
     seq_len: int = 96
     model_type: str = "base"
     model_version: int = 1
+
 
 class TrainTask:
     DIRECT_3CLASS = "DIRECT_3CLASS"
@@ -40,10 +44,11 @@ class TrainTask:
 
     BINARY_TASKS = {TRIGGER, DIRECTION, LONG_OVR, SHORT_OVR}
     COMBO_TASKS = {TRIGGER_DIRECTION, LONG_SHORT_OVR}
-    
+
+
 @dataclass
 class LSTMConfig(BaseModelConfig):
-    seq_len: int = 216     # 160 best for LSTM
+    seq_len: int = 216  # 160 best for LSTM
     model_type: str = "lstm"
     model_version: int = 1
     hidden_size: int = 32
@@ -52,17 +57,18 @@ class LSTMConfig(BaseModelConfig):
     lstm_dropout: float = 0.2
     head_dropout: float = 0.2
     p_drop: float = 0.3
-    readout: str = ['last' , 'meanmax' , 'attn', 'mix'][1]
-    head: str = ['linear' , 'mlp'][0]
-    in_locked_p: float = 0.1               # V4 locked dropout on inputs
-    out_locked_p: float = 0              # V4 locked dropout on LSTM outputs (before pooling)
-    input_norm: bool = True                # V4 LayerNorm on input features
-    input_proj_dim: int | None = None      # V4 optional projection before LSTM: a linear layer mapping raw feature dim (e.g. 48) to a new dim D (dim reduction)
-    logit_clip: float | None = None        # V4 
+    readout: str = ["last", "meanmax", "attn", "mix"][1]
+    head: str = ["linear", "mlp"][0]
+    in_locked_p: float = 0.1  # V4 locked dropout on inputs
+    out_locked_p: float = 0  # V4 locked dropout on LSTM outputs (before pooling)
+    input_norm: bool = True  # V4 LayerNorm on input features
+    input_proj_dim: int | None = None  # V4 optional projection before LSTM: a linear layer mapping raw feature dim (e.g. 48) to a new dim D (dim reduction)
+    logit_clip: float | None = None  # V4
+
 
 @dataclass
 class TransformerConfig(BaseModelConfig):
-    seq_len: int = 216     # 160 best for LSTM
+    seq_len: int = 216  # 160 best for LSTM
     model_type: str = "transformer"
     model_version: int = 1
     d_model: int = 64
@@ -76,18 +82,19 @@ class TransformerConfig(BaseModelConfig):
     use_alibi: bool = True
     pos_encoding: str = "none"
     cls_token: bool = False
-    readout: str = "meanmax" #"cls" | "meanmax" | "attn" | "mix"
+    readout: str = "meanmax"  # "cls" | "meanmax" | "attn" | "mix"
     head: str = "linear"
     ffn_type: str = "swiglu"
     use_feature_weighting: bool = False
 
+
 @dataclass
 class ConvLSTMConfig(BaseModelConfig):
-    seq_len: int = 160     # 160 best for LSTM
+    seq_len: int = 160  # 160 best for LSTM
     model_type: str = "conv_lstm"
     model_version: int = 1
     d_model: int = 64
-    hidden_size:int = 32
+    hidden_size: int = 32
     conv_kernel: int = 3
     conv_dropout: float = 0.2
     conv_layers: int = 1
@@ -98,16 +105,17 @@ class ConvLSTMConfig(BaseModelConfig):
     in_locked_p: float = 0.1
     out_locked_p: float = 0.1
     head_dropout: float = 0.3
-    readout: str = "meanmax"    # 'last'|'meanmax'|'attn'|'mix'
-    head: str = "linear"    # 'linear'|'mlp'
+    readout: str = "meanmax"  # 'last'|'meanmax'|'attn'|'mix'
+    head: str = "linear"  # 'linear'|'mlp'
     logit_clip: Optional[float] = None
     p_drop: Optional[float] = None
     task_proj_dim: int = 32
     use_feature_weighting: bool = False
 
+
 @dataclass
 class TCNConfig(BaseModelConfig):
-    seq_len: int = 216     # 160 best for LSTM
+    seq_len: int = 216  # 160 best for LSTM
     model_type: str = "tcn"
     model_version: int = 1
     num_channels: list = field(default_factory=lambda: [64, 128, 256])
@@ -116,9 +124,10 @@ class TCNConfig(BaseModelConfig):
     readout: str = "mix"
     logit_clip: Optional[float] = None
 
+
 @dataclass
 class MambaConfig(BaseModelConfig):
-    seq_len: int = 216     # 160 best for LSTM
+    seq_len: int = 216  # 160 best for LSTM
     model_type: str = "mamba"
     model_version: int = 1
     d_model: int = 128
@@ -128,6 +137,7 @@ class MambaConfig(BaseModelConfig):
     dropout: float = 0.1
     readout: str = "mix"  # 'last' | 'meanmax' | 'mix'
     logit_clip: Optional[float] = None
+
 
 @dataclass
 class XGBoostConfig(BaseModelConfig):
@@ -144,9 +154,11 @@ class XGBoostConfig(BaseModelConfig):
     reg_lambda: float = 1.0
     reg_alpha: float = 0.0
 
-    tree_method: str = "hist"           # "hist"/"gpu_hist"  can be "gpu_hist" with a GPU, depending on the xgboost version
+    tree_method: str = "hist"
+    xgb_device: str = "cuda"  # "cpu" or "cuda"
     eval_metric: str = "logloss"
-    use_scaler: bool = False            # tree models need no standardization
+    use_scaler: bool = False  # tree models need no standardization
+
 
 @dataclass
 class SVCConfig(BaseModelConfig):
@@ -158,6 +170,7 @@ class SVCConfig(BaseModelConfig):
     kernel: str = "rbf"
     gamma: str = "scale"
     use_scaler: bool = True
+
 
 @dataclass
 class LogisticRegressionSklearnConfig(BaseModelConfig):
@@ -171,24 +184,24 @@ class LogisticRegressionSklearnConfig(BaseModelConfig):
     max_iter: int = 1000
     use_scaler: bool = True
 
+
 @dataclass
 class CNNConfig(BaseModelConfig):
-    seq_len: int = 216     # 160 best for LSTM
+    seq_len: int = 216  # 160 best for LSTM
     model_type: str = "cnn"
     model_version: int = 1
     p_drop: float = 0.3
     tau: float = 16.0
     use_tpool: bool = False
 
+
 @dataclass
 class TrainConfig:
-    model_cfg: BaseModelConfig = field(
-        default_factory=lambda: ConvLSTMConfig(model_version=3)
-    )
+    model_cfg: BaseModelConfig = field(default_factory=lambda: ConvLSTMConfig(model_version=3))
     data_cfg: DataConfig = field(default_factory=DataConfig)
     feature_conf_list: List[str] = field(default_factory=lambda: feature.FEATURE_LIST_CRYPTOCURRENCY)
     epochs: int = 100
-    batch_size: int = 256#256
+    batch_size: int = 256  # 256
     lr: float = 3e-4
     gate_lr: float = 3e-4
     weight_decay: float = 5e-4
@@ -197,17 +210,17 @@ class TrainConfig:
     stride: int = 4
     use_cache: bool = False
     lambda_dir: float = 0.1  # Importance of long/short direction
-    lambda_main:float = 0.7
+    lambda_main: float = 0.7
     lambda_cost: float = 1  # Flip / missed trend / noisy trades
     flip_penalty: float = 1
     miss_penalty: float = 1
     false_trade_penalty: float = 1
     minority_sampling_ratio: Optional[float] = None
-    mag_warmup_epochs:int = 8
-    temperature:float = 2.0
+    mag_warmup_epochs: int = 8
+    temperature: float = 2.0
     selection_metric: str = "macro_f1"  # "macro_f1" or "loss"
-    label_smoothing :float = 0.02
-    train_compatibility:str = ''
+    label_smoothing: float = 0.02
+    train_compatibility: str = ""
     train_task: str = TrainTask.DIRECT_3CLASS
 
     def __post_init__(self):
@@ -215,23 +228,15 @@ class TrainConfig:
             raise ValueError("selection_metric must be 'macro_f1' or 'loss'")
         if self.epochs <= 0 or self.batch_size <= 0 or self.patience <= 0:
             raise ValueError("epochs, batch_size and patience must be positive")
-        if (
-            self.minority_sampling_ratio is not None
-            and not 0 < self.minority_sampling_ratio < 0.5
-        ):
-            raise ValueError(
-                "minority_sampling_ratio must be between 0 and 0.5"
-            )
-        feature_hash = hashlib.sha256(
-            "\0".join(self.feature_conf_list).encode("utf-8")
-        ).hexdigest()[:12]
-        self.train_compatibility = (
-            f"{self.model_cfg.seq_len}_{self.stride}_{feature_hash}"
-        )
+        if self.minority_sampling_ratio is not None and not 0 < self.minority_sampling_ratio < 0.5:
+            raise ValueError("minority_sampling_ratio must be between 0 and 0.5")
+        feature_hash = hashlib.sha256("\0".join(self.feature_conf_list).encode("utf-8")).hexdigest()[:12]
+        self.train_compatibility = f"{self.model_cfg.seq_len}_{self.stride}_{feature_hash}"
+
 
 @dataclass
 class LogisticConfig(BaseModelConfig):
-    seq_len: int = 96     # 160 best for LSTM
+    seq_len: int = 96  # 160 best for LSTM
     model_type: str = "logistic_regression"
     model_version: int = 1
 
@@ -243,8 +248,8 @@ COMBO_SUB_TASKS = {
 
 seq_len = 96
 SingleModelConfig = TrainConfig(
-    model_cfg=TransformerConfig(model_version=2, seq_len=seq_len),
+    model_cfg=XGBoostConfig(model_version=2, seq_len=seq_len),
     feature_conf_list=feature.FEATURE_LIST_COMMODITY,
     train_task=TrainTask.DIRECT_3CLASS,
-    stride =4,
+    stride=4,
 )
