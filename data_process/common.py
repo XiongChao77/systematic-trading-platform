@@ -61,7 +61,8 @@ class MarketDataSourceConfig:
 @dataclass
 class BaseDefine(MarketDataSourceConfig):
     # label
-    label_type: str = "FTHL"  # TBM / FTHL / "TBM_TREND" / ""BBM:"BINARY_BARRIER"
+    label_type: str = "FTHL"  # FTHL / TBM / TBM_TREND / BBM / PURE_BINARY
+    pure_binary_threshold_pct: float = 0.01  # Fractional return: 0.01 means 1% on both sides.
     # model / data
     vol_ewma_span: int = 20
     predict_num: int = 32
@@ -340,6 +341,8 @@ def attach_label(df, para=BaseDefine, label_col="label"):
         df = attach_triple_barrier_trend_label(df, para=para, label_col=label_col)
     elif para.label_type == "BBM":
         df = attach_binary_barrier_label(df, para=para, label_col=label_col, verbose=True)
+    elif para.label_type == "PURE_BINARY":
+        df = attach_pure_binary_label(df, para=para, label_col=label_col)
     return df
 
 
@@ -958,6 +961,108 @@ def fast_binary_barrier_kernel(
                 invalid_reasons[i] = 4
 
     return labels, reach_times, scan_lens, invalid_reasons
+
+
+@njit(cache=True)
+def fast_pure_binary_kernel(close, high, low, threshold_pct):
+    """Find the first future bar reaching either configured inclusive barrier.
+
+    Scan from the next row through the data end, without a time limit or
+    time-gap restriction. Same-bar dual hits and no hits are INVALID (-1).
+    Valid labels are POSITIVE (2) and NEGATIVE (0). Invalid reason codes
+    are 0 for valid, 1 for same-bar dual hits, and 2 for no future hit.
+    """
+    n = len(close)
+    labels = np.full(n, -1, dtype=np.int32)
+    reach_times = np.full(n, -1, dtype=np.int32)
+    scan_lens = np.zeros(n, dtype=np.int32)
+    invalid_reasons = np.full(n, 2, dtype=np.int32)
+
+    for i in range(n):
+        upper = close[i] * (1.0 + threshold_pct)
+        lower = close[i] * (1.0 - threshold_pct)
+        for curr_idx in range(i + 1, n):
+            scan_lens[i] = curr_idx - i
+            hit_up = high[curr_idx] >= upper
+            hit_down = low[curr_idx] <= lower
+            if hit_up and hit_down:
+                invalid_reasons[i] = 1
+                break
+            if hit_up or hit_down:
+                labels[i] = 2 if hit_up else 0
+                reach_times[i] = curr_idx - i
+                invalid_reasons[i] = 0
+                break
+
+    return labels, reach_times, scan_lens, invalid_reasons
+
+
+def attach_pure_binary_label(df, para=BaseDefine, label_col="label", verbose=True):
+    """Attach first-hit labels using configured symmetric return barriers.
+
+    pure_binary_threshold_pct is a fractional return (0.01 means 1%).
+    Neither predict_num nor volatility thresholds limit the search. Input
+    rows must be ordered chronologically. The anchor bar itself is excluded.
+    """
+    threshold_pct = float(para.pure_binary_threshold_pct)
+    if not np.isfinite(threshold_pct) or not 0.0 < threshold_pct < 1.0:
+        raise ValueError("pure_binary_threshold_pct must be finite and between 0 and 1 (exclusive)")
+    df = df.copy()
+    labels, reach_times, scan_lens, invalid_reasons = fast_pure_binary_kernel(
+        df["close"].to_numpy(dtype=np.float64),
+        df["high"].to_numpy(dtype=np.float64),
+        df["low"].to_numpy(dtype=np.float64),
+        threshold_pct,
+    )
+    df[label_col] = labels.astype(int)
+    df["reach_time"] = reach_times.astype(int)
+    df["scan_len"] = scan_lens.astype(int)
+    df["invalid_reason"] = invalid_reasons.astype(int)
+    if verbose:
+        print(f"PURE_BINARY inclusive return threshold: {threshold_pct:.4%}")
+        print_pure_binary_stats(df, label_col=label_col)
+    return df
+
+
+def print_pure_binary_stats(df, label_col="label"):
+    """Print class shares of all samples and per-direction event-time percentiles.
+
+    Event times count subsequent bars from the anchor, with the next bar
+    counted as one. Percentiles use NumPy's default linear interpolation.
+    INVALID samples are excluded from event-time statistics.
+    """
+    print("\n==================== PURE_BINARY Statistics ====================")
+    total = len(df)
+    print(f"Total Samples: {total}")
+    if total == 0:
+        print("Empty dataframe.\n")
+        return
+
+    labels = df[label_col].to_numpy()
+    groups = [
+        ("POSITIVE", labels == int(Signal.POSITIVE)),
+        ("NEGATIVE", labels == int(Signal.NEGATIVE)),
+        ("INVALID", labels == int(Signal.INVALID)),
+    ]
+    print(f"{'Label':<12} | {'Count':>10} | {'Share of all samples':>20}")
+    for name, mask in groups:
+        count = int(mask.sum())
+        print(f"{name:<12} | {count:>10} | {count / total:>19.2%}")
+
+    print("Reach Time Percentiles (bars after anchor; valid events only):")
+    percentiles = [1, 5, 25, 50, 75, 90, 95, 99]
+    for name, mask in groups[:2]:
+        values = df.loc[mask, "reach_time"].to_numpy(dtype=float)
+        if len(values) == 0:
+            print(f"{name}: No events.")
+            continue
+        quantiles = np.percentile(values, percentiles)
+        percentile_text = " | ".join(f"P{pct}: {value:.2f}" for pct, value in zip(percentiles, quantiles))
+        print(
+            f"{name}: Count: {len(values)} | Mean: {values.mean():.2f} | "
+            f"Min: {values.min():.0f} | {percentile_text} | Max: {values.max():.0f}"
+        )
+    print("=" * 64 + "\n")
 
 
 def attach_binary_barrier_label(

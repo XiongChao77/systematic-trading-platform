@@ -246,10 +246,10 @@ COMBO_SUB_TASKS = {
     TrainTask.LONG_SHORT_OVR: (TrainTask.LONG_OVR, TrainTask.SHORT_OVR),
 }
 
-seq_len = 96
+seq_len = 48
 SingleModelConfig = TrainConfig(
     model_cfg=XGBoostConfig(model_version=2, seq_len=seq_len),
-    feature_conf_list=feature.FEATURE_LIST_COMMODITY,
-    train_task=TrainTask.DIRECT_3CLASS,
-    stride=4,
+    feature_conf_list=feature.FEATURE_LIST_CRYPTOCURRENCY,
+    train_task=TrainTask.DIRECTION,
+    stride=2,
 )

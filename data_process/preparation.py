@@ -53,7 +53,15 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
             source=file,
             logger=logger,
         )
-    df = common.clean_data_quality_auto(df,logger)  
+    df = common.clean_data_quality_auto(df,logger)
+    is_pure_binary = para.label_type == "PURE_BINARY"
+    if is_pure_binary:
+        df['open_time_date_utc'] = pd.to_datetime(df['open_time_ms_utc'], unit='ms', utc=True)
+        latest_time = df['open_time_date_utc'].max()
+        start_ts = latest_time - pd.DateOffset(months=6)
+        split_ts = latest_time - pd.DateOffset(months=3)
+        df = df.loc[df['open_time_date_utc'] >= start_ts].sort_values('open_time_date_utc').reset_index(drop=True)
+        logger.info("PURE_BINARY data window: %s -> %s; backtest starts at %s", start_ts, latest_time, split_ts)
     # 3. Pass interval_ms to label logic so it can adapt its volatility window to the real time span.
     label_col = 'label'
     if para.market_category == 'Forex':
@@ -61,6 +69,7 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
     else:
         df = common.attach_attr(df, feature_group_list , feature_conf_list, para)
     # common.print_zret_statistics(df)
+    # Label the complete selected history before splitting; events may occur in the backtest period.
     df = common.attach_label(df, para=para,label_col = label_col)
     # common.print_label_performance_stats(df, para)
     # # common.attach_macd_event_lifecycle_label(df, interval_ms=interval_ms)
@@ -78,11 +87,14 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
     counts = df[label_col].value_counts().sort_index()
     proportions = df[label_col].value_counts(normalize=True).sort_index()
     
-    logger.info("\n=== Dynamic label distribution summary ===")
-    logger.info("Thresholds are saved in columns: 'threshold_long' and 'threshold_short'")
-    logger.info(f"Long threshold range: Min={df['threshold_long'].min():.4f}, Max={df['threshold_long'].max():.4f}, Mean={df['threshold_long'].mean():.4f}")
-    logger.info(f"Short threshold range: Min={df['threshold_short'].min():.4f}, Max={df['threshold_short'].max():.4f}, Mean={df['threshold_short'].mean():.4f}")
-    common.log_threshold_percentiles(df, logger)
+    logger.info("\n=== Label distribution summary ===")
+    if is_pure_binary:
+        logger.info("PURE_BINARY inclusive return threshold: %.4f%%", para.pure_binary_threshold_pct * 100)
+    else:
+        logger.info("Thresholds are saved in columns: 'threshold_long' and 'threshold_short'")
+        logger.info(f"Long threshold range: Min={df['threshold_long'].min():.4f}, Max={df['threshold_long'].max():.4f}, Mean={df['threshold_long'].mean():.4f}")
+        logger.info(f"Short threshold range: Min={df['threshold_short'].min():.4f}, Max={df['threshold_short'].max():.4f}, Mean={df['threshold_short'].mean():.4f}")
+        common.log_threshold_percentiles(df, logger)
 
     for label_val, cnt in counts.items():
         label_name = "Down" if label_val == 0 else ("Up" if label_val == 2 else ("Range" if label_val == 1 else "INVALID"))
@@ -93,8 +105,10 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
     # ---------------------------------------------------------
     # 3. Split and persist datasets
     # ---------------------------------------------------------
-    split_ts = pd.to_datetime(df['open_time_date_utc'].iloc[-1]) - pd.DateOffset(months=8)
-    train_df, test_df = df[df['open_time_date_utc'] < str(split_ts)], df[df['open_time_date_utc'] >= str(split_ts)]
+    if not is_pure_binary:
+        split_ts = pd.to_datetime(df['open_time_date_utc'].iloc[-1]) - pd.DateOffset(months=8)
+    times = pd.to_datetime(df['open_time_date_utc'], utc=True)
+    train_df, test_df = df[times < split_ts], df[times >= split_ts]
 
     # Write to prep_output_dir (default common.DATA_OUT_DIR; independent per batch worker)
     out_dir = prep_output_dir
@@ -150,7 +164,7 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
 if __name__ == "__main__":
 #**********column info: open_time_date_utc,open,high,low,close,volume,close_time_ms_utc,quote_asset_volume,number_of_trades,taker_buy_base_volume,taker_buy_quote_volume,ignore
     logger, _ = common.setup_session_logger(sub_folder='data_process')
-    pare_para = config.DOGE_15m_TBM
+    pare_para = config.DOGE_1m_PURE_BINARY
     if pare_para.market_category == 'Forex':
         feature_conf_list = feature.FEATURE_LIST_COMMODITY
     else:
