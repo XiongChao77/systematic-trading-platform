@@ -242,13 +242,10 @@ class FeatureMACD(FeatureBase):
         self.macd_abs_group = [f"{prefix}_DIF", f"{prefix}_DEA", f"{prefix}_HIST"]
 
         # 2. Percentage/momentum feature group
-        self.macd_pct_group = [f"{prefix}_DIF_PCT", f"{prefix}_HIST_PCT", f"{prefix}_HIST_ACCEL"]
-
-        # 3. Standalone feature (ratio)
-        self.sig_dist = [f"{prefix}_SIG_DIST"]
+        self.macd_pct_group = [f"{prefix}_DIF_PCT", f"{prefix}_HIST_PCT"]
 
         # Combine all features
-        self.features = self.macd_abs_group + self.macd_pct_group + self.sig_dist
+        self.features = self.macd_abs_group + self.macd_pct_group
 
     def generate(self, df: pd.DataFrame, kline_interval_ms: int) -> pd.DataFrame:
         close = df["close"].astype(float)
@@ -273,9 +270,6 @@ class FeatureMACD(FeatureBase):
 
         res[f"{prefix}_DIF_PCT"] = dif_pct_s
         res[f"{prefix}_HIST_PCT"] = hist_pct
-        res[f"{prefix}_HIST_ACCEL"] = hist_pct.diff().fillna(0)
-        res[f"{prefix}_SIG_DIST"] = np.where(dea_pct != 0, (dif_pct_s - dea_pct) / np.abs(dea_pct), np.nan)
-
         return pd.DataFrame(res, index=df.index)
 
     def normalize(self, X: np.ndarray, feature_cols: list[str], factory):
@@ -289,9 +283,6 @@ class FeatureMACD(FeatureBase):
         # 2. Momentum percentage group (DIF_PCT, HIST_PCT, ACCEL)
         # Use zero-anchored group scaling
         self._normalize_signal_group(X, feature_cols, self.macd_pct_group, factory=factory, scale=1.0, method="log")
-
-        # 3. SIG_DIST (scale separately; ratio-of-ratio)
-        self._normalize_signal_group(X, feature_cols, self.sig_dist, factory=factory, scale=1.0, method="log")
 
     def _min_history_request(self, kline_interval_ms: int = None) -> int:
         return int((self.slow + self.signal) * 4)
@@ -337,7 +328,6 @@ class FeatureMAStructure(FeatureBase):
         if self.add_delta:
             self.features += [
                 "D_MA_BAR_S_L",
-                "D_MA_DAY_S_L",
             ]
 
     # ------------------------------------------------------------------
@@ -390,7 +380,6 @@ class FeatureMAStructure(FeatureBase):
         # === Δ ===
         if self.add_delta:
             res["D_MA_BAR_S_L"] = pd.Series(res["MA_BAR_S_L"]).diff().fillna(0.0)
-            res["D_MA_DAY_S_L"] = pd.Series(res["MA_DAY_S_L"]).diff().fillna(0.0)
 
         return pd.DataFrame(res, index=df.index)
 
@@ -570,68 +559,6 @@ class FeatureContainer:
         self.parameters = kwargs
 
 
-class FeatureATRRegime(FeatureBase):
-    """
-    Multi-horizon volatility regime analyzer.
-    1. atr_{w}: percentage volatility (NATR-style) for modeling/trading.
-    2. vol_regime: relative position of short-term vol vs. long-term backdrop (used to filter non-trending markets).
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # Support multiple ATR windows via 'windows' parameter, e.g. [14, 100, 1000]
-        self.windows = kwargs.get("windows", [14, 100, 1000])
-        self.short_w = self.windows[0]  # use first window as "short-term" baseline
-        self.long_w = self.windows[-1]  # use last window as "long-term" backdrop
-
-        self.features = []
-        # Dynamically register all ATR features
-        for w in self.windows:
-            self.features.append(f"atr_{w}")
-
-        # Regime reference features
-        self.features.append(f"vol_regime_{self.long_w}")
-        self.features.append("Vol_Trend")
-
-    def generate(self, df: pd.DataFrame, kline_interval_ms: int) -> pd.DataFrame:
-        close, h, l = df["close"].astype(float), df["high"], df["low"]
-        pc = close.shift(1)
-        res = {}
-        tr = np.maximum(h - l, np.maximum((h - pc).abs(), (l - pc).abs()))
-
-        atr_series_map = {}
-        for w in self.windows:
-            atr_w = tr.rolling(w).mean()
-            atr_series_map[w] = atr_w
-            res[f"atr_{w}"] = np.where(close > 0, atr_w / close, 0.0)
-
-        short_atr = atr_series_map[self.short_w]
-        long_atr_ref = short_atr.rolling(self.long_w).mean()
-        res[f"vol_regime_{self.long_w}"] = np.where(long_atr_ref > 0, short_atr / long_atr_ref, 1.0)
-        res["Vol_Trend"] = short_atr.diff(5) / (short_atr.shift(5) + EPS)
-        return pd.DataFrame(res, index=df.index)
-
-    def normalize(self, X: np.ndarray, feature_cols: list[str], factory):
-        # 1. Process all ATR features
-        # Use per-feature z-score + tanh squashing so different volatility scales become comparable
-        for w in self.windows:
-            col = f"atr_{w}"
-            if col in feature_cols:
-                self._normalize_z_score(X, feature_cols, [col], feature_base=col, factory=factory, method="tanh")
-
-        # 2. Regime reference feature
-        regime_col = f"vol_regime_{self.long_w}"
-        if regime_col in feature_cols:
-            self._normalize_z_score(X, feature_cols, [regime_col], feature_base=regime_col, factory=factory, method="log")
-
-        # 3. Vol_Trend (rate-of-change)
-        if "Vol_Trend" in feature_cols:
-            idx = feature_cols.index("Vol_Trend")
-            X[:, :, idx] = self._apply_squashing(X[:, :, idx], scale=1.0, method="tanh")
-
-    def _min_history_request(self, kline_interval_ms: int = None) -> int:
-        # Must satisfy the largest window requirement
-        return int(max(self.windows) * 1.2)
 
 
 class FeatureVolMa(FeatureBase):
@@ -639,11 +566,9 @@ class FeatureVolMa(FeatureBase):
         super().__init__(**kwargs)
         self.vol_ma_windows: list = kwargs.get("vol_ma_windows", (5, 10, 20))
         self.ma_features = []
-        self.ma_features_ratio = []
         for w in self.vol_ma_windows:
             self.ma_features.append(f"VOL_MA_{w}")
-            self.ma_features_ratio.append(f"VOL_ratio_{w}")
-            self.features.extend([f"VOL_MA_{w}", f"VOL_ratio_{w}"])
+            self.features.append(f"VOL_MA_{w}")
 
     def generate(self, df: pd.DataFrame, kline_interval_ms: int) -> pd.DataFrame:
         res = {}
@@ -651,13 +576,11 @@ class FeatureVolMa(FeatureBase):
         for w in self.vol_ma_windows:
             vol_ma = vol.rolling(w).mean()
             res[f"VOL_MA_{w}"] = vol_ma
-            res[f"VOL_ratio_{w}"] = np.where(vol_ma > EPS, vol / vol_ma, 0.0)
         return pd.DataFrame(res, index=df.index)
 
     def normalize(self, X: np.ndarray, feature_cols: list[str], factory):
         self._normalize_volume_rlc(X, feature_cols, self.ma_features, "volume")
         self._normalize_z_score_group(X, feature_cols, self.ma_features, factory=factory, method="log", scale=3)
-        self._normalize_z_score_group(X, feature_cols, self.ma_features_ratio, factory=factory, method="log")
 
     def _min_history_request(self, kline_interval_ms: int = None) -> int:
         """
@@ -672,112 +595,6 @@ class FeatureVolMa(FeatureBase):
         return int(max_window * 1.5)
 
 
-class FeatureQavMa(FeatureBase):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # 1. Load configuration
-        self.windows = kwargs.get("windows", [7, 25, 99])  # multiple window lengths
-        self.add_surge = kwargs.get("add_surge", True)  # add surge ratios (intensity)
-        self.add_slope = kwargs.get("add_slope", True)  # add trend slope (consistency)
-        self.add_bias = kwargs.get("add_bias", True)  # add VWAP bias (cost)
-        self.slope_step = kwargs.get("slope_step", 3)  # slope estimation span
-
-        self.surge_features = []
-        self.slope_features = []
-        self.bias_features = []
-
-        # 2. Pre-register feature names
-        for w in self.windows:
-            if self.add_surge:
-                col = f"QAV_SURGE_{w}"
-                self.features.append(col)
-                self.surge_features.append(col)
-
-            if self.add_slope:
-                col = f"QAV_SLOPE_{w}"
-                self.features.append(col)
-                self.slope_features.append(col)
-
-        if self.add_bias:
-            # VWAP bias usually needs only one dimension (deviation vs traded VWAP)
-            col = "VWAP_BIAS"
-            self.features.append(col)
-            self.bias_features.append(col)
-
-    def _slope_reg_vectorized(self, series: pd.Series, steps: int) -> pd.Series:
-        """
-        Vectorized least-squares regression slope (without log transform).
-        Fit over the full window to reduce endpoint noise.
-        """
-        if steps <= 1:
-            return pd.Series(np.nan, index=series.index)
-
-        n = float(steps)
-        # x axis: [0, 1, 2, ..., n-1]
-        x_mean = (n - 1) / 2.0
-        var_x = (n * (n**2 - 1)) / 12.0  # variance of x
-
-        # Vectorized y statistics
-        y_filled = series.fillna(0)
-        s1 = y_filled.cumsum()
-        s2 = s1.cumsum()
-
-        sum_y = s1 - s1.shift(steps)
-        shift_s1 = s1.shift(steps)
-        shift_s2 = s2.shift(steps)
-
-        # Compute sum(x*y) via cumulative sums
-        weighted_sum_rev = (s2 - shift_s2) - steps * shift_s1
-        sum_xy = (steps * sum_y) - weighted_sum_rev
-
-        # Slope formula: beta = Cov(x, y) / Var(x)
-        y_mean = sum_y / n
-        slope = (sum_xy - n * x_mean * y_mean) / var_x
-
-        # Normalize slope by mean so relative changes are comparable across price/volume levels.
-        return slope / (y_mean + EPS)
-
-    def generate(self, df: pd.DataFrame, kline_interval_ms: int) -> pd.DataFrame:
-        qav = df["quote_asset_volume"].astype(float)
-        vol = df["volume"].astype(float)
-        close = df["close"].astype(float)
-        res = {}
-
-        for w in self.windows:
-            ma_qav = qav.rolling(w).mean()
-            if self.add_surge:
-                res[f"QAV_SURGE_{w}"] = np.where(ma_qav > EPS, qav / ma_qav, 1.0)
-            if self.add_slope:
-                res[f"QAV_SLOPE_{w}"] = self._slope_reg_vectorized(ma_qav, self.slope_step)
-
-        if self.add_bias:
-            vwap = np.where(vol > EPS, qav / vol, 0.0)
-            res["VWAP_BIAS"] = np.where(vwap > EPS, (close / vwap) - 1.0, 0.0)
-
-        return pd.DataFrame(res, index=df.index)
-
-    def normalize(self, X: np.ndarray, feature_cols: list[str], factory):
-        # 1. Surge ratio group: heavy-tailed and volatile; use log squashing
-        if self.surge_features:
-            for f in self.surge_features:
-                self._normalize_z_score_rel(X, feature_cols, [f], factory=factory, feature_base=f, method="log")
-
-        # 2. Trend slope group: after log1p, slopes are stable; regular normalization works
-        if self.slope_features:
-            # Slopes can be group-normalized together since they share the same scale (percentage change)
-            self._normalize_z_score_rel(X, feature_cols, self.slope_features, feature_base=self.slope_features[0], factory=factory, method="log")
-
-        # 3. VWAP bias group: percentage-like; normalize separately (typically within [-1, 1])
-        if self.bias_features:
-            self._normalize_z_score_rel(X, feature_cols, self.bias_features, feature_base="VWAP_BIAS", factory=factory, method="log")
-
-        # 4. Optional physical guardrails (either here or in FeatureFactory)
-        # X[:, :, indices] = np.clip(X[:, :, indices], -5.0, 5.0)
-
-    def _min_history_request(self, kline_interval_ms: int = None) -> int:
-        # Need max window + slope step as warm-up
-        max_w = max(self.windows) if self.windows else 0
-        return int((max_w + self.slope_step) * 1.5)
 
 
 # ==== 4. OBV ====
@@ -1059,22 +876,25 @@ class FeatureAdvancedVol(FeatureBase):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.windows = kwargs.get("windows", [14, 100])
+        self.gk_windows = kwargs.get("gk_windows", self.windows)
         self.features = []
         for w in self.windows:
             self.features.append(f"vol_parkinson_{w}")
-            self.features.append(f"vol_gk_{w}")
+            if w in self.gk_windows:
+                self.features.append(f"vol_gk_{w}")
 
     def generate(self, df: pd.DataFrame, kline_interval_ms: int) -> pd.DataFrame:
         o, h, l, c = df["open"].astype(float), df["high"].astype(float), df["low"].astype(float), df["close"].astype(float)
         res = {}
         log_hl = np.log(h / (l + EPS)) ** 2
-        log_co = np.log(c / (o + EPS)) ** 2
+        log_co = np.log(c / (o + EPS)) ** 2 if self.gk_windows else None
         for w in self.windows:
             const_p = 1.0 / (4.0 * np.log(2.0))
             res[f"vol_parkinson_{w}"] = np.sqrt(const_p * log_hl.rolling(w).mean())
-            const_gk = 2.0 * np.log(2.0) - 1.0
-            gk_term = 0.5 * log_hl - const_gk * log_co
-            res[f"vol_gk_{w}"] = np.sqrt(gk_term.rolling(w).mean())
+            if w in self.gk_windows:
+                const_gk = 2.0 * np.log(2.0) - 1.0
+                gk_term = 0.5 * log_hl - const_gk * log_co
+                res[f"vol_gk_{w}"] = np.sqrt(gk_term.rolling(w).mean())
         return pd.DataFrame(res, index=df.index)
 
     def normalize(self, X: np.ndarray, feature_cols: list[str], factory):
@@ -1088,74 +908,20 @@ class FeatureAdvancedVol(FeatureBase):
         return int(max(self.windows) * 1.5)
 
 
-class FeatureFractalPersistence(FeatureBase):
-    """
-    Fractal/persistence indicators: quantify trend purity and memory.
-    Includes: Hurst exponent (variance-time scaling) and Efficiency Ratio (ER / Kaufman).
-
-    - ER: net displacement / total path length in [0, 1]. 1 => pure trend, 0 => choppy/range.
-    - Hurst: rolling estimate via variance-time scaling. H>0.5 trend persistence, H<0.5 mean reversion, H=0.5 random walk.
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # Suggested windows: 14 (short-term sensitivity), 126 (swing/longer-term baseline)
-        self.windows = kwargs.get("windows", [14, 126])
-        self.features = []
-        for w in self.windows:
-            self.features.append(f"hurst_{w}")
-            self.features.append(f"er_{w}")
-
-    def generate(self, df: pd.DataFrame, kline_interval_ms: int) -> pd.DataFrame:
-        close = df["close"].astype(float)
-        diff = close.diff().abs()
-        res = {}
-        for w in self.windows:
-            # ER
-            net_change = (close - close.shift(w)).abs()
-            total_path = diff.rolling(w).sum()
-            res[f"er_{w}"] = np.where(total_path > EPS, net_change / total_path, 0.0)
-            # Hurst
-            log_close = np.log(close + EPS)
-            std_1 = log_close.diff().rolling(w).std()
-            std_w = log_close.diff(w).rolling(w).std()
-            ratio = np.where(std_1 > EPS, std_w / (std_1 + EPS), 1.0)
-            res[f"hurst_{w}"] = np.clip(np.log(np.maximum(ratio, EPS)) / np.log(max(w, 2)), 0.0, 1.0)
-        return pd.DataFrame(res, index=df.index)
-
-    def normalize(self, X: np.ndarray, feature_cols: list[str], factory):
-        # ER is already in [0, 1]; shift it to [-0.5, 0.5]
-        er_indices, _ = self._get_target_indices(feature_cols, [f for f in self.features if "er_" in f])
-        if er_indices:
-            X[:, :, er_indices] = X[:, :, er_indices] - 0.5
-
-        # Hurst is typically in [0, 1] with a center around 0.5
-        hurst_indices, _ = self._get_target_indices(feature_cols, [f for f in self.features if "hurst_" in f])
-        if hurst_indices:
-            # Shift to [-0.5, 0.5] so 0 corresponds to random walk
-            X[:, :, hurst_indices] = X[:, :, hurst_indices] - 0.5
-
-    def _min_history_request(self, kline_interval_ms: int = None) -> int:
-        return int(max(self.windows) * 2)
 
 
 class FeatureOrderFlow(FeatureBase):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.windows = kwargs.get("windows", [14, 49])
         self.poc_bias_step = kwargs.get("poc_bias_step", [7, 25, 99, 200, 400, 900])
 
         self.features = []
-        for w in self.windows:
-            self.features.extend([f"imbalance_{w}", f"vpin_{w}", f"trade_density_{w}"])
         for w in self.poc_bias_step:
             self.features.append(f"poc_bias_{w}")
 
     def generate(self, df: pd.DataFrame, kline_interval_ms: int) -> pd.DataFrame:
         # 1. Base data
         vol = df["volume"].astype(float)
-        taker_vol = df["taker_buy_base_volume"].astype(float)
-        trades = df["number_of_trades"].astype(float)
         close = df["close"].astype(float)
         high = df["high"].astype(float)
         low = df["low"].astype(float)
@@ -1167,19 +933,7 @@ class FeatureOrderFlow(FeatureBase):
         # Output container
         res = {}
 
-        # 2. Instant buy/sell ratio (vectorized)
-        raw_imbalance_series = pd.Series(np.divide(taker_vol, vol, out=np.full_like(vol, 0.5), where=vol > EPS), index=df.index)
-
-        # 3. Compute window features
-        for w in self.windows:
-            rolling_imb = raw_imbalance_series.rolling(w)
-            res[f"imbalance_{w}"] = rolling_imb.mean() - 0.5
-            res[f"vpin_{w}"] = rolling_imb.std()
-
-            trades_ma = trades.rolling(w).mean()
-            res[f"trade_density_{w}"] = np.divide(trades, trades_ma, out=np.full_like(trades, 1.0), where=trades_ma > EPS)
-
-        # 4. Vectorized POC bias (core optimization)
+        # Vectorized POC bias
         for w in self.poc_bias_step:
             # Use vectorized rolling sums instead of apply
             rolling_pv_sum = pv.rolling(w).sum()
@@ -1195,33 +949,14 @@ class FeatureOrderFlow(FeatureBase):
         return pd.DataFrame(res, index=df.index)
 
     def normalize(self, X: np.ndarray, feature_cols: list[str], factory):
-        # 1. Imbalance: in [-0.5, 0.5] and centered; apply z-score
-        imbalance_feats = [f for f in self.features if "imbalance_" in f]
-        self._normalize_z_score_group(X, feature_cols, imbalance_feats, factory, method="tanh")
-
-        # 2. VPIN: non-negative order-flow dispersion; normalize the windows
-        # together so their relative magnitudes are retained.
-        vpin_feats = [f for f in self.features if "vpin_" in f]
-        self._normalize_z_score_group(X, feature_cols, vpin_feats, factory, method="tanh")
-
-        # 3. Trade density is a ratio whose neutral value is 1. Use a bounded
-        # log-ratio so 1 -> 0, reciprocal deviations are symmetric, and a zero
-        # trade count cannot create a very large negative input.
-        density_features = [f for f in self.features if "trade_density_" in f]
-        for f in density_features:
-            if f in feature_cols:
-                idx = feature_cols.index(f)
-                log_ratio = np.log(np.maximum(X[:, :, idx], EPS))
-                X[:, :, idx] = np.tanh(log_ratio)
-
-        # 4. POC bias is already log(close / VWAP) when generated. Preserve its
+        # POC bias is already log(close / VWAP) when generated. Preserve its
         # zero anchor and only scale the group; applying log again would compress
         # the signal twice.
         poc_feats = [f for f in self.features if "poc_bias_" in f]
         self._normalize_signal_group(X, feature_cols, poc_feats, factory, method=None)
 
     def _min_history_request(self, kline_interval_ms: int = None) -> int:
-        return int(int(max(max(self.windows), max(self.poc_bias_step))) * 1.5)
+        return int(max(self.poc_bias_step) * 1.5)
 
 
 class FeatureClassicFactors(FeatureBase):
@@ -1234,24 +969,26 @@ class FeatureClassicFactors(FeatureBase):
         self.windows = kwargs.get("windows", [20, 100])
         self.features = []
         for w in self.windows:
-            self.features.extend([f"skew_{w}", f"kurt_{w}", f"id_factor_{w}", f"dist_to_high_{w}"])
+            if w != 100:
+                self.features.append(f"kurt_{w}")
+            if w != 20:
+                self.features.append(f"id_factor_{w}")
+            self.features.append(f"dist_to_high_{w}")
 
     def generate(self, df: pd.DataFrame, kline_interval_ms: int):
         close = df["close"].astype(float)
         returns = close.pct_change()
 
         for w in self.windows:
-            # 1. Moments (skew & kurt)
-            # Capture asymmetry and fat-tail properties of returns
-            df[f"skew_{w}"] = returns.rolling(w).skew()
-            df[f"kurt_{w}"] = returns.rolling(w).kurt()
+            # Retain shorter-window kurtosis; long-window kurtosis was removed.
+            if w != 100:
+                df[f"kurt_{w}"] = returns.rolling(w).kurt()
 
-            # 2. Information dispersion (ID factor)
-            # Difference between counts of up vs down bars
-            pos_bars = (returns > 0).rolling(w).sum()
-            neg_bars = (returns < 0).rolling(w).sum()
-            # Normalize by window length
-            df[f"id_factor_{w}"] = (pos_bars - neg_bars) / w
+            # Retain long-window information dispersion.
+            if w != 20:
+                pos_bars = (returns > 0).rolling(w).sum()
+                neg_bars = (returns < 0).rolling(w).sum()
+                df[f"id_factor_{w}"] = (pos_bars - neg_bars) / w
 
             # 3. Extremum position (distance to high)
             # Use log distance to keep scale consistent
@@ -1259,8 +996,8 @@ class FeatureClassicFactors(FeatureBase):
             df[f"dist_to_high_{w}"] = np.log(rolling_high / (close + EPS))
 
     def normalize(self, X: np.ndarray, feature_cols: list[str], factory):
-        # 1. Skew/kurt: typically around [-3, 3]; z-score is sufficient
-        skew_kurt = [f for f in self.features if "skew" in f or "kurt" in f]
+        # Kurtosis is typically around [-3, 3]; z-score is sufficient.
+        skew_kurt = [f for f in self.features if "kurt" in f]
         self._normalize_z_score_group(X, feature_cols, skew_kurt, factory, method="tanh")
 
         # 2. ID factor: naturally in [-1, 1] with 0 as balance
@@ -1411,79 +1148,19 @@ def calc_rolling_top_k_reference(data, window, k):
 
     return out
 
-
-class FeatureVolumeEvent(FeatureBase):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.windows = kwargs.get("windows", [5000, 1500, 500])
-        self.top_k = kwargs.get("top_k", 3)
-        # Dynamically register all features
-        self.features = []
-        for w in self.windows:
-            self.features.append(f"vol_event_flag_{w}")
-
-    def generate(self, df: pd.DataFrame, kline_interval_ms: int):
-        # Ensure input is a float64 numpy array
-        vol_values = df["volume"].values.astype(np.float64)
-
-        for w in self.windows:
-            flag_col = f"vol_event_flag_{w}"
-
-            # Call the JIT function optimized with a manual loop
-            v_ref_raw_values = calc_rolling_top_k_reference(vol_values, w, self.top_k)
-
-            # Convert to Series for subsequent EWM smoothing
-            v_ref_raw = pd.Series(v_ref_raw_values, index=df.index)
-            # Slightly larger alpha makes the reference decay faster, improving responsiveness
-            v_ref = v_ref_raw.ewm(alpha=1 / (w * 2), adjust=False).mean()
-
-            # This computation is done in pandas/numpy and is stable
-            ratio_col = np.where(v_ref > EPS, df["volume"] / v_ref, np.nan)
-            df[flag_col] = (ratio_col >= 1.0).astype(int)
-
-    def normalize(self, X: np.ndarray, feature_cols: list[str], factory):
-        # Event-level feature.
-        # Do NOT normalize / z-score / center.
-        pass
-
-    def _min_history_request(self, kline_interval_ms: int = None) -> int:
-        # Must return the largest window to ensure enough initialization history
-        return int(max(self.windows) * 1.2)
-
-
 class FeatureCandle(FeatureBase):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # 1. Magnitude features: price-dependent and heavily long-tailed
-        self.feat_magnitude = ["body", "upper_wick", "lower_wick", "max_range", "body_mom"]
-        # 2. Ratio features: naturally in [0, 1]
-        self.feat_ratio = ["body_pct", "upper_wick_pct", "lower_wick_pct", "close_pos", "doji_score"]
-        # 3. Score features: directional, typically in [-1, 1]
-        self.feat_score = ["wick_bias"]
-
-        self.features = self.feat_magnitude + self.feat_ratio + self.feat_score
+        self.feat_magnitude = []
+        self.feat_ratio = ["close_pos"]
+        self.feat_score = []
+        self.features = self.feat_ratio
 
     def generate(self, df: pd.DataFrame, kline_interval_ms: int = None) -> pd.DataFrame:
-        o, h, l, c = df["open"], df["high"], df["low"], df["close"]
-        res = {}
-
-        # Magnitudes
-        res["body"] = np.abs(c - o)
-        res["upper_wick"] = h - np.maximum(o, c)
-        res["lower_wick"] = np.minimum(o, c) - l
-        res["max_range"] = h - l
-        res["body_mom"] = pd.Series(res["body"]).diff().fillna(0)
-
-        # Ratios
-        rng = res["max_range"]
-        res["body_pct"] = np.where(rng > 0, res["body"] / rng, 0.0)
-        res["upper_wick_pct"] = np.where(rng > 0, res["upper_wick"] / rng, 0.0)
-        res["lower_wick_pct"] = np.where(rng > 0, res["lower_wick"] / rng, 0.0)
-        res["close_pos"] = np.where(rng > 0, (c - l) / rng, 0.5)
-        res["doji_score"] = 1.0 - res["body_pct"]
-        res["wick_bias"] = res["upper_wick_pct"] - res["lower_wick_pct"]
-
-        return pd.DataFrame(res, index=df.index)
+        high, low, close = df["high"], df["low"], df["close"]
+        candle_range = high - low
+        close_pos = np.where(candle_range > 0, (close - low) / candle_range, 0.5)
+        return pd.DataFrame({"close_pos": close_pos}, index=df.index)
 
     def normalize(self, X: np.ndarray, feature_cols: list[str], factory):
         """
@@ -1491,20 +1168,11 @@ class FeatureCandle(FeatureBase):
         - Magnitude: price-normalize -> group z-score -> log1p compression
         - Ratio: center to [-0.5, 0.5] -> optional log enhancement
         """
-        self._normalize_z_score_group(X, feature_cols, self.feat_magnitude, factory, method="log")
-
-        # 2. Ratio features
-        # self._normalize_signal_group(X,feature_cols,self.feat_ratio, factory, method = 'log')
-        # 2. Ratio features: shift to [-0.5, 0.5]
-        # Column indices for ratio features
+        # Center the retained close-position feature to [-0.5, 0.5].
         ratio_indices = [feature_cols.index(f) for f in self.feat_ratio if f in feature_cols]
 
         if ratio_indices:
-            # Shift: [0, 1] -> [-0.5, 0.5]
             X[:, :, ratio_indices] = X[:, :, ratio_indices] - 0.5
-        # 3. Score features (e.g. wick_bias)
-
-        self._normalize_z_score(X, feature_cols, self.feat_score, self.feat_score[0], factory)
 
     def _min_history_request(self, kline_interval_ms: int = None) -> int:
         """
@@ -1544,7 +1212,13 @@ class FeatureDonchian(FeatureBase):
             # 2. Ratio/shape features
             p_pos = f"DONCHIAN_POS_{p}"
             self.pos_features.append(p_pos)
-            self.ratio_features.extend([p_pos, f"DONCHIAN_BW_{p}", f"DONCHIAN_DIST_U_{p}", f"DONCHIAN_DIST_L_{p}"])
+            self.ratio_features.append(p_pos)
+            if p not in (7, 25, 99):
+                self.ratio_features.append(f"DONCHIAN_BW_{p}")
+            if p != 7:
+                self.ratio_features.append(f"DONCHIAN_DIST_U_{p}")
+            if p not in (7, 25):
+                self.ratio_features.append(f"DONCHIAN_DIST_L_{p}")
 
         self.features = self.price_features + self.ratio_features
 
@@ -1557,9 +1231,12 @@ class FeatureDonchian(FeatureBase):
             range_hl = upper - lower
             res[f"DONCHIAN_UPPER_{p}"], res[f"DONCHIAN_LOWER_{p}"], res[f"DONCHIAN_MIDDLE_{p}"] = upper, lower, middle
             res[f"DONCHIAN_POS_{p}"] = np.where(range_hl > EPS, (close - lower) / range_hl, 0.5)
-            res[f"DONCHIAN_BW_{p}"] = np.where(middle > EPS, range_hl / middle, 0.0)
-            res[f"DONCHIAN_DIST_U_{p}"] = (upper - close) / (close + EPS)
-            res[f"DONCHIAN_DIST_L_{p}"] = (close - lower) / (close + EPS)
+            if p not in (7, 25, 99):
+                res[f"DONCHIAN_BW_{p}"] = np.where(middle > EPS, range_hl / middle, 0.0)
+            if p != 7:
+                res[f"DONCHIAN_DIST_U_{p}"] = (upper - close) / (close + EPS)
+            if p not in (7, 25):
+                res[f"DONCHIAN_DIST_L_{p}"] = (close - lower) / (close + EPS)
         return pd.DataFrame(res, index=df.index)
 
     def normalize(self, X: np.ndarray, feature_cols: list[str], factory):
@@ -1640,7 +1317,7 @@ class FeatureBoll(FeatureBase):
         # Price channel features
         self.price_features = [f"BOLL_UPPER_{self.period}", f"BOLL_LOWER_{self.period}", f"BOLL_MIDDLE_{self.period}"]
         # Dimensionless derived features
-        self.ratio_features = [f"BOLL_BW_{self.period}", f"BOLL_PB_{self.period}"]  # bandwidth: squeeze intensity proxy  # %B: relative price position
+        self.ratio_features = [f"BOLL_PB_{self.period}"]
         self.features = self.price_features + self.ratio_features
 
     def generate(self, df: pd.DataFrame, kline_interval_ms: int) -> pd.DataFrame:
@@ -1655,7 +1332,6 @@ class FeatureBoll(FeatureBase):
         res[f"BOLL_UPPER_{self.period}"] = upper
         res[f"BOLL_LOWER_{self.period}"] = lower
         res[f"BOLL_MIDDLE_{self.period}"] = middle
-        res[f"BOLL_BW_{self.period}"] = (upper - lower) / (middle + EPS)
         res[f"BOLL_PB_{self.period}"] = (close - lower) / (upper - lower + EPS)
 
         return pd.DataFrame(res, index=df.index)
@@ -1665,14 +1341,10 @@ class FeatureBoll(FeatureBase):
         self._normalize_z_score_rel(X, feature_cols, self.price_features, feature_base="close", factory=factory, method="log")
 
         # B. %B position: roughly in [0, 1]; center it
-        pb_idx = [factory._feature_index[f] for f in [self.ratio_features[1]] if f in factory._feature_index]
+        pb_idx = [factory._feature_index[f] for f in self.ratio_features if f in factory._feature_index]
         if pb_idx:
             X[:, :, pb_idx] = X[:, :, pb_idx] - 0.5
 
-        # C. Bandwidth: positive and long-tailed; apply log1p compression
-        bw_idx = [factory._feature_index[f] for f in [self.ratio_features[0]] if f in factory._feature_index]
-        if bw_idx:
-            X[:, :, bw_idx] = np.log1p(X[:, :, bw_idx])
 
     def _min_history_request(self, kline_interval_ms: int = None) -> int:
         # SMA base window
@@ -1712,9 +1384,162 @@ class FeatureOrigin(FeatureBase):  # add taker_buy_base_volume/volume and taker_
         return 1
 
 
+@njit(cache=True)
+def _smart_money_window_ratio(start, end, scores, volumes, prices, secondary=None, secondary_descending=True):
+    """Return smart-trade VWAP / all-trade VWAP for one trailing window."""
+    length = end - start + 1
+    score_window = np.empty(length)
+    for local_idx in range(length):
+        score = scores[start + local_idx]
+        score_window[local_idx] = -np.inf if np.isnan(score) else score
+    order = np.argsort(score_window)[::-1]
+    total_volume = 0.0
+    total_pv = 0.0
+    for i in range(start, end + 1):
+        total_volume += volumes[i]
+        total_pv += prices[i] * volumes[i]
+    if total_volume <= EPS or total_pv <= 0.0:
+        return np.nan
+
+    # Include whole bars in descending smartness order until cumulative volume
+    # reaches or crosses 20% of the trailing-window total.
+    smart_target = total_volume * 0.20
+    smart_weights = np.zeros(length)
+    selected_volume = 0.0
+    for rank in range(length):
+        idx = start + order[rank]
+        bar_volume = max(volumes[idx], 0.0)
+        if bar_volume <= 0.0:
+            continue
+        smart_weights[idx - start] = bar_volume
+        selected_volume += bar_volume
+        if selected_volume >= smart_target:
+            break
+
+    if secondary is not None:
+        secondary_window = np.empty(length)
+        for local_idx in range(length):
+            score = secondary[start + local_idx]
+            if np.isnan(score):
+                secondary_window[local_idx] = -np.inf if secondary_descending else np.inf
+            else:
+                secondary_window[local_idx] = score
+        secondary_order = np.argsort(secondary_window)
+        if secondary_descending:
+            secondary_order = secondary_order[::-1]
+        secondary_target = selected_volume * 0.50
+        kept_volume = 0.0
+        final_weights = np.zeros(length)
+        for rank in range(length):
+            local_idx = secondary_order[rank]
+            candidate_weight = smart_weights[local_idx]
+            if candidate_weight <= 0.0:
+                continue
+            final_weights[local_idx] = candidate_weight
+            kept_volume += candidate_weight
+            if kept_volume >= secondary_target:
+                break
+        smart_weights = final_weights
+
+    smart_volume = 0.0
+    smart_pv = 0.0
+    for local_idx in range(length):
+        weight = smart_weights[local_idx]
+        if weight > 0.0:
+            smart_volume += weight
+            smart_pv += prices[start + local_idx] * weight
+    if smart_volume <= EPS or total_pv <= 0.0:
+        return np.nan
+    return (smart_pv / smart_volume) / (total_pv / total_volume)
+
+
+@njit(cache=True)
+def _smart_money_rolling(close, volume, price, window):
+    """Compute baseline and two secondary-screened smart-money ratios."""
+    size = len(close)
+    result = np.full((size, 3), np.nan)
+    returns = np.full(size, np.nan)
+    smartness = np.full(size, np.nan)
+    for i in range(1, size):
+        if close[i - 1] > 0.0:
+            returns[i] = close[i] / close[i - 1] - 1.0
+        if volume[i] > 0.0 and not np.isnan(returns[i]):
+            smartness[i] = abs(returns[i]) / (volume[i] ** 0.25)
+
+    impact = np.full(size, np.nan)
+    volume_decay = np.full(size, np.nan)
+    for i in range(5, size - 5):
+        if np.isnan(smartness[i]):
+            continue
+        before_return = 0.0
+        after_return = 0.0
+        before_volume = 0.0
+        after_volume = 0.0
+        for offset in range(1, 6):
+            before_return += returns[i - offset]
+            after_return += returns[i + offset]
+            before_volume += volume[i - offset]
+            after_volume += volume[i + offset]
+        if before_volume > 0.0:
+            impact[i] = abs(after_return - before_return)
+            volume_decay[i] = after_volume / before_volume
+
+    for end in range(window - 1, size):
+        start = end - window + 1
+        result[end, 0] = _smart_money_window_ratio(start, end, smartness, volume, price)
+
+        # Secondary features use only minutes with a complete five-bar context
+        # on each side, so no data beyond the current rolling-window end enters.
+        result[end, 1] = _smart_money_window_ratio(
+            start, end, smartness, volume, price, impact, True
+        )
+        result[end, 2] = _smart_money_window_ratio(
+            start, end, smartness, volume, price, volume_decay, False
+        )
+    return result
+
+
+class FeatureSmartMoneyMinute(FeatureBase):
+    """Minute smart-money baseline and enhanced factors from the cited report."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.windows = tuple(kwargs.get("windows", (30, 60, 240)))
+        self.factor_names = ("Smart_Money_2_0", "Smart_PriceImpact", "Smart_VolDecay")
+        self.features = [f"{name}_{window}" for window in self.windows for name in (*self.factor_names, "Smart_Minute_Enhanced")]
+
+    def generate(self, df: pd.DataFrame, kline_interval_ms: int) -> pd.DataFrame:
+        close = df["close"].to_numpy(dtype=np.float64)
+        volume = df["volume"].to_numpy(dtype=np.float64)
+        quote_volume_col = "quote_asset_volume" if "quote_asset_volume" in df.columns else "quote_volume"
+        price = df[quote_volume_col].to_numpy(dtype=np.float64) / np.maximum(volume, EPS) if quote_volume_col in df.columns else close.copy()
+        volume = np.where(np.isfinite(volume) & (volume > 0.0), volume, 0.0)
+        close = np.where(np.isfinite(close) & (close > 0.0), close, np.nan)
+        price = np.where(np.isfinite(price) & (price > 0.0), price, close)
+        res = {}
+        for window in self.windows:
+            factors = _smart_money_rolling(close, volume, price, window)
+            res[f"Smart_Money_2_0_{window}"] = factors[:, 0]
+            res[f"Smart_PriceImpact_{window}"] = factors[:, 1]
+            res[f"Smart_VolDecay_{window}"] = factors[:, 2]
+            enhanced = np.full(len(df), np.nan)
+            valid = np.isfinite(factors[:, 1]) & np.isfinite(factors[:, 2])
+            enhanced[valid] = (factors[valid, 1] + factors[valid, 2]) / 2.0
+            res[f"Smart_Minute_Enhanced_{window}"] = enhanced
+        return pd.DataFrame(res, index=df.index)
+
+    def normalize(self, X: np.ndarray, feature_cols: list[str], factory):
+        # Standardize each factor independently. The enhanced factor is already
+        # composed from raw Smart_PriceImpact and Smart_VolDecay values in generate().
+        for feature in self.features:
+            self._normalize_z_score(X, feature_cols, [feature], feature_base=feature, factory=factory)
+
+    def _min_history_request(self, kline_interval_ms: int = None) -> int:
+        return max(self.windows)
+
+
 # MA / momentum / structure
 # --- 1. Price trend & indicator features ---
-FCVolumeEvent = FeatureContainer(FeatureVolumeEvent, **{"windows": [5000, 1500, 1000, 500, 200, 100], "top_k": 3})
 FCMACD = FeatureContainer(FeatureMACD, **{"fast": 12, "slow": 26, "signal": 9})
 FCMA = FeatureContainer(
     FeatureMAStructure,
@@ -1735,24 +1560,20 @@ FCBoll = FeatureContainer(FeatureBoll, **{"period": 25})
 
 # --- 3. Volume & activity features ---
 FCVolMa = FeatureContainer(FeatureVolMa, **{"vol_ma_windows": [7, 14, 25, 99]})
-FCQavMa = FeatureContainer(FeatureQavMa, **{"windows": [7, 25, 99]})
 FCOBV = FeatureContainer(FeatureOBV, **{})
 FCPVT = FeatureContainer(FeaturePVT, **{})
 FCWAP = FeatureContainer(FeatureWAP, **{"vwap_windows": [7, 25, 99], "add_bias": True})
-FCCFM = FeatureContainer(FeatureCFM, **{"cmf_windows": [7, 25, 99]})
+FCCFM = FeatureContainer(FeatureCFM, **{"cmf_windows": [25, 99]})
 FCMFI = FeatureContainer(FeatureMFI, **{"mfi_windows": [7, 25, 99, 200, 500, 999]})
 FCATS = FeatureContainer(FeatureATS, **{})
 
-FCAdvancedVol = FeatureContainer(FeatureAdvancedVol, windows=[14, 100])
-FCFractalPersistence = FeatureContainer(FeatureFractalPersistence, windows=[14, 126])
+FCAdvancedVol = FeatureContainer(FeatureAdvancedVol, windows=[14, 100], gk_windows=[100])
 FCOrderFlow = FeatureContainer(FeatureOrderFlow, windows=[14, 49], poc_bias_step=[7, 25, 99, 200, 300, 400, 500, 600, 700, 800, 900], include_poc_bias=True)
 FCOrderClassicFactors = FeatureContainer(FeatureClassicFactors, windows=[20, 100])
 FCOrderMomentum = FeatureContainer(
     FeatureMomentum, horizons=[10, 20, 60], include_skip=True, skip_horizon=20, include_vol_adj=True, vol_adj_horizon=20, vol_window=20
 )
-
-
-FCATR = FeatureContainer(FeatureATRRegime, windows=[14])  # 14, 16, 1000 , 2000, 5000
+FCSmartMoneyMinute = FeatureContainer(FeatureSmartMoneyMinute, windows=(30, 240))
 
 # --- 4. Candlestick shapes & raw fields ---
 FCCandle = FeatureContainer(FeatureCandle, **{})
@@ -1763,8 +1584,6 @@ FCOrigin = FeatureContainer(FeatureOrigin, **{})
 # ==============================================================================
 
 FEATURE_GROUP_LIST = [
-    # 1. Custom volume event features
-    FCVolumeEvent,
     # 2. Price trend & indicators
     FCMACD,  # (12,26,9), (6,13,5), or (10,20,7)
     FCMA,  # pair with slope features
@@ -1776,20 +1595,16 @@ FEATURE_GROUP_LIST = [
     FCBoll,
     # 3. Volume & activity features
     FCVolMa,
-    FCQavMa,
-    # FCOBV,    # similar to FeaturePVT but loses magnitude; prefer PVT
     FCPVT,  # cumulative; often less useful for short-horizon prediction than momentum
     FCWAP,
     FCCFM,
     FCMFI,
     # FCATS,  # negative impact in some tests
     FCAdvancedVol,
-    FCFractalPersistence,
     FCOrderFlow,
     FCOrderClassicFactors,
     FCOrderMomentum,
-    FCATR,
-    # 4. Candlestick shape features
+    FCSmartMoneyMinute,
     FCCandle,
     FCOrigin,
 ]
@@ -1911,6 +1726,18 @@ FEATURE_LIST_COMMODITY = [
     "low",
     "close",
     "volume",
+    "Smart_Money_2_0_30",
+    "Smart_Money_2_0_60",
+    "Smart_Money_2_0_240",
+    "Smart_PriceImpact_30",
+    "Smart_PriceImpact_60",
+    "Smart_PriceImpact_240",
+    "Smart_VolDecay_30",
+    "Smart_VolDecay_60",
+    "Smart_VolDecay_240",
+    "Smart_Minute_Enhanced_30",
+    "Smart_Minute_Enhanced_60",
+    "Smart_Minute_Enhanced_240",
     # =========================
     # 1) Trend / directional persistence: whether price has continuation
     # =========================
@@ -1918,27 +1745,21 @@ FEATURE_LIST_COMMODITY = [
     # "PVT",                # Price-volume enhanced momentum
     "dist_to_high_100",  # Breakout-style trend structure
     "id_factor_100",
-    "id_factor_20",
     # "MFI_999",            # Extreme money flow
     # "MFI_99",
     # =========================
     # 2) Volatility regime: amplitude and risk environment
     # =========================
     "vol_gk_100",  # Long-term volatility
-    "vol_gk_14",  # Short-term volatility
-    "skew_100",
-    "kurt_100",  # Tail structure (extreme risk)
     # "BOLL_BW_25",         # Decide after uplift testing
     "RSI_14",  # Relative Strength Index (momentum/overheat; indirectly reflects volatility)
     # =========================
     # 3) Efficiency / market structure: trending vs ranging
     # =========================
-    "er_126",  # Trend efficiency ratio (high-quality structure factor)
     # =========================
     # 4) Participation / liquidity: market activity
     # =========================
     # "trade_density_14",    # Continuous participation intensity
-    # "vol_event_flag_500",  # Extreme volume event (regime trigger)
     # =========================
     # 5) Order flow / imbalance: buy-vs-sell dominance
     # =========================
@@ -1953,8 +1774,6 @@ FEATURE_LIST_COMMODITY = [
     # =========================
     # 7) Candlestick / path microstructure
     # =========================
-    "upper_wick_pct",
-    "lower_wick_pct",
 ]
 
 FEATURE_LIST_CRYPTOCURRENCY = [
@@ -1966,6 +1785,18 @@ FEATURE_LIST_CRYPTOCURRENCY = [
     "low",
     "close",
     "volume",
+    "Smart_Money_2_0_30",
+    "Smart_Money_2_0_60",
+    "Smart_Money_2_0_240",
+    "Smart_PriceImpact_30",
+    "Smart_PriceImpact_60",
+    "Smart_PriceImpact_240",
+    "Smart_VolDecay_30",
+    "Smart_VolDecay_60",
+    "Smart_VolDecay_240",
+    "Smart_Minute_Enhanced_30",
+    "Smart_Minute_Enhanced_60",
+    "Smart_Minute_Enhanced_240",
     "number_of_trades",  # CRYPTO_ONLY: not enabled in FEATURE_LIST_COMMODITY
     "quote_asset_volume",  # CRYPTO_ONLY: not enabled in FEATURE_LIST_COMMODITY
     "taker_buy_base_volume",  # CRYPTO_ONLY: not enabled in FEATURE_LIST_COMMODITY
@@ -1977,32 +1808,22 @@ FEATURE_LIST_CRYPTOCURRENCY = [
     "PVT",  # CRYPTO_ONLY: not enabled in FEATURE_LIST_COMMODITY
     "dist_to_high_100",  # Breakout-style trend structure
     "id_factor_100",
-    "id_factor_20",
     "MFI_999",  # CRYPTO_ONLY: not enabled in FEATURE_LIST_COMMODITY
     "MFI_99",  # CRYPTO_ONLY: not enabled in FEATURE_LIST_COMMODITY
     # =========================
     # 2) Volatility regime: amplitude and risk environment
     # =========================
     "vol_gk_100",  # Long-term volatility
-    "vol_gk_14",  # Short-term volatility
-    "skew_100",
-    "kurt_100",  # Tail structure (extreme risk)
-    "BOLL_BW_25",  # Decide after uplift testing
     "RSI_14",  # Relative Strength Index (momentum/overheat; indirectly reflects volatility)
     # =========================
     # 3) Efficiency / market structure: trending vs ranging
     # =========================
-    "er_126",  # Trend efficiency ratio (high-quality structure factor)
     # =========================
     # 4) Participation / liquidity: market activity
     # =========================
-    "trade_density_14",  # CRYPTO_ONLY: not enabled in FEATURE_LIST_COMMODITY
-    "vol_event_flag_500",  # CRYPTO_ONLY: not enabled in FEATURE_LIST_COMMODITY
     # =========================
     # 5) Order flow / imbalance: buy-vs-sell dominance
     # =========================
-    "vpin_49",  # CRYPTO_ONLY: not enabled in FEATURE_LIST_COMMODITY
-    "vpin_14",  # CRYPTO_ONLY: not enabled in FEATURE_LIST_COMMODITY
     # =========================
     # 6) Spatial / price position: where price sits within ranges/cost
     # =========================
@@ -2012,6 +1833,4 @@ FEATURE_LIST_CRYPTOCURRENCY = [
     # =========================
     # 7) Candlestick / path microstructure
     # =========================
-    "upper_wick_pct",
-    "lower_wick_pct",
 ]

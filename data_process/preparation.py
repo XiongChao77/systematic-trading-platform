@@ -37,7 +37,7 @@ def _source_descriptor(df: pd.DataFrame, path: str) -> dict:
         **_time_range(df),
     }
 
-def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,feature_conf_list=[],para = common.BaseDefine(), prep_output_dir =common.DATA_OUT_DIR ):
+def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,feature_conf_list=[],para: common.PreparationConfig = common.BaseDefine(), prep_output_dir =common.DATA_OUT_DIR ):
     file = common.market_data_path(para)
     logger.info(f"using file :{file}")
     # 1. Convert interval string to milliseconds
@@ -54,7 +54,7 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
             logger=logger,
         )
     df = common.clean_data_quality_auto(df,logger)
-    is_pure_binary = para.label_type == "PURE_BINARY"
+    is_pure_binary = isinstance(para, common.PureBinaryDefine)
     if is_pure_binary:
         df['open_time_date_utc'] = pd.to_datetime(df['open_time_ms_utc'], unit='ms', utc=True)
         latest_time = df['open_time_date_utc'].max()
@@ -165,10 +165,11 @@ if __name__ == "__main__":
 #**********column info: open_time_date_utc,open,high,low,close,volume,close_time_ms_utc,quote_asset_volume,number_of_trades,taker_buy_base_volume,taker_buy_quote_volume,ignore
     logger, _ = common.setup_session_logger(sub_folder='data_process')
     pare_para = config.DOGE_1m_PURE_BINARY
+    pare_para = config.DOGE_1m_TBM
     if pare_para.market_category == 'Forex':
         feature_conf_list = feature.FEATURE_LIST_COMMODITY
     else:
         feature_conf_list = []
-    main(logger,common.FEATURE_GROUP_LIST, para= pare_para, feature_conf_list= feature_conf_list)
+    main(logger,common.FEATURE_GROUP_LIST, para= pare_para)
     # volatility_prediction_heatmap.main(pare_para=pare_para,logger=logger,)
     # volatility_prediction_heatmap.plot_price_and_volatility(pare_para,[10,20,40,80,160],output_path=None,logger=None)

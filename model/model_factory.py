@@ -11,6 +11,7 @@ from model.models.model_base import BaseTimeSeriesModel
 
 # ---- generic: single-head, n_classes-configurable (binary OR direct 3-class) ----
 from model.models.generic.xgboost_model import XGBoostAdapter
+from model.models.generic.lightgbm_model import LightGBMAdapter
 from model.models.generic.sklearn_adapter import SVCAdapter, LogisticRegressionSklearnAdapter
 from model.models.generic.lstm import LSTM1D_V1
 from model.models.generic.lstm_v2 import LSTM1D_V2
@@ -43,6 +44,7 @@ class ModelFactory:
     model_list = [
         # ---- generic (single-head, n_classes-configurable) ----
         XGBoostAdapter,
+        LightGBMAdapter,
         SVCAdapter,
         LogisticRegressionSklearnAdapter,
         LSTM1D_V1,

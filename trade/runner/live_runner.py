@@ -189,7 +189,7 @@ class LiveStrategySpec:
     device: str = "auto"
     compound: bool = True
     enable: bool = True
-    base_define: common.BaseDefine = None
+    base_define: common.PreparationConfig = None
     train_config: Any = None
     strategy_config: Any = None
     broker_config: BrokerConfig = None
@@ -588,7 +588,7 @@ def load_params_from_report(
             strategy_params = loaded_params["strategy"]
 
             for spec in specs_by_hash[hash_id]:
-                spec.base_define = common.BaseDefine(**market_params)
+                spec.base_define = common.preparation_config_from_dict(market_params)
                 spec.train_config = config_from_dict_train(train_params)
                 spec.strategy_config = strategy_config_from_dict(strategy_params)
             params_by_hash[hash_id] = loaded_params
@@ -860,7 +860,7 @@ def _optional_float(value: Any, default: Optional[float] = None) -> Optional[flo
 
 def _prepare_market_frame(
     frame: pd.DataFrame,
-    base_define: common.BaseDefine,
+    base_define: common.PreparationConfig,
 ) -> pd.DataFrame:
     if frame is None or frame.empty:
         raise ValueError("Live data feed returned no closed candles")

@@ -323,7 +323,7 @@ def build_task_spec(
         pre_d = asdict(pre)
         pre_d.pop("prep_output_dir", None)
         pre_h = TaskIdentity.prep_hash_for(pre_d)
-        _assert_hash_roundtrip("prep", pre_d, common.BaseDefine(**pre_d), pre_h)
+        _assert_hash_roundtrip("prep", pre_d, common.preparation_config_from_dict(pre_d), pre_h)
 
         node_pre = spec.setdefault(pre_h, {"params": json_safe(pre_d), "train": {}})
         pre_strategy_configs = [backtest_runner.strategy_config_for_preparation(strategy_config, pre) for strategy_config in simulation_task]
@@ -647,7 +647,7 @@ def _worker_prep(worker_log_file: str, task_queue: mp.Queue, train_queue: mp.Que
 
         task_spec = msg
         for pre_h, pre_task in task_spec.items():
-            para = common.BaseDefine(**pre_task["params"])
+            para = common.preparation_config_from_dict(pre_task["params"])
             t0 = time.time()
             try:
                 prep_dir = _prep_output_dir(exp_dir, pre_h)
@@ -733,7 +733,7 @@ def _train_task(
 
     t0 = time.time()
     try:
-        pre_para = common.BaseDefine(**pre_params)
+        pre_para = common.preparation_config_from_dict(pre_params)
         t_cfg = _config_from_dict_train(train_params, expected_hash=tr_h)
         # Single model mode (DIRECT_3CLASS/LONG_OVR/...) and the combo_model sub-model mode share one
         # worker: which task is trained is decided by the train_task field of the TrainConfig itself
@@ -1411,7 +1411,7 @@ def run_combo_fusion_and_backtest(
             role_2: {"tr_h": r2["tr_h"], "metrics": r2["metrics"], "train_params": r2["train_params"]},
         }
         for strategy_config in simulation_task:
-            pre_para = common.BaseDefine(**r1["pre_params"])
+            pre_para = common.preparation_config_from_dict(r1["pre_params"])
             effective_strategy_config = backtest_runner.strategy_config_for_preparation(
                 strategy_config,
                 pre_para,
@@ -1545,7 +1545,7 @@ def main():
             broker_config = backtest_runner.BrokerConfig(
                 **params["broker"],
             )
-            pre_para = common.BaseDefine(**params["common"])
+            pre_para = common.preparation_config_from_dict(params["common"])
             train_cfg = _config_from_dict_train(params["train"])
             load_prep_output_dir = os.path.join(common.TEMPORARY_DIR, "batch_experiments", "load_configs", "prep", f"{pre_para.symbol}_{pre_para.interval}")
             strategy_hash = params["hash"]

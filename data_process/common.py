@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import os, colorlog, logging, json, platform
 from dataclasses import asdict, is_dataclass, fields, replace
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 from datetime import datetime
 from data_process.utils import *
 from data_process.feature import *
@@ -61,8 +61,7 @@ class MarketDataSourceConfig:
 @dataclass
 class BaseDefine(MarketDataSourceConfig):
     # label
-    label_type: str = "FTHL"  # FTHL / TBM / TBM_TREND / BBM / PURE_BINARY
-    pure_binary_threshold_pct: float = 0.01  # Fractional return: 0.01 means 1% on both sides.
+    label_type: str = "FTHL"  # FTHL / TBM / TBM_TREND / BBM
     # model / data
     vol_ewma_span: int = 20
     predict_num: int = 32
@@ -74,6 +73,32 @@ class BaseDefine(MarketDataSourceConfig):
     tbm_take_profit_price: Optional[Literal["close", "high_low"]] = None
     min_expected_move_pct: float = 0.01
     version: float = 0.1
+
+    def __post_init__(self):
+        if self.label_type == "PURE_BINARY":
+            raise ValueError("PURE_BINARY requires PureBinaryDefine")
+
+
+@dataclass
+class PureBinaryDefine(MarketDataSourceConfig):
+    """Symmetric first-hit labels without volatility or prediction-window settings."""
+
+    label_type: Literal["PURE_BINARY"] = "PURE_BINARY"
+    pure_binary_threshold_pct: float = 0.01  # Fractional return: 0.01 means 1% on both sides.
+    version: float = 0.1
+
+    def __post_init__(self):
+        if self.label_type != "PURE_BINARY":
+            raise ValueError("PureBinaryDefine only supports PURE_BINARY")
+
+
+PreparationConfig = Union[BaseDefine, PureBinaryDefine]
+
+
+def preparation_config_from_dict(parameters: dict) -> PreparationConfig:
+    """Restore the preparation type identified by its serialized label type."""
+    config_type = PureBinaryDefine if parameters.get("label_type") == "PURE_BINARY" else BaseDefine
+    return config_type(**parameters)
 
 
 vol_multiplier = 1.8
@@ -263,14 +288,14 @@ def load_data_manifest_from_dir(base_dir: str) -> dict:
         return json.load(handle)
 
 
-def load_pre_params_from_dir(base_dir: str) -> BaseDefine:
+def load_pre_params_from_dir(base_dir: str) -> PreparationConfig:
     """Load interval settings from data_config_meta.json under base_dir (no global paths; multiprocessing-friendly)."""
     config_path = get_data_config_path_in_dir(base_dir)
     if not os.path.exists(config_path):
         raise RuntimeError(f"❌ Config file not found: {config_path}")
     with open(config_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
-        para = BaseDefine(**meta)
+        para = preparation_config_from_dict(meta)
     return para
 
 
@@ -333,6 +358,8 @@ def attch_open_time_sn(para: MarketDataSourceConfig, df):
 
 def attach_label(df, para=BaseDefine, label_col="label"):
     df = attch_open_time_sn(para, df)
+    if isinstance(para, PureBinaryDefine):
+        return attach_pure_binary_label(df, para=para, label_col=label_col)
     if para.label_type == "FTHL":
         df = attach_fthl_label(df, para=para, label_col=label_col)
     elif para.label_type == "TBM":
@@ -341,8 +368,6 @@ def attach_label(df, para=BaseDefine, label_col="label"):
         df = attach_triple_barrier_trend_label(df, para=para, label_col=label_col)
     elif para.label_type == "BBM":
         df = attach_binary_barrier_label(df, para=para, label_col=label_col, verbose=True)
-    elif para.label_type == "PURE_BINARY":
-        df = attach_pure_binary_label(df, para=para, label_col=label_col)
     return df
 
 
@@ -997,13 +1022,17 @@ def fast_pure_binary_kernel(close, high, low, threshold_pct):
     return labels, reach_times, scan_lens, invalid_reasons
 
 
-def attach_pure_binary_label(df, para=BaseDefine, label_col="label", verbose=True):
+def attach_pure_binary_label(df, para: Optional[PureBinaryDefine] = None, label_col="label", verbose=True):
     """Attach first-hit labels using configured symmetric return barriers.
 
     pure_binary_threshold_pct is a fractional return (0.01 means 1%).
     Neither predict_num nor volatility thresholds limit the search. Input
     rows must be ordered chronologically. The anchor bar itself is excluded.
     """
+    if para is None:
+        para = PureBinaryDefine()
+    if not isinstance(para, PureBinaryDefine):
+        raise TypeError("Pure binary labeling requires PureBinaryDefine")
     threshold_pct = float(para.pure_binary_threshold_pct)
     if not np.isfinite(threshold_pct) or not 0.0 < threshold_pct < 1.0:
         raise ValueError("pure_binary_threshold_pct must be finite and between 0 and 1 (exclusive)")

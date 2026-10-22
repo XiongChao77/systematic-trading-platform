@@ -1,6 +1,5 @@
 import os, sys
 from dataclasses import replace
-
 current_work_dir = os.path.dirname(__file__)
 sys.path.append(os.path.join(current_work_dir,'..'))
 from data_process import common
@@ -13,6 +12,19 @@ DOGE_15m_TBM =common.BaseDefine(
     tbm_take_profit_price="close", min_expected_move_pct=0, version = 0,
 )
 
+DOGE_1m_TBM = replace(
+    DOGE_15m_TBM,
+    interval="1m",
+    vol_ewma_span = 60*24,
+    predict_num = 120,
+    vol_multiplier_long = 1,
+    stop_multiplier_rate_long = 0.8,
+    vol_multiplier_short = 1,
+    stop_multiplier_rate_short = 0.8,
+    min_expected_move_pct=0.1,
+    tbm_take_profit_price = "high_low"
+)
+
 DOGE_15m_BBM =common.BaseDefine(
     market_category="Cryptocurrency", data_source="binance_public_data", symbol="DOGEUSDT", interval="15m", 
     trading_type='um', label_type="BBM", vol_ewma_span=20, predict_num=64, vol_multiplier_long=8,
@@ -20,8 +32,11 @@ DOGE_15m_BBM =common.BaseDefine(
     tbm_take_profit_price="close", min_expected_move_pct=0, version = 0,
 )
 
-DOGE_1m_PURE_BINARY = replace(
-    common.DOGE_1m,
-    label_type="PURE_BINARY",
+DOGE_1m_PURE_BINARY = common.PureBinaryDefine(
+    market_category="Cryptocurrency",
+    data_source="binance_public_data",
+    symbol="DOGEUSDT",
+    interval="1m",
+    trading_type="um",
     pure_binary_threshold_pct=0.005,
 )

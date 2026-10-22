@@ -7,16 +7,20 @@ Data source:
     https://data.binance.vision/
 
 Main behavior:
-    - Prefer monthly ZIP files for complete calendar months. Use daily ZIP files
-      for partial months and as a fallback when a monthly archive is unavailable.
+    - Prefer existing ZIP files. For uncached ranges, prefer monthly ZIP files
+      for complete months and daily ZIP files for partial months.
     - If a daily ZIP is absent, use its monthly archive as a fallback.
     - If --start is not specified, query the Binance Vision S3 XML API and infer
       the earliest available daily ZIP date for this market/symbol/interval.
+      Explicit date ranges use local archives first without listing remote files.
     - If --end is not specified, default to the latest completed UTC day.
     - Treat local ZIP files as the cache. download_info.json is a human-readable
       audit report only and is never used as downloader input.
-    - Use the first/last advertised daily objects as availability boundaries;
-      internal daily-object gaps remain eligible for monthly recovery.
+    - Resume automatically from valid cached archives, downloading only missing
+      sources. Invalid cached archives are downloaded again.
+    - Skip a series when its final CSV already exists, unless --force is used.
+    - When inferring --start, use the first/last advertised daily objects as
+      availability boundaries; internal gaps remain eligible for monthly recovery.
     - Aggregate the selected sources and strictly validate the final K-line sequence.
 
 Examples:
@@ -392,41 +396,31 @@ def resolve_start_end(
             f"start must be <= end, got start={requested_start}, end={requested_end}"
         )
 
+    if requested_start is not None:
+        return requested_start, requested_end
+
     dates = infer_available_dates_from_listing(session, market, symbol, interval)
 
     if dates:
         latest_available = dates[-1]
         effective_end = min(requested_end, latest_available)
-        effective_start = max(requested_start, dates[0]) if requested_start else dates[0]
+        effective_start = dates[0]
         if effective_start > effective_end:
             raise ValueError(
                 "No available ZIP files in requested date range: "
-                f"requested_start={requested_start or dates[0]}, requested_end={requested_end}, "
+                f"requested_start={dates[0]}, requested_end={requested_end}, "
                 f"source_start={dates[0]}, source_end={latest_available}"
-            )
-        if requested_start is not None and effective_start > requested_start:
-            print(
-                "⚠️ Requested start date is earlier than data-source start; "
-                f"requested_start={requested_start}, using_start={effective_start}"
             )
         if effective_end < requested_end:
             print(
                 "⚠️ Requested end date is later than data-source end; "
                 f"requested_end={requested_end}, using_end={effective_end}"
             )
-        if requested_start is None:
-            print(f"✅ --start not specified. Using earliest available file date: {effective_start}")
-        else:
-            print(f"✅ Using requested start inside source boundaries: {effective_start}")
+        print(f"✅ --start not specified. Using earliest available file date: {effective_start}")
         return effective_start, effective_end
 
     fallback = FALLBACK_START[market]
-    effective_start = max(requested_start, fallback) if requested_start else fallback
-    if requested_start is not None and fallback > requested_start:
-        print(
-            "⚠️ Requested start date is earlier than fallback data-source start; "
-            f"requested_start={requested_start}, using_start={fallback}"
-        )
+    effective_start = fallback
     print(f"⚠️ Failed to infer earliest date from listing. Falling back to {effective_start}.")
     return effective_start, requested_end
 
@@ -494,7 +488,8 @@ def download_zip_url(
                     time.sleep(sleep_s * attempt)
                     continue
             response.raise_for_status()
-            read_kline_rows_from_zip(response.content, url)
+            if not read_kline_rows_from_zip(response.content, url):
+                raise ValueError("Downloaded archive contains no candles")
             return response.content, None
         except Exception as exc:
             if attempt < retries:
@@ -595,6 +590,18 @@ def download_symbol_interval(
     market = args.market
     symbol = symbol.upper()
     interval_ms = interval_to_ms(interval)
+    para = common.MarketDataSourceConfig(
+        market_category="Cryptocurrency",
+        data_source="binance_public_data",
+        symbol=symbol,
+        interval=interval,
+        trading_type=market,
+    )
+    market_data_path = Path(common.market_data_path(para)).expanduser().resolve()
+    if market_data_path.is_file() and not args.force:
+        print(f"Skipping existing output CSV: {market_data_path}")
+        return market_data_path
+
     output_dir = build_output_dir(
         Path(args.out_dir).expanduser().resolve(), market, symbol, interval
     )
@@ -623,7 +630,8 @@ def download_symbol_interval(
         end=end,
     )
     info["archive_policy"] = (
-        "monthly_for_complete_months; daily_for_partial_months; "
+        "existing_archives_first; monthly_for_uncached_complete_months; "
+        "daily_for_partial_months; "
         "monthly_fallback_for_missing_daily"
     )
     info["monthly_zip_dir"] = MONTHLY_ZIP_DIRNAME
@@ -666,72 +674,57 @@ def download_symbol_interval(
         info["last_updated_utc"] = utc_now_iso()
         write_download_info(info_path, info)
 
-    def load_monthly(month: date) -> tuple[Optional[list[list[str]]], Optional[str]]:
-        key = f"monthly:{month_key(month)}"
-        path = build_monthly_zip_path(output_dir, symbol, interval, month)
-        url = build_monthly_url(market, symbol, interval, month)
-        if path.is_file():
+    def load_source(
+        key: str, frequency: str, path: Path, url: str
+    ) -> tuple[Optional[list[list[str]]], Optional[str]]:
+        # A completed atomic-write temporary file can survive an interruption.
+        temporary_path = path.with_suffix(path.suffix + ".temp")
+        for candidate in (path, temporary_path):
+            if not candidate.is_file():
+                continue
             try:
-                rows = read_kline_rows_from_zip(path.read_bytes(), str(path))
+                rows = read_kline_rows_from_zip(candidate.read_bytes(), str(candidate))
+                if not rows:
+                    raise ValueError("Cached archive contains no candles")
             except Exception as exc:
-                counters["failed"] += 1
-                error = f"invalid cached ZIP: {type(exc).__name__}: {exc}"
-                record_source(
-                    key, frequency="monthly", status="failed", path=path, url=url, error=error
-                )
-                return None, error
-            counters["monthly_cached"] += 1
-            record_source(key, frequency="monthly", status="cached", path=path, url=url)
+                print(f"Ignoring invalid cache {candidate}: {type(exc).__name__}: {exc}")
+                continue
+            if candidate == temporary_path:
+                os.replace(temporary_path, path)
+            counters[f"{frequency}_cached"] += 1
+            record_source(key, frequency=frequency, status="cached", path=path, url=url)
             return rows, None
 
         content, error = download_zip_url(session, url)
         if content is not None:
             write_zip_cache(path, content)
-            counters["monthly_downloaded"] += 1
-            record_source(key, frequency="monthly", status="downloaded", path=path, url=url)
-            print(f"{month_key(month)}: downloaded monthly ZIP {len(content)} bytes")
+            counters[f"{frequency}_downloaded"] += 1
+            record_source(key, frequency=frequency, status="downloaded", path=path, url=url)
+            print(f"{key}: downloaded ZIP {len(content)} bytes")
             return read_kline_rows_from_zip(content, url), None
         if error == "missing":
-            counters["monthly_missing"] += 1
-            record_source(key, frequency="monthly", status="missing", path=path, url=url)
+            counters[f"{frequency}_missing"] += 1
+            record_source(key, frequency=frequency, status="missing", path=path, url=url)
             return None, "missing"
         counters["failed"] += 1
         record_source(
-            key, frequency="monthly", status="failed", path=path, url=url, error=error
+            key, frequency=frequency, status="failed", path=path, url=url, error=error
         )
         return None, error
 
-    def load_daily(day: date) -> tuple[Optional[list[list[str]]], Optional[str]]:
-        key = f"daily:{day.isoformat()}"
-        path = build_zip_path(output_dir, symbol, interval, day)
-        url = build_daily_url(market, symbol, interval, day)
-        if path.is_file():
-            try:
-                rows = read_kline_rows_from_zip(path.read_bytes(), str(path))
-            except Exception as exc:
-                counters["failed"] += 1
-                error = f"invalid cached ZIP: {type(exc).__name__}: {exc}"
-                record_source(
-                    key, frequency="daily", status="failed", path=path, url=url, error=error
-                )
-                return None, error
-            counters["daily_cached"] += 1
-            record_source(key, frequency="daily", status="cached", path=path, url=url)
-            return rows, None
+    def load_monthly(month: date) -> tuple[Optional[list[list[str]]], Optional[str]]:
+        return load_source(
+            f"monthly:{month_key(month)}", "monthly",
+            build_monthly_zip_path(output_dir, symbol, interval, month),
+            build_monthly_url(market, symbol, interval, month),
+        )
 
-        content, error = download_zip_url(session, url)
-        if content is not None:
-            write_zip_cache(path, content)
-            counters["daily_downloaded"] += 1
-            record_source(key, frequency="daily", status="downloaded", path=path, url=url)
-            return read_kline_rows_from_zip(content, url), None
-        if error == "missing":
-            counters["daily_missing"] += 1
-            record_source(key, frequency="daily", status="missing", path=path, url=url)
-            return None, "missing"
-        counters["failed"] += 1
-        record_source(key, frequency="daily", status="failed", path=path, url=url, error=error)
-        return None, error
+    def load_daily(day: date) -> tuple[Optional[list[list[str]]], Optional[str]]:
+        return load_source(
+            f"daily:{day.isoformat()}", "daily",
+            build_zip_path(output_dir, symbol, interval, day),
+            build_daily_url(market, symbol, interval, day),
+        )
 
     print("=" * 80)
     print("Binance Vision monthly-first kline downloader")
@@ -750,10 +743,49 @@ def download_symbol_interval(
     unresolved_dates: list[date] = []
     month_starts = list(iter_month_starts(start, end))
 
-    for number, month in enumerate(month_starts, start=1):
+    # Inventory file names before opening archives or requesting missing files.
+    cached_paths = {
+        path for directory in (daily_zip_dir, monthly_zip_dir)
+        for path in directory.iterdir() if path.is_file()
+    }
+
+    def has_cache(path: Path) -> bool:
+        return path in cached_paths or path.with_suffix(path.suffix + ".temp") in cached_paths
+
+    month_plans: list[tuple[date, date, date, list[date], bool]] = []
+    planned_paths: list[Path] = []
+    for month in month_starts:
         first_day, last_day = month_bounds(month)
         segment_start = max(start, first_day)
         segment_end = min(end, last_day)
+        daily_dates = list(date_range(segment_start, segment_end))
+        monthly_path = build_monthly_zip_path(output_dir, symbol, interval, month)
+        monthly_cached = has_cache(monthly_path)
+        daily_cached = any(
+            has_cache(build_zip_path(output_dir, symbol, interval, day))
+            for day in daily_dates
+        )
+        complete_month = segment_start == first_day and segment_end == last_day
+        use_monthly = monthly_cached or (complete_month and not daily_cached)
+        month_plans.append((month, segment_start, segment_end, daily_dates, use_monthly))
+        if use_monthly:
+            planned_paths.append(monthly_path)
+        else:
+            planned_paths.extend(
+                build_zip_path(output_dir, symbol, interval, day)
+                for day in daily_dates
+            )
+
+    cached_count = sum(has_cache(path) for path in planned_paths)
+    print(
+        f"Local ZIP inventory: {cached_count} present, "
+        f"{len(planned_paths) - cached_count} missing"
+    )
+
+    for number, (month, segment_start, segment_end, daily_dates, use_monthly) in enumerate(
+        month_plans, start=1
+    ):
+        first_day, last_day = month_bounds(month)
         complete_month = segment_start == first_day and segment_end == last_day
         print(
             f"[{number}/{len(month_starts)}] {month_key(month)}: "
@@ -761,8 +793,9 @@ def download_symbol_interval(
         )
 
         monthly_base_used = False
-        daily_dates = list(date_range(segment_start, segment_end))
-        if complete_month:
+        # Reuse monthly coverage even for partial ranges. If only daily files
+        # exist, continue that download instead of fetching an overlapping month.
+        if use_monthly:
             monthly_rows, monthly_error = load_monthly(month)
             if monthly_rows is not None:
                 monthly_segment = filter_rows_by_dates(
@@ -888,14 +921,6 @@ def download_symbol_interval(
     ).date()
     write_output_csv(out_path, filtered_rows)
 
-    para = common.MarketDataSourceConfig(
-        market_category="Cryptocurrency",
-        data_source="binance_public_data",
-        symbol=symbol,
-        interval=interval,
-        trading_type=market,
-    )
-    market_data_path = Path(common.market_data_path(para)).expanduser().resolve()
     recovered_daily = sum(
         entry["status"] == "filled_from_monthly"
         for entry in info["source_files"].values()
@@ -944,7 +969,10 @@ def download_symbol_interval(
     print(f"Info file              : {info_path}")
 
     market_data_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(out_path), str(market_data_path))
+    temporary_target = market_data_path.with_suffix(market_data_path.suffix + ".temp")
+    shutil.copyfile(out_path, temporary_target)
+    os.replace(temporary_target, market_data_path)
+    out_path.unlink()
     print(f"Output CSV             : {market_data_path}")
     print("=" * 80)
     print("✅ K-line source validation passed.")
@@ -961,17 +989,17 @@ def main() -> int:
         "--symbols",
         "--symbol",
         nargs="+",
-        default=[ "ETHUSDT","BTCUSDT"],#"ETHUSDT",
+        default=["BTCUSDT","ETHUSDT","SOLUSDT","ZECUSDT","XRPUSDT","NEARUSDT","BNBUSDT","DOGEUSDT","UNIUSDT","AVAXUSDT","QNTUSDT","ADAUSDT","LINKUSDT","LTCUSDT","TRXUSDT","HBARUSDT","AAVEUSDT","FETUSDT","XLMUSDT","BCHUSDT","FILUSDT","INJUSDT","PAXGUSDT","DASHUSDT","DOTUSDT","ONEUSDT","VTHOUSDT","ICPUSDT","SANDUSDT","MOVRUSDT","RAYUSDT","RLCUSDT","CAKEUSDT","ALGOUSDT","ARUSDT","LSKUSDT","GTCUSDT","PHAUSDT","OGNUSDT","CRVUSDT","SHIBUSDT","RUNEUSDT"],#"ETHUSDT",
         help="One or more symbols, e.g. --symbols BTCUSDT DOGEUSDT",
     )
     parser.add_argument(
         "--intervals",
         "--interval",
         nargs="+",
-        default=["5m","15m","30m","1h","2h","4h"],
+        default=["1m"],
         help="One or more intervals, e.g. --intervals 15m 30m 1h",
     )
-    parser.add_argument("--start", default=None, help="Start day UTC, YYYY-MM-DD. Default: earliest available date.")
+    parser.add_argument("--start", default="2022-01-01", help="Start day UTC, YYYY-MM-DD. Default: earliest available date.")
     parser.add_argument(
         "--end",
         default=None,
@@ -982,9 +1010,14 @@ def main() -> int:
         "--dir",
         dest="out_dir",
         default=str(Path(__file__).resolve().parent / "data"),
-        help="ZIP cache and audit directory. Validated CSV files are moved to common.market_data_path().",
+        help="ZIP cache and audit directory. Resume automatically from existing ZIPs under <dir>/<market>/<symbol>/<interval>/. Validated CSV files are moved to common.market_data_path().",
     )
     parser.add_argument("--show-missing", action="store_true", help="Print every missing ZIP URL/date, not only summary.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Rebuild the final CSV even if it already exists.",
+    )
     args = parser.parse_args()
 
     symbols = list(dict.fromkeys(symbol.upper() for symbol in args.symbols))

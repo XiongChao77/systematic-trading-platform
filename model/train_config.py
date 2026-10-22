@@ -161,6 +161,25 @@ class XGBoostConfig(BaseModelConfig):
 
 
 @dataclass
+class LightGBMConfig(BaseModelConfig):
+    seq_len: int = 96
+    model_type: str = "lightgbm"
+    model_version: int = 1
+
+    num_leaves: int = 31
+    max_depth: int = -1
+    n_estimators: int = 300
+    learning_rate: float = 0.03
+    subsample: float = 0.8
+    subsample_freq: int = 1
+    colsample_bytree: float = 0.8
+    reg_lambda: float = 1.0
+    reg_alpha: float = 0.0
+    min_child_samples: int = 20
+    use_scaler: bool = False
+
+
+@dataclass
 class SVCConfig(BaseModelConfig):
     seq_len: int = 96
     model_type: str = "svc"

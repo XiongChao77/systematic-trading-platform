@@ -177,7 +177,7 @@ def strategy_config_from_dict(params: dict):
     return config_type(**params)
 
 
-def strategy_config_for_preparation(strategy_config, pre_para: Optional[BaseDefine]):
+def strategy_config_for_preparation(strategy_config, pre_para: Optional[common.PreparationConfig]):
     """Return the effective strategy config implied by preparation settings.
 
     A TBM label and ``BbmStrategyConfig`` share the same volatility barriers.
@@ -696,7 +696,7 @@ def main(logger: logging.Logger, config: RunnerConfig, period: str):
         strategy_config=strategy_config,
         broker_config=config.broker_config,
         data=feed,
-        predict_num=pre_para.predict_num if pre_para is not None else None,
+        predict_num=pre_para.predict_num if isinstance(pre_para, BaseDefine) else None,
         data_interval_ms=common.get_interval_ms(pre_para.interval if pre_para is not None else config.data_config.interval),
         engine_config=config.engine_config,
     )

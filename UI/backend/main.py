@@ -20,6 +20,7 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from UI.backend.modules.backtests import router as backtests_router
 from UI.backend.modules.experiments import router as experiments_router
+from UI.backend.modules.factors import router as factors_router
 from UI.backend.modules.labels import router as labels_router
 from UI.backend.modules.live import router as live_router
 
@@ -34,6 +35,7 @@ def create_app() -> FastAPI:
     application = FastAPI(title="Strategy Center", version="1.0")
     application.add_middleware(GZipMiddleware, minimum_size=1_024)
     application.include_router(experiments_router)
+    application.include_router(factors_router)
     application.include_router(backtests_router)
     application.include_router(labels_router)
     application.include_router(live_router)
@@ -43,7 +45,7 @@ def create_app() -> FastAPI:
         return {
             "status": "ok",
             "application": "Strategy Center",
-            "modules": ["live", "experiments", "backtests", "labels"],
+            "modules": ["live", "factors", "experiments", "backtests", "labels"],
             "frontend_built": (FRONTEND_DIST / "index.html").is_file(),
         }
 

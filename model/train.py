@@ -21,6 +21,7 @@ from model.model_factory import ModelFactory
 from model.tasks.strategies import build_task
 from model.train_config import (
     DataConfig,
+    LightGBMConfig,
     SingleModelConfig,
     TrainConfig,
     TrainTask,
@@ -273,7 +274,10 @@ def train(
             "with fusion_trigger_dir/fusion_long_short_ovr"
         )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cpu" if isinstance(config.model_cfg, LightGBMConfig)
+        else "cuda" if torch.cuda.is_available() else "cpu"
+    )
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
 
@@ -296,15 +300,30 @@ def train(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train the configured model.")
     parser.add_argument(
+        "--model",
+        choices=("xgboost", "lightgbm"),
+        help="Select a tree model. LightGBM runs on CPU.",
+    )
+    parser.add_argument(
         "--xgb-device",
         choices=("cpu", "cuda"),
-        help="XGBoost execution device (default: cpu); only applies to XGBoost configurations.",
+        help="XGBoost execution device; only applies to XGBoost configurations.",
     )
     args = parser.parse_args()
     config = SingleModelConfig
+    if args.model == "lightgbm" and not isinstance(config.model_cfg, LightGBMConfig):
+        config = replace(
+            config,
+            model_cfg=LightGBMConfig(seq_len=config.model_cfg.seq_len),
+        )
+    elif args.model == "xgboost" and not isinstance(config.model_cfg, XGBoostConfig):
+        config = replace(
+            config,
+            model_cfg=XGBoostConfig(seq_len=config.model_cfg.seq_len),
+        )
     if args.xgb_device:
         if not isinstance(config.model_cfg, XGBoostConfig):
-            parser.error("--xgb-device can only be used when SingleModelConfig selects XGBoost")
+            parser.error("--xgb-device can only be used with XGBoost")
         config = replace(
             config,
             model_cfg=replace(config.model_cfg, xgb_device=args.xgb_device),
@@ -314,7 +333,9 @@ if __name__ == "__main__":
     session_logger, _ = common.setup_session_logger(sub_folder="train", file_level=logging.DEBUG)
     try:
         save_dir = os.path.join(common.TRAIN_OUT_DIR, config.train_task)
-        if args.xgb_device:
+        if isinstance(config.model_cfg, LightGBMConfig):
+            save_dir = os.path.join(save_dir, "lightgbm_cpu")
+        elif args.xgb_device:
             save_dir = os.path.join(save_dir, f"xgb_{args.xgb_device}")
         train(
             config=config,

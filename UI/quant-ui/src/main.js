@@ -8,6 +8,7 @@ import { mountLabelsPage } from "./modules/labels/labels-page.js";
 import { mountBacktestsPage } from "./modules/backtests/backtests-page.js";
 import { mountExperimentsPage } from "./modules/experiments/experiments-page.js";
 import { mountLivePage } from "./modules/live/live-page.js";
+import { mountFactorsPage } from "./modules/factors/factors-page.js";
 
 const root = document.querySelector("#app");
 const shell = createAppShell(root);
@@ -17,6 +18,7 @@ const router = createRouter({
   navItems: shell.navItems,
   routes: {
     live: mountLivePage,
+    factors: mountFactorsPage,
     labels: mountLabelsPage,
     backtests: mountBacktestsPage,
     experiments: mountExperimentsPage,

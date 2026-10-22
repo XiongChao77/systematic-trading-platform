@@ -102,7 +102,7 @@ def build_runner_config(
 
     strategy_config = backtest_runner.strategy_config_from_dict(strategy_params)
     broker_config = backtest_runner.BrokerConfig(**broker_params)
-    market_config = common.BaseDefine(**common_params)
+    market_config = common.preparation_config_from_dict(common_params)
     train_config = config_from_dict_train(train_params)
 
     prep_output_dir = data_params.get("prep_output_dir")
