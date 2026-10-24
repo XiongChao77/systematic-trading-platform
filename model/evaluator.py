@@ -1,19 +1,152 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections import Counter
 
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     balanced_accuracy_score,
     classification_report,
     confusion_matrix,
     matthews_corrcoef,
+    precision_recall_curve,
 )
 
-from model.training_types import PredictionResult
+from model.training_types import FitResult, PredictionResult
+
+
+def plot_precision_recall_curve(
+    result: PredictionResult,
+    labels: list[int],
+    output_path: str,
+) -> None:
+    """Save a binary PR curve or one-vs-rest curves for multiclass predictions."""
+    if len(labels) < 2:
+        raise ValueError("Precision-recall curves require at least two classes")
+    if result.probabilities.shape != (len(result.y_true), len(labels)):
+        raise ValueError("Prediction probabilities must have one column per class")
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    curve_labels = labels[1:] if len(labels) == 2 else labels
+    figure = Figure(figsize=(8, 6))
+    FigureCanvasAgg(figure)
+    axis = figure.subplots()
+    try:
+        for class_index, class_id in enumerate(labels):
+            if class_id not in curve_labels:
+                continue
+            binary_truth = result.y_true == class_id
+            precision, recall, _ = precision_recall_curve(
+                binary_truth,
+                result.probabilities[:, class_index],
+            )
+            average_precision = average_precision_score(
+                binary_truth,
+                result.probabilities[:, class_index],
+            )
+            axis.plot(
+                recall,
+                precision,
+                label=f"Class {class_id} (AP={average_precision:.3f})",
+            )
+
+        axis.set(
+            xlabel="Recall",
+            ylabel="Precision",
+            title="Precision-Recall Curve",
+            xlim=(0.0, 1.0),
+            ylim=(0.0, 1.05),
+        )
+        axis.grid(True, alpha=0.3)
+        axis.legend(loc="best")
+        figure.tight_layout()
+        figure.savefig(output_path, dpi=160)
+    finally:
+        figure.clear()
+
+
+def plot_threshold_precision_recall_curve(
+    result: PredictionResult,
+    labels: list[int],
+    output_path: str,
+) -> None:
+    """Save precision and recall against decision thresholds."""
+    if len(labels) < 2:
+        raise ValueError("Threshold precision-recall curves require at least two classes")
+    if result.probabilities.shape != (len(result.y_true), len(labels)):
+        raise ValueError("Prediction probabilities must have one column per class")
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    curve_labels = labels[1:] if len(labels) == 2 else labels
+    figure = Figure(figsize=(8, 6))
+    FigureCanvasAgg(figure)
+    axis = figure.subplots()
+    try:
+        for class_index, class_id in enumerate(labels):
+            if class_id not in curve_labels:
+                continue
+            precision, recall, thresholds = precision_recall_curve(
+                result.y_true == class_id,
+                result.probabilities[:, class_index],
+            )
+            axis.plot(
+                thresholds,
+                precision[:-1],
+                label=f"Class {class_id} Precision",
+            )
+            axis.plot(
+                thresholds,
+                recall[:-1],
+                linestyle="--",
+                label=f"Class {class_id} Recall",
+            )
+
+        axis.set(
+            xlabel="Decision threshold",
+            ylabel="Score",
+            title="Threshold vs. Precision/Recall",
+            ylim=(0.0, 1.05),
+        )
+        axis.grid(True, alpha=0.3)
+        axis.legend(loc="best")
+        figure.tight_layout()
+        figure.savefig(output_path, dpi=160)
+    finally:
+        figure.clear()
+
+
+def plot_training_curves(fit_result: FitResult, output_path: str) -> None:
+    """Save per-epoch training and validation loss curves."""
+    if not fit_result.history:
+        return
+    epochs = [entry["epoch"] for entry in fit_result.history]
+    train_losses = [entry["train_loss"] for entry in fit_result.history]
+    validation_losses = [entry["validation_loss"] for entry in fit_result.history]
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    figure = Figure(figsize=(8, 6))
+    FigureCanvasAgg(figure)
+    axis = figure.subplots()
+    try:
+        axis.plot(epochs, train_losses, label="Train loss")
+        axis.plot(epochs, validation_losses, label="Validation loss")
+        axis.set(
+            xlabel="Epoch",
+            ylabel="Loss",
+            title="Training and Validation Loss",
+        )
+        axis.grid(True, alpha=0.3)
+        axis.legend(loc="best")
+        figure.tight_layout()
+        figure.savefig(output_path, dpi=160)
+    finally:
+        figure.clear()
 
 
 def evaluate_classification(result: PredictionResult, labels: list[int]) -> dict:

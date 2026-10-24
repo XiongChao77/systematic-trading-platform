@@ -189,7 +189,31 @@ class SklearnTrainer:
 
     def fit(self, model: Any, task: TaskStrategy, train_split: TensorSplit, validation_split: TensorSplit) -> FitResult:
         task.configure(train_split.labels)
-        model.fit(train_split.X, train_split.y)
+        fit_with_validation = getattr(model, "fit_with_validation", None)
+        if callable(fit_with_validation):
+            history = fit_with_validation(
+                train_split.X,
+                train_split.y,
+                validation_split.X,
+                validation_split.y,
+            )
+            for metrics in history:
+                self.logger.info(
+                    "Round %03d | Train loss %.5f | Validation loss %.5f",
+                    int(metrics["epoch"]),
+                    metrics["train_loss"],
+                    metrics["validation_loss"],
+                )
+            if history and model.best_iteration is not None:
+                best = history[model.best_iteration]
+                self.logger.info(
+                    "XGBoost early stopping | best_round %03d | best_validation_loss %.5f",
+                    int(best["epoch"]),
+                    best["validation_loss"],
+                )
+        else:
+            model.fit(train_split.X, train_split.y)
+            history = []
         validation = self.predict(model, task, validation_split)
         macro_f1 = f1_score(
             validation.y_true,
@@ -205,7 +229,7 @@ class SklearnTrainer:
             selection_metric=selection_metric,
             validation_score=float(score),
             validation_metrics=validation_metrics,
-            history=[],
+            history=history,
         )
 
     def predict(self, model: Any, task: TaskStrategy, split: TensorSplit) -> PredictionResult:

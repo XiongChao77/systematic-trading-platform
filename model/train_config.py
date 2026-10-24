@@ -147,11 +147,12 @@ class XGBoostConfig(BaseModelConfig):
 
     xgb_depth: int = 4
     xgb_estimators: int = 300
+    xgb_early_stopping_rounds: int = 30
     learning_rate: float = 0.03
 
     subsample: float = 0.8
     colsample_bytree: float = 0.8
-    reg_lambda: float = 1.0
+    reg_lambda: float = 1.5
     reg_alpha: float = 0.0
 
     tree_method: str = "hist"
@@ -218,7 +219,7 @@ class CNNConfig(BaseModelConfig):
 class TrainConfig:
     model_cfg: BaseModelConfig = field(default_factory=lambda: ConvLSTMConfig(model_version=3))
     data_cfg: DataConfig = field(default_factory=DataConfig)
-    feature_conf_list: List[str] = field(default_factory=lambda: feature.FEATURE_LIST_CRYPTOCURRENCY)
+    feature_conf_list: Optional[List[str]] = field(default_factory=lambda: feature.FEATURE_LIST_CRYPTOCURRENCY)
     epochs: int = 100
     batch_size: int = 256  # 256
     lr: float = 3e-4
@@ -249,7 +250,12 @@ class TrainConfig:
             raise ValueError("epochs, batch_size and patience must be positive")
         if self.minority_sampling_ratio is not None and not 0 < self.minority_sampling_ratio < 0.5:
             raise ValueError("minority_sampling_ratio must be between 0 and 0.5")
-        feature_hash = hashlib.sha256("\0".join(self.feature_conf_list).encode("utf-8")).hexdigest()[:12]
+        feature_hash_input = (
+            "\0<ALL_FEATURES>"
+            if self.feature_conf_list is None
+            else "\0".join(self.feature_conf_list)
+        )
+        feature_hash = hashlib.sha256(feature_hash_input.encode("utf-8")).hexdigest()[:12]
         self.train_compatibility = f"{self.model_cfg.seq_len}_{self.stride}_{feature_hash}"
 
 
@@ -268,7 +274,7 @@ COMBO_SUB_TASKS = {
 seq_len = 48
 SingleModelConfig = TrainConfig(
     model_cfg=XGBoostConfig(model_version=2, seq_len=seq_len),
-    feature_conf_list=feature.FEATURE_LIST_CRYPTOCURRENCY,
-    train_task=TrainTask.DIRECTION,
+    feature_conf_list=None,#feature.FEATURE_LIST_CRYPTOCURRENCY,
+    train_task=TrainTask.DIRECT_3CLASS,
     stride=2,
 )

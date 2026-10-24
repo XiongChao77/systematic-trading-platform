@@ -9,8 +9,13 @@ from typing import Any
 import torch
 
 from data_process import common
-from model.evaluator import confusion_frame
-from model.training_types import FitResult
+from model.evaluator import (
+    confusion_frame,
+    plot_precision_recall_curve,
+    plot_threshold_precision_recall_curve,
+    plot_training_curves,
+)
+from model.training_types import FitResult, PredictionResult
 
 
 def _write_json(path: str, payload: Any) -> None:
@@ -44,6 +49,7 @@ def save_single_run(
     model: torch.nn.Module,
     task_type: str,
     fit_result: FitResult,
+    prediction: PredictionResult,
     metrics: dict,
     save_dir: str,
     prep_output_dir: str,
@@ -103,6 +109,20 @@ def save_single_run(
     _write_json(history_path, fit_result.history)
     _write_json(train_config_path, train_config)
     confusion_frame(metrics).to_csv(os.path.join(save_dir, "confusion_matrix.csv"))
+    plot_precision_recall_curve(
+        prediction,
+        metrics["labels"],
+        os.path.join(save_dir, "precision_recall_curve.png"),
+    )
+    plot_threshold_precision_recall_curve(
+        prediction,
+        metrics["labels"],
+        os.path.join(save_dir, "threshold_precision_recall_curve.png"),
+    )
+    plot_training_curves(
+        fit_result,
+        os.path.join(save_dir, "training_curve.png"),
+    )
 
     description = {
         "task_type": task_type,
@@ -110,6 +130,9 @@ def save_single_run(
         "models": {"main": {"model": "model.pt", "meta": "meta.json"}},
         "metrics": "metrics.json",
         "history": "history.json",
+        "precision_recall_curve": "precision_recall_curve.png",
+        "threshold_precision_recall_curve": "threshold_precision_recall_curve.png",
+        "training_curve": "training_curve.png" if fit_result.history else None,
         "train_config": "train_config.json",
         "data_config": "data_config_meta.json",
         "data_manifest": common.DATA_MANIFEST_FILENAME,

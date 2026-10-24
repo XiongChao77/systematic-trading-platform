@@ -102,7 +102,18 @@ def prepare_data(
     frame = common.load_train_df_from_dir(prep_output_dir)
     preparation = common.load_pre_params_from_dir(prep_output_dir)
     interval_ms = common.get_interval_ms(preparation.interval)
-    requested_features = list(config.feature_conf_list)
+    if config.feature_conf_list is None:
+        feature_factory = common.FeatureFactory(interval_ms)
+        candidate_features = dict.fromkeys(
+            [*feature_factory.base_features, *feature_factory.all_feature_list]
+        )
+        requested_features = [
+            name for name in candidate_features if name in frame.columns
+        ]
+        if not requested_features:
+            raise ValueError("No model features are available in the prepared dataset")
+    else:
+        requested_features = list(config.feature_conf_list)
 
     dataset = TimeSeriesWindowDataset(
         df=frame,
@@ -193,6 +204,7 @@ def train_single(
         model=model,
         task_type=task_type,
         fit_result=fit_result,
+        prediction=prediction,
         metrics=metrics,
         save_dir=save_dir,
         prep_output_dir=prepared.prep_output_dir,

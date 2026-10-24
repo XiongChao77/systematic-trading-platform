@@ -154,7 +154,7 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
         self.logger.info("⚙️ Cache not found or invalid. Processing raw data...")
 
         # A. Data Preparation & Audit
-        df_work, clean_features = self._prepare_data(df, feature_cols, label_col)
+        df_work, clean_features, finite_rows = self._prepare_data(df, feature_cols, label_col)
         self.feature_names = clean_features
         self.feature_count = len(clean_features)
         cols_set = set(self.feature_cols)
@@ -164,7 +164,13 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
         X3d, time_windows = self._generate_windows(df_work)
 
         # C. Filter & Align (Continuity + Labels)
-        X_filtered, y_filtered, final_indices = self._filter_and_align(df_work, X3d, time_windows, label_col)
+        X_filtered, y_filtered, final_indices = self._filter_and_align(
+            df_work,
+            X3d,
+            time_windows,
+            label_col,
+            finite_rows,
+        )
 
         # D. Finalize (Normalization & Tensor Conversion)
         self._finalize_dataset(X_filtered, y_filtered, final_indices)
@@ -253,11 +259,16 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
     # --- Internal Pipeline Methods ---
     # ----------------------------------------------------------------
 
-    def _prepare_data(self, df: pd.DataFrame, feature_cols: List[str], label_col: str) -> Tuple[pd.DataFrame, List[str]]:
+    def _prepare_data(
+        self,
+        df: pd.DataFrame,
+        feature_cols: List[str],
+        label_col: str,
+    ) -> Tuple[pd.DataFrame, List[str], np.ndarray]:
         """
         Clean data in two stages:
         1. Remove initial cold-start NaNs (expected)
-        2. Remove abnormal NaNs in the middle or tail (risky)
+        2. Mark non-finite rows so overlapping windows can be discarded.
         """
         # --- Basic column selection ---
         clean_features = [c for c in feature_cols if c not in DROP_FEATURES]
@@ -290,7 +301,7 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
         else:
             raise RuntimeError("❌ [Data Clean] Error: no complete rows found! Please check feature computation logic.")
 
-        # --- Part 2: remove NaNs in the middle or tail (abnormal gaps) ---
+        # --- Part 2: identify non-finite inputs without removing timeline rows ---
         exclude_nan_check_cols = ["trend_strength"]  # "trend_strength" is not feature
         nan_check_cols = [c for c in cols if c not in exclude_nan_check_cols]
         numeric_values = df_work[nan_check_cols].apply(
@@ -298,23 +309,27 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
             errors="coerce",
         )
         invalid_values = ~np.isfinite(numeric_values.to_numpy(dtype=np.float64))
+        finite_rows = ~invalid_values.any(axis=1)
         if invalid_values.any():
-            invalid_rows = np.flatnonzero(invalid_values.any(axis=1))
+            invalid_rows = np.flatnonzero(~finite_rows)
             invalid_columns = [column for column_index, column in enumerate(nan_check_cols) if invalid_values[:, column_index].any()]
             source_rows = df_work.index[invalid_rows[:5]].tolist()
-            raise ValueError(
-                "Required model inputs contain missing/non-finite values after "
-                "the initial warmup; refusing to drop rows silently. "
-                f"columns={invalid_columns}, count={len(invalid_rows)}, "
-                f"sample_rows={source_rows}"
+            self.logger.warning(
+                "Found %d row(s) with non-finite required inputs after warmup; "
+                "any training window containing them will be discarded. "
+                "columns=%s, sample_rows=%s",
+                len(invalid_rows),
+                invalid_columns,
+                source_rows,
             )
-        self.logger.debug("✅ [Step 2] No middle/tail missing feature values found.")
+        else:
+            self.logger.debug("✅ [Step 2] No middle/tail missing feature values found.")
 
         # --- Final index reset ---
         df_work.reset_index(drop=True, inplace=True)
         self.logger.info(f"✨ [Data Clean] Done: {total_rows} -> {len(df_work)} rows (dropped {total_rows - len(df_work)} rows)")
 
-        return df_work, clean_features
+        return df_work, clean_features, finite_rows
 
     def _generate_windows(self, df_work: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         """Creates 3D windows using custom stride."""
@@ -331,12 +346,14 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
         X3d: np.ndarray,
         time_windows: np.ndarray,
         label_col: Optional[str],
+        finite_rows: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         """
         Enhanced filtering logic:
         1. Global check: total missing span within the window must be within tolerance.
         2. Tail check: last N points in the window must be fully continuous (no gaps).
-        3. Label alignment: support stride and track filtering reasons.
+        3. Reject windows containing non-finite required inputs.
+        4. Label alignment: support stride and track filtering reasons.
         """
         original_count = len(X3d)
         has_label = (label_col is not None) and (label_col in df_work.columns)
@@ -359,6 +376,15 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
         tail_ideal_span = check_tail_count * interval
         mask_tail = tail_actual_span <= tail_ideal_span
 
+        invalid_prefix = np.concatenate(
+            ([0], np.cumsum(~finite_rows, dtype=np.int64))
+        )
+        invalid_per_window = (
+            invalid_prefix[self.seq_len:] - invalid_prefix[:-self.seq_len]
+        )[::self.stride]
+        mask_finite = invalid_per_window[:original_count] == 0
+        invalid_window_count = int(np.count_nonzero(~mask_finite))
+
         # --- B. Label validity check ---
         if has_label:
             raw_labels = df_work[label_col].values[self.seq_len - 1 :: self.stride]
@@ -377,7 +403,7 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
         fail_label = np.sum(mask_global & mask_tail & ~mask_label)
 
         # Final combined mask
-        final_mask = mask_global & mask_tail & mask_label
+        final_mask = mask_global & mask_tail & mask_label & mask_finite
         final_count = np.sum(final_mask)
 
         # --- D. Index alignment ---
@@ -395,6 +421,11 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
             self.logger.warning(f"   - ❌ Dropped (tail not continuous): {fail_tail}")
         if fail_label > 0:
             self.logger.warning(f"   - ❌ Dropped (label invalid/INVALID): {fail_label}")
+        if invalid_window_count > 0:
+            self.logger.warning(
+                "   - ❌ Dropped (window contains non-finite required input): %d",
+                invalid_window_count,
+            )
         self.logger.info(f"   - ✅ Final kept: {final_count} ({final_count/original_count:.2%})")
 
         if "trend_strength" in df_work.columns:

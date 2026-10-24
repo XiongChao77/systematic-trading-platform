@@ -45,3 +45,20 @@ flowchart TD
     Fairly strong: >0.45
 Overfitting: va_loss >> tr_loss and va_macroF1 does not rise while tr_loss falls -- the model learned the training set's patterns / noise
 Feed part of the magnitude information into the loss function and see whether the model can learn more
+
+## Training and evaluation plots
+
+Each single-model training run saves `precision_recall_curve.png` using the
+final test-set predictions. Binary tasks plot the positive class; multiclass
+tasks plot one-vs-rest curves for each class.
+
+Runs also save `threshold_precision_recall_curve.png`, showing precision and
+recall as the decision threshold varies for the positive class or each
+one-vs-rest class.
+
+Runs with per-epoch or per-boosting-round metrics also save `training_curve.png`
+and `history.json`, containing train and validation loss. XGBoost prints train
+and validation log loss for each boosting round and stops after 30 rounds
+without validation log-loss improvement. The saved XGBoost booster is sliced
+to the lowest-validation-loss round. The test set is evaluated only after
+training and is not used for per-epoch monitoring or model selection.
