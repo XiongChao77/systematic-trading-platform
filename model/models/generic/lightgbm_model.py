@@ -1,10 +1,38 @@
-import lightgbm as lgb
+from functools import lru_cache
+import logging
 
+import lightgbm as lgb
+import numpy as np
+
+from model.regression_objective import (
+    lightgbm_asymmetric_huber_objective,
+)
 from model.models.generic.sklearn_adapter import SklearnEstimatorAdapter
 
 
+@lru_cache(maxsize=1)
+def _lightgbm_gpu_available() -> bool:
+    probe = lgb.LGBMClassifier(
+        n_estimators=1,
+        max_bin=15,
+        min_data_in_bin=1,
+        min_data_in_leaf=1,
+        device_type="gpu",
+        verbosity=-1,
+        n_jobs=1,
+    )
+    try:
+        probe.fit(
+            np.array([[0.0], [1.0], [0.2], [0.8]], dtype=np.float32),
+            np.array([0, 1, 0, 1]),
+        )
+    except lgb.basic.LightGBMError:
+        return False
+    return True
+
+
 class LightGBMAdapter(SklearnEstimatorAdapter):
-    """CPU LightGBM classifier for the single-head training pipeline."""
+    """LightGBM adapter for classification and robust regression tasks."""
 
     MODEL_TYPE = "lightgbm"
     MODEL_VERSION = 1
@@ -28,6 +56,14 @@ class LightGBMAdapter(SklearnEstimatorAdapter):
     ):
         if kwargs:
             print(f"[LightGBMAdapter] Ignored kwargs: {list(kwargs.keys())}")
+        device_type = "cpu"
+        if self.device.type == "cuda":
+            if _lightgbm_gpu_available():
+                device_type = "gpu"
+            else:
+                logging.getLogger(__name__).warning(
+                    "LightGBM GPU training is unavailable; falling back to CPU"
+                )
         hp = {
             "num_leaves": num_leaves,
             "max_depth": max_depth,
@@ -40,10 +76,18 @@ class LightGBMAdapter(SklearnEstimatorAdapter):
             "reg_alpha": reg_alpha,
             "min_child_samples": min_child_samples,
         }
+        if self.n_classes == 1:
+            estimator = lgb.LGBMRegressor(
+                **hp,
+                objective=lightgbm_asymmetric_huber_objective,
+                metric="None",
+                device_type=device_type,
+                n_jobs=-1,
+                verbosity=-1,
+            )
+            return estimator, hp
+
         estimator = lgb.LGBMClassifier(
-            **hp,
-            device_type="cpu",
-            n_jobs=-1,
-            verbosity=-1,
+            **hp, device_type=device_type, n_jobs=-1, verbosity=-1
         )
         return estimator, hp

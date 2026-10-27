@@ -120,8 +120,14 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
         cache_path: Optional[str] = None,
         use_cache: bool = False,
         show_feature_distribution: bool = True,
+        materialize_windows: bool = True,
     ) -> None:
         self.logger = logging.getLogger("dataset")
+        self.materialize_windows = materialize_windows
+        if not materialize_windows and use_cache:
+            raise ValueError("Window tensor caching is not supported for batch inference")
+        if seq_len < 3 or stride < 1:
+            raise ValueError("seq_len must be at least 3 and stride must be positive")
         self.is_live = is_live
         self.show_feature_distribution = show_feature_distribution
         self.stride = stride
@@ -426,7 +432,8 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
                 "   - ❌ Dropped (window contains non-finite required input): %d",
                 invalid_window_count,
             )
-        self.logger.info(f"   - ✅ Final kept: {final_count} ({final_count/original_count:.2%})")
+        kept_ratio = final_count / original_count if original_count else 0.0
+        self.logger.info(f"   - ✅ Final kept: {final_count} ({kept_ratio:.2%})")
 
         if "trend_strength" in df_work.columns:
             # Use the same slicing as labels: start at seq_len-1 and sample by stride
@@ -438,7 +445,12 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
             self.logger.info("⚠️ Missing trend_strength in df_work; returns set to 0")
             self.returns = np.zeros(final_count)
 
-        return X3d[final_mask], labels_all[final_mask], final_indices
+        if self.materialize_windows:
+            windows = X3d[final_mask]
+        else:
+            self._window_indices = np.flatnonzero(final_mask)
+            windows = X3d
+        return windows, labels_all[final_mask], final_indices
 
     def _finalize_dataset(
         self,
@@ -447,6 +459,18 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
         final_indices: Optional[np.ndarray],
     ) -> None:
         """Normalization and conversion to Tensors."""
+        if not self.materialize_windows:
+            # This read-only view retains only the underlying [rows, features]
+            # array. Selected windows are copied and normalized per batch.
+            self._windows = X_filtered
+            self.y = torch.from_numpy(y_filtered).long()
+            self.returns = torch.from_numpy(self.returns).float()
+            self.indices = final_indices
+            self.logger.info(
+                "Batch inference dataset ready | windows=%d | seq_len=%d | features=%d",
+                len(self.y), self.seq_len, self.feature_count,
+            )
+            return
         self.factory.normalize(X_filtered, self.feature_names)
         if not np.isfinite(X_filtered).all():
             invalid_locations = np.argwhere(~np.isfinite(X_filtered))
@@ -521,9 +545,44 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
         self.logger.info("=" * 90 + "\n")
 
     def __len__(self) -> int:
-        return self.X.shape[0]
+        return len(self.y)
+
+    @property
+    def input_shape(self) -> tuple[int, int, int]:
+        if self.materialize_windows:
+            return tuple(self.X.shape)
+        return len(self), self.seq_len, self.feature_count
+
+    def iter_batches(self, batch_size: int):
+        """Construct and normalize each inference batch once, in sample order."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        for start in range(0, len(self), batch_size):
+            end = min(start + batch_size, len(self))
+            if self.materialize_windows:
+                inputs = self.X[start:end]
+            else:
+                values = self._windows[self._window_indices[start:end]]
+                try:
+                    self.factory.normalize(values, self.feature_names)
+                    if not np.isfinite(values).all():
+                        sample, step, feature = np.argwhere(~np.isfinite(values))[0]
+                        raise ValueError(
+                            "Feature normalization produced a non-finite model input; "
+                            f"feature={self.feature_names[int(feature)]}, "
+                            f"sample={start + int(sample)}, time_step={int(step)}"
+                        )
+                finally:
+                    # The factory keeps normalization references and cached
+                    # statistics; release them before building the next batch.
+                    self.factory._X = None
+                    self.factory._base_stats_pool = {}
+                inputs = torch.from_numpy(values)
+            yield inputs, self.y[start:end], self.returns[start:end]
 
     def __getitem__(self, i: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.materialize_windows:
+            raise TypeError("Batch inference datasets must be read with iter_batches()")
         return self.X[i], self.y[i], self.returns[i]
 
 

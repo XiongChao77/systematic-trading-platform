@@ -8,14 +8,18 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 import numpy as np
 import pandas as pd
+from data_process.common import Signal
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
     balanced_accuracy_score,
     classification_report,
     confusion_matrix,
+    mean_absolute_error,
+    mean_squared_error,
     matthews_corrcoef,
     precision_recall_curve,
+    r2_score,
 )
 
 from model.training_types import FitResult, PredictionResult
@@ -83,19 +87,16 @@ def plot_threshold_precision_recall_curve(
         raise ValueError("Prediction probabilities must have one column per class")
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    curve_labels = labels[1:] if len(labels) == 2 else labels
     figure = Figure(figsize=(8, 6))
     FigureCanvasAgg(figure)
     axis = figure.subplots()
     try:
         for class_index, class_id in enumerate(labels):
-            if class_id not in curve_labels:
-                continue
             precision, recall, thresholds = precision_recall_curve(
                 result.y_true == class_id,
                 result.probabilities[:, class_index],
             )
-            axis.plot(
+            precision_line, = axis.plot(
                 thresholds,
                 precision[:-1],
                 label=f"Class {class_id} Precision",
@@ -103,6 +104,7 @@ def plot_threshold_precision_recall_curve(
             axis.plot(
                 thresholds,
                 recall[:-1],
+                color=precision_line.get_color(),
                 linestyle="--",
                 label=f"Class {class_id} Recall",
             )
@@ -164,7 +166,7 @@ def evaluate_classification(result: PredictionResult, labels: list[int]) -> dict
     total = len(y_true)
     per_class = {}
 
-    for class_id in labels:
+    for class_index, class_id in enumerate(labels):
         key = str(class_id)
         base_rate = true_counts[class_id] / total if total else 0.0
         predicted = y_pred == class_id
@@ -178,11 +180,31 @@ def evaluate_classification(result: PredictionResult, labels: list[int]) -> dict
             "pred_ratio": float(pred_counts[class_id] / total) if total else 0.0,
             "precision_lift": float(precision / base_rate) if base_rate else None,
             "avg_probability_when_predicted": (
-                float(result.probabilities[predicted, class_id].mean()) if predicted.any() else None
+                float(result.probabilities[predicted, class_index].mean()) if predicted.any() else None
             ),
         }
 
     matrix = confusion_matrix(y_true, y_pred, labels=labels)
+    misclassified_true_distribution = {}
+    for pred_index, pred_label in enumerate(labels):
+        incorrect_count = int(matrix[:, pred_index].sum() - matrix[pred_index, pred_index])
+        actual_distribution = {
+            str(true_label): {
+                "count": int(matrix[true_index, pred_index]),
+                "ratio": (
+                    float(matrix[true_index, pred_index] / incorrect_count)
+                    if incorrect_count
+                    else 0.0
+                ),
+            }
+            for true_index, true_label in enumerate(labels)
+            if true_label != pred_label
+        }
+        misclassified_true_distribution[str(pred_label)] = {
+            "incorrect_count": incorrect_count,
+            "actual_distribution": actual_distribution,
+        }
+
     return {
         "macro_f1": float(report["macro avg"]["f1-score"]),
         "macro_precision": float(report["macro avg"]["precision"]),
@@ -212,7 +234,57 @@ def evaluate_classification(result: PredictionResult, labels: list[int]) -> dict
         },
         "per_class": per_class,
         "confusion_matrix": {"labels": labels, "matrix": matrix.tolist()},
+        "misclassified_true_distribution": misclassified_true_distribution,
     }
+
+
+def evaluate_regression(result: PredictionResult, labels: list[int]) -> dict:
+    if result.predictions is None:
+        raise ValueError("Regression evaluation requires continuous predictions")
+    expected_labels = [
+        int(Signal.NEGATIVE),
+        int(Signal.NEUTRAL),
+        int(Signal.POSITIVE),
+    ]
+    if labels != expected_labels:
+        raise ValueError(f"Regression label centers must be {expected_labels}, got {labels}")
+
+    predictions = np.asarray(result.predictions, dtype=np.float64).reshape(-1)
+    if predictions.shape != np.asarray(result.y_true).reshape(-1).shape:
+        raise ValueError("Regression predictions and labels must have matching lengths")
+    if not np.isfinite(predictions).all():
+        raise ValueError("Regression evaluation received non-finite predictions")
+    centers = np.asarray(expected_labels, dtype=np.float64)
+    decoded = centers[
+        np.abs(predictions[:, None] - centers[None, :]).argmin(axis=1)
+    ].astype(np.int64)
+    class_indices = {label: index for index, label in enumerate(labels)}
+    probabilities = np.zeros((len(decoded), len(labels)), dtype=np.float64)
+    for row, label in enumerate(decoded):
+        probabilities[row, class_indices[int(label)]] = 1.0
+
+    classification = evaluate_classification(
+        PredictionResult(
+            y_true=np.asarray(result.y_true, dtype=np.int64),
+            probabilities=probabilities,
+            loss=result.loss,
+            predictions=predictions,
+            predicted_labels=decoded,
+        ),
+        labels,
+    )
+    errors = predictions - np.asarray(result.y_true, dtype=np.float64)
+    classification["regression_metrics"] = {
+        "mae": float(mean_absolute_error(result.y_true, predictions)),
+        "mse": float(mean_squared_error(result.y_true, predictions)),
+        "rmse": float(mean_squared_error(result.y_true, predictions) ** 0.5),
+        "r2": float(r2_score(result.y_true, predictions)),
+        "mean_error": float(errors.mean()),
+    }
+    for class_metrics in classification["per_class"].values():
+        class_metrics["avg_probability_when_predicted"] = None
+    classification["prediction_type"] = "regression_score_decoded_to_nearest_label"
+    return classification
 
 
 def confusion_frame(metrics: dict) -> pd.DataFrame:
@@ -260,11 +332,49 @@ def log_evaluation_report(
     model_label: str = "Model",
 ) -> None:
     """Print a classification report table plus label proportions and the save path."""
-    kind = "Binary" if len(metrics["labels"]) == 2 else "Multiclass"
+    kind = (
+        "Regression"
+        if "regression_metrics" in metrics
+        else "Binary"
+        if len(metrics["labels"]) == 2
+        else "Multiclass"
+    )
     logger.info("%s Evaluating %s Model: %s | Task: %s %s", "=" * 20, kind, model_label, task_type, "=" * 20)
     logger.info("\n" + format_classification_table(metrics))
+    regression_metrics = metrics.get("regression_metrics")
+    if regression_metrics:
+        logger.info(
+            "Regression metrics | MAE: %.4f | RMSE: %.4f | R2: %.4f | Mean error: %.4f",
+            regression_metrics["mae"],
+            regression_metrics["rmse"],
+            regression_metrics["r2"],
+            regression_metrics["mean_error"],
+        )
+    logger.info("True-label distribution among errors by predicted class:")
+    for pred_label in metrics["labels"]:
+        error_summary = metrics["misclassified_true_distribution"][str(pred_label)]
+        incorrect_count = error_summary["incorrect_count"]
+        actual_distribution = error_summary["actual_distribution"]
+        components = ", ".join(
+            f"true {true_label}: {entry['ratio']:.2%} (n={entry['count']})"
+            for true_label, entry in actual_distribution.items()
+        )
+        logger.info(
+            "  predicted %s | errors=%d | %s",
+            pred_label,
+            incorrect_count,
+            components or "no other classes",
+        )
     loss_str = f"{metrics['loss']:.4f}" if metrics["loss"] is not None else "n/a"
-    logger.info("Test macro-F1: %.4f | Test Loss: %s", metrics["macro_f1"], loss_str)
+    if regression_metrics:
+        logger.info(
+            "Test MAE: %.4f | Test RMSE: %.4f | Test Loss: %s",
+            regression_metrics["mae"],
+            regression_metrics["rmse"],
+            loss_str,
+        )
+    else:
+        logger.info("Test macro-F1: %.4f | Test Loss: %s", metrics["macro_f1"], loss_str)
 
     proportions = ", ".join(
         f"{label}: {metrics['true_distribution'][label]['ratio'] * 100:.2f}%"

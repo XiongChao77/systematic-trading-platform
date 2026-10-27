@@ -61,10 +61,10 @@ export async function mountLabelsPage(container) {
                 <span data-role="data-meta" class="panel-note">No prepared output loaded</span>
               </div>
               <div class="label-legend" aria-label="Label legend">
-                <span class="legend-negative">Negative 0</span>
-                <span class="legend-neutral">Neutral 1</span>
-                <span class="legend-positive">Positive 2</span>
-                <span class="legend-invalid">Invalid -1</span>
+                <span class="legend-negative">Negative -1</span>
+                <span class="legend-neutral">Neutral 0</span>
+                <span class="legend-positive">Positive 1</span>
+                <span class="legend-invalid">Invalid -2</span>
               </div>
             </div>
             <div data-role="chart-state" class="page-state"><span class="spinner"></span>Loading prepared data...</div>
@@ -431,9 +431,9 @@ function renderSummary(container, payload) {
   };
   container.innerHTML = [
     ["Rows", total ? total.toLocaleString() : "—"],
-    ["Negative", ratio("0")],
-    ["Neutral", ratio("1")],
-    ["Positive", ratio("2")],
+    ["Negative", ratio("-1")],
+    ["Neutral", ratio("0")],
+    ["Positive", ratio("1")],
   ].map(([label, value]) => `<article class="summary-card"><span>${label}</span><strong>${value}</strong></article>`).join("");
 }
 

@@ -30,7 +30,6 @@ dow
 PropTrading
 LiveTrading
 live_config.json
-account*
 
 # Backtests is an application module, not a test directory.
 !UI/backend/modules/backtests/
@@ -46,3 +45,4 @@ orderbook_output
 **/__pycache__/
 .pytest_cache/
 test*
+.vscode/

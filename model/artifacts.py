@@ -109,16 +109,18 @@ def save_single_run(
     _write_json(history_path, fit_result.history)
     _write_json(train_config_path, train_config)
     confusion_frame(metrics).to_csv(os.path.join(save_dir, "confusion_matrix.csv"))
-    plot_precision_recall_curve(
-        prediction,
-        metrics["labels"],
-        os.path.join(save_dir, "precision_recall_curve.png"),
-    )
-    plot_threshold_precision_recall_curve(
-        prediction,
-        metrics["labels"],
-        os.path.join(save_dir, "threshold_precision_recall_curve.png"),
-    )
+    is_regression = "regression_metrics" in metrics
+    if not is_regression:
+        plot_precision_recall_curve(
+            prediction,
+            metrics["labels"],
+            os.path.join(save_dir, "precision_recall_curve.png"),
+        )
+        plot_threshold_precision_recall_curve(
+            prediction,
+            metrics["labels"],
+            os.path.join(save_dir, "threshold_precision_recall_curve.png"),
+        )
     plot_training_curves(
         fit_result,
         os.path.join(save_dir, "training_curve.png"),
@@ -130,8 +132,10 @@ def save_single_run(
         "models": {"main": {"model": "model.pt", "meta": "meta.json"}},
         "metrics": "metrics.json",
         "history": "history.json",
-        "precision_recall_curve": "precision_recall_curve.png",
-        "threshold_precision_recall_curve": "threshold_precision_recall_curve.png",
+        "precision_recall_curve": None if is_regression else "precision_recall_curve.png",
+        "threshold_precision_recall_curve": (
+            None if is_regression else "threshold_precision_recall_curve.png"
+        ),
         "training_curve": "training_curve.png" if fit_result.history else None,
         "train_config": "train_config.json",
         "data_config": "data_config_meta.json",

@@ -171,10 +171,10 @@ class MeanLastGatedPooling(nn.Module):
 
 
 # ============================================================
-# Transformer1D_V2
+# Transformer1D_V1
 # ============================================================
 
-class Transformer1D_V2(BaseTimeSeriesModel):
+class Transformer1D_V1(BaseTimeSeriesModel):
     """
     Local-Global Transformer for financial time-series
     classification.
@@ -201,7 +201,7 @@ class Transformer1D_V2(BaseTimeSeriesModel):
     """
 
     MODEL_TYPE = "transformer"
-    MODEL_VERSION = 2
+    MODEL_VERSION = 1
 
     supports_lengths = False
 

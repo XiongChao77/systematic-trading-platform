@@ -9,10 +9,10 @@ import {
 import { escapeHtml, formatDuration, formatPercent, formatPrice } from "./formatters.js";
 
 const SIGNAL_COLORS = {
-  "-1": "#d5a126",
-  "0": "#df5962",
-  "1": "#aeb5c2",
-  "2": "#24987d",
+  "-2": "#d5a126",
+  "-1": "#df5962",
+  "0": "#aeb5c2",
+  "1": "#24987d",
 };
 
 export class MarketChart {
@@ -386,10 +386,10 @@ function signalColor(value) {
 
 function signalName(value) {
   const number = Math.round(Number(value));
-  if (number === 2) return "Positive";
-  if (number === 1) return "Neutral";
-  if (number === 0) return "Negative";
-  if (number === -1) return "Invalid";
+  if (number === 1) return "Positive";
+  if (number === 0) return "Neutral";
+  if (number === -1) return "Negative";
+  if (number === -2) return "Invalid";
   return "—";
 }
 

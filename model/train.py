@@ -16,7 +16,7 @@ sys.path.append(os.path.join(current_work_dir,'..'))
 from data_process import common
 from model.artifacts import save_fusion_run, save_single_run
 from model.data_loader import TimeSeriesWindowDataset
-from model.evaluator import evaluate_classification, log_evaluation_report
+from model.evaluator import evaluate_classification, evaluate_regression, log_evaluation_report
 from model.model_factory import ModelFactory
 from model.tasks.strategies import build_task
 from model.train_config import (
@@ -145,6 +145,8 @@ def prepare_data(
 
 
 def _output_dim(task_type: str) -> int:
+    if task_type == TrainTask.REGRESSION:
+        return 1
     return 2 if task_type in TrainTask.BINARY_TASKS else 3
 
 
@@ -159,6 +161,15 @@ def _build_model(config: TrainConfig, task_type: str, input_size: int, device: t
 
 
 def _dataset_splits(task:TaskStrategy, raw: DataSplits) -> DataSplits:
+    if task.source_labels is not None:
+        missing_train_labels = set(task.source_labels) - set(raw.train.labels.tolist())
+    else:
+        missing_train_labels = set()
+    if missing_train_labels:
+        raise ValueError(
+            f"Training split is missing labels required by the task: {sorted(missing_train_labels)}"
+        )
+
     transformed = DataSplits(
         train=task.dataset_split(raw.train),
         validation=task.dataset_split(raw.validation),
@@ -171,7 +182,11 @@ def _dataset_splits(task:TaskStrategy, raw: DataSplits) -> DataSplits:
     ):
         if not len(split):
             raise ValueError(f"{name} split is empty after task transformation")
-    missing_train_labels = set(task.labels) - set(transformed.train.labels.tolist())
+    missing_train_labels = (
+        set()
+        if task.is_regression or task.source_labels is not None
+        else set(task.labels) - set(transformed.train.labels.tolist())
+    )
     if missing_train_labels:
         raise ValueError(
             f"Training split is missing labels required by the task: {sorted(missing_train_labels)}"
@@ -199,7 +214,11 @@ def train_single(
 
     fit_result = trainer.fit(model, task, splits.train, splits.validation)
     prediction = trainer.predict(model, task, splits.test)
-    metrics = evaluate_classification(prediction, task.labels)
+    metrics = (
+        evaluate_regression(prediction, task.labels)
+        if task.is_regression
+        else evaluate_classification(prediction, task.labels)
+    )
     report = save_single_run(
         model=model,
         task_type=task_type,
@@ -215,13 +234,12 @@ def train_single(
         train_config=asdict(config),
     )
     logger.info(
-        "Completed %s: validation_%s=%.4f test_macro_f1=%.4f",
+        "Completed %s: validation_%s=%.4f",
         task_type,
         fit_result.selection_metric,
         fit_result.validation_score,
-        metrics["macro_f1"],
     )
-    model_label = "Best_F1" if fit_result.selection_metric == "macro_f1" else "Best_Loss"
+    model_label = f"Best_{fit_result.selection_metric.upper()}"
     log_evaluation_report(
         logger,
         task_type=task_type,
@@ -286,10 +304,14 @@ def train(
             "with fusion_trigger_dir/fusion_long_short_ovr"
         )
 
-    device = torch.device(
-        "cpu" if isinstance(config.model_cfg, LightGBMConfig)
-        else "cuda" if torch.cuda.is_available() else "cpu"
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    training_device = device.type
+    device_label = {
+        "cuda": "GPU (CUDA)",
+        "cpu": "CPU",
+    }.get(training_device, training_device)
+    logger.info("Training device: %s", device_label)
+
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
 
@@ -310,49 +332,15 @@ def train(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train the configured model.")
-    parser.add_argument(
-        "--model",
-        choices=("xgboost", "lightgbm"),
-        help="Select a tree model. LightGBM runs on CPU.",
-    )
-    parser.add_argument(
-        "--xgb-device",
-        choices=("cpu", "cuda"),
-        help="XGBoost execution device; only applies to XGBoost configurations.",
-    )
-    args = parser.parse_args()
     config = SingleModelConfig
-    if args.model == "lightgbm" and not isinstance(config.model_cfg, LightGBMConfig):
-        config = replace(
-            config,
-            model_cfg=LightGBMConfig(seq_len=config.model_cfg.seq_len),
-        )
-    elif args.model == "xgboost" and not isinstance(config.model_cfg, XGBoostConfig):
-        config = replace(
-            config,
-            model_cfg=XGBoostConfig(seq_len=config.model_cfg.seq_len),
-        )
-    if args.xgb_device:
-        if not isinstance(config.model_cfg, XGBoostConfig):
-            parser.error("--xgb-device can only be used with XGBoost")
-        config = replace(
-            config,
-            model_cfg=replace(config.model_cfg, xgb_device=args.xgb_device),
-        )
-
     started_at = time.perf_counter()
     session_logger, _ = common.setup_session_logger(sub_folder="train", file_level=logging.DEBUG)
     try:
+        # save_dir = os.path.join(common.TRAIN_OUT_DIR, TrainTask.TRIGGER_DIRECTION)
+        # fusion_trigger_dir(session_logger, r'/home/chao/work/financial-ml-system/output/train/TRIGGER',
+        #                     r'/home/chao/work/financial-ml-system/output/train/DIRECTION', save_dir)
+        # exit()
         save_dir = os.path.join(common.TRAIN_OUT_DIR, config.train_task)
-        if isinstance(config.model_cfg, LightGBMConfig):
-            save_dir = os.path.join(save_dir, "lightgbm_cpu")
-        elif args.xgb_device:
-            save_dir = os.path.join(save_dir, f"xgb_{args.xgb_device}")
-        train(
-            config=config,
-            save_dir=save_dir,
-            logger=session_logger,
-        )
+        train(config=config, save_dir=save_dir, logger=session_logger)
     finally:
         session_logger.info("Total run time: %.2f s", time.perf_counter() - started_at)

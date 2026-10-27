@@ -8,17 +8,20 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import WeightedRandomSampler
 
+from data_process.common import Signal
 from model.models.fusion import fuse_trigger_direction_logits
+from model.regression_objective import asymmetric_huber_torch_loss
 from model.train_config import TrainConfig, TrainTask
 from model.training_types import TensorSplit
 
 
 def _balanced_weights(labels: np.ndarray, classes: list[int], device: torch.device) -> torch.Tensor:
-    counts = np.bincount(labels.astype(int), minlength=max(classes) + 1)
-    observed = sum(counts[class_id] for class_id in classes)
+    labels = np.asarray(labels)
+    counts = np.asarray([(labels == class_id).sum() for class_id in classes])
+    observed = counts.sum()
     weights = [
-        observed / (len(classes) * counts[class_id]) if counts[class_id] else 0.0
-        for class_id in classes
+        observed / (len(classes) * count) if count else 0.0
+        for count in counts
     ]
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
@@ -46,6 +49,8 @@ def _three_class_expected_cost(
 class TaskStrategy(ABC):
     labels: list[int]
     output_dim: int
+    is_regression = False
+    source_labels: list[int] | None = None
 
     def __init__(self, config: TrainConfig, device: torch.device):
         self.config = config
@@ -72,15 +77,84 @@ class TaskStrategy(ABC):
     def probabilities(self, output: Any) -> torch.Tensor:
         pass
 
+    def decode_class_indices(self, indices: np.ndarray) -> np.ndarray:
+        return np.asarray(self.labels, dtype=np.int64)[np.asarray(indices, dtype=np.int64)]
+
+
+class ThreeClassRegressionTask(TaskStrategy):
+    labels = [
+        int(Signal.NEGATIVE),
+        int(Signal.NEUTRAL),
+        int(Signal.POSITIVE),
+    ]
+    output_dim = 1
+    is_regression = True
+
+    def dataset_split(self, split: TensorSplit) -> TensorSplit:
+        unexpected = set(split.labels.tolist()) - set(self.labels)
+        if unexpected:
+            raise ValueError(
+                f"Regression task expects Signal labels {self.labels}; "
+                f"found {sorted(unexpected)}"
+            )
+        return TensorSplit(split.X, split.y.float(), split.returns)
+
+    def forward(self, model: torch.nn.Module, inputs: torch.Tensor) -> torch.Tensor:
+        return model(inputs).reshape(-1)
+
+    def loss(
+        self,
+        output: torch.Tensor,
+        labels: torch.Tensor,
+        returns: torch.Tensor,
+        epoch: int,
+    ) -> torch.Tensor:
+        return asymmetric_huber_torch_loss(output, labels)
+
+    def probabilities(self, output: torch.Tensor) -> torch.Tensor:
+        return output.reshape(-1, 1)
+
+    @staticmethod
+    def decode(values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        if not np.isfinite(values).all():
+            raise ValueError("Regression model produced non-finite class scores")
+        centers = np.asarray(
+            [
+                int(Signal.NEGATIVE),
+                int(Signal.NEUTRAL),
+                int(Signal.POSITIVE),
+            ],
+            dtype=np.float64,
+        )
+        nearest = np.abs(values[:, None] - centers[None, :]).argmin(axis=1)
+        return centers[nearest].astype(np.int64)
+
 
 class DirectThreeClassTask(TaskStrategy):
-    labels = [0, 1, 2]
+    labels = [
+        int(Signal.NEGATIVE),
+        int(Signal.NEUTRAL),
+        int(Signal.POSITIVE),
+    ]
+    source_labels = labels
     output_dim = 3
+
+    def dataset_split(self, split: TensorSplit) -> TensorSplit:
+        targets = torch.full_like(split.y, -1)
+        for index, label in enumerate(self.labels):
+            targets[split.y == label] = index
+        if (targets < 0).any():
+            raise ValueError(
+                "Direct three-class task received labels outside Signal values: "
+                f"{sorted(set(split.labels.tolist()) - set(self.labels))}"
+            )
+        return TensorSplit(split.X, targets.long(), split.returns)
 
     def configure(self, train_labels: np.ndarray) -> None:
         sampling_ratio = self.config.minority_sampling_ratio
         self.class_weights = (
-            _balanced_weights(train_labels, self.labels, self.device)
+            _balanced_weights(train_labels, list(range(self.output_dim)), self.device)
             if sampling_ratio is None
             else None
         )
@@ -90,21 +164,22 @@ class DirectThreeClassTask(TaskStrategy):
         if minority_ratio is None or len(labels) == 0:
             return None
 
-        counts = np.bincount(labels.astype(int), minlength=max(self.labels) + 1)
-        missing = [class_id for class_id in self.labels if counts[class_id] == 0]
+        classes = list(range(self.output_dim))
+        counts = np.bincount(labels.astype(int), minlength=self.output_dim)
+        missing = [class_id for class_id in classes if counts[class_id] == 0]
         if missing:
             raise ValueError(f"Cannot sample missing Direct task classes: {missing}")
 
-        majority_class = max(self.labels, key=lambda class_id: counts[class_id])
+        majority_class = max(classes, key=lambda class_id: counts[class_id])
         minority_classes = [
-            class_id for class_id in self.labels if class_id != majority_class
+            class_id for class_id in classes if class_id != majority_class
         ]
         majority_ratio = 1.0 - minority_ratio * len(minority_classes)
         target_ratios = {
             class_id: (
                 majority_ratio if class_id == majority_class else minority_ratio
             )
-            for class_id in self.labels
+            for class_id in classes
         }
         sample_weights = np.asarray(
             [target_ratios[int(label)] / counts[int(label)] for label in labels],
@@ -144,14 +219,22 @@ class BinaryTask(TaskStrategy):
     def dataset_split(self, split: TensorSplit) -> TensorSplit:
         y = split.y
         if self.task_type == TrainTask.TRIGGER:
-            return TensorSplit(split.X, (y != 1).long(), split.returns)
+            return TensorSplit(split.X, (y != int(Signal.NEUTRAL)).long(), split.returns)
         if self.task_type == TrainTask.DIRECTION:
-            mask = y != 1
-            return TensorSplit(split.X[mask], (y[mask] == 2).long(), split.returns[mask])
+            mask = y != int(Signal.NEUTRAL)
+            return TensorSplit(
+                split.X[mask],
+                (y[mask] == int(Signal.POSITIVE)).long(),
+                split.returns[mask],
+            )
         if self.task_type == TrainTask.LONG_OVR:
-            return TensorSplit(split.X, (y == 2).long(), split.returns)
+            return TensorSplit(
+                split.X, (y == int(Signal.POSITIVE)).long(), split.returns
+            )
         if self.task_type == TrainTask.SHORT_OVR:
-            return TensorSplit(split.X, (y == 0).long(), split.returns)
+            return TensorSplit(
+                split.X, (y == int(Signal.NEGATIVE)).long(), split.returns
+            )
         raise ValueError(f"Unsupported binary task: {self.task_type}")
 
     def sampler(self, labels: np.ndarray) -> Optional[WeightedRandomSampler]:
@@ -196,13 +279,31 @@ class BinaryTask(TaskStrategy):
 
 
 class DualHeadThreeClassTask(TaskStrategy):
-    labels = [0, 1, 2]
+    labels = [
+        int(Signal.NEGATIVE),
+        int(Signal.NEUTRAL),
+        int(Signal.POSITIVE),
+    ]
+    source_labels = labels
     output_dim = 3
 
+    def dataset_split(self, split: TensorSplit) -> TensorSplit:
+        targets = torch.full_like(split.y, -1)
+        for index, label in enumerate(self.labels):
+            targets[split.y == label] = index
+        if (targets < 0).any():
+            raise ValueError(
+                "Dual-head task received labels outside Signal values: "
+                f"{sorted(set(split.labels.tolist()) - set(self.labels))}"
+            )
+        return TensorSplit(split.X, targets.long(), split.returns)
+
     def configure(self, train_labels: np.ndarray) -> None:
-        trigger_labels = (train_labels != 1).astype(int)
-        direction_labels = (train_labels[train_labels != 1] == 2).astype(int)
-        self.main_weights = _balanced_weights(train_labels, self.labels, self.device)
+        neutral_index = self.labels.index(int(Signal.NEUTRAL))
+        positive_index = self.labels.index(int(Signal.POSITIVE))
+        trigger_labels = (train_labels != neutral_index).astype(int)
+        direction_labels = (train_labels[train_labels != neutral_index] == positive_index).astype(int)
+        self.main_weights = _balanced_weights(train_labels, list(range(self.output_dim)), self.device)
         self.trigger_weights = _balanced_weights(trigger_labels, [0, 1], self.device)
         self.direction_weights = _balanced_weights(direction_labels, [0, 1], self.device)
 
@@ -222,9 +323,11 @@ class DualHeadThreeClassTask(TaskStrategy):
         epoch: int,
     ) -> torch.Tensor:
         trigger_logits, direction_logits = output
-        trigger_targets = (labels != 1).long()
-        direction_targets = (labels == 2).long()
-        action_mask = labels != 1
+        neutral_index = self.labels.index(int(Signal.NEUTRAL))
+        positive_index = self.labels.index(int(Signal.POSITIVE))
+        trigger_targets = (labels != neutral_index).long()
+        direction_targets = (labels == positive_index).long()
+        action_mask = labels != neutral_index
         smoothing = float(getattr(self.config, "label_smoothing", 0.0))
 
         trigger_loss = F.cross_entropy(
@@ -245,7 +348,9 @@ class DualHeadThreeClassTask(TaskStrategy):
             )
             direction_loss = per_sample.mean()
 
-        probabilities = self.probabilities(output)
+        probabilities = fuse_trigger_direction_logits(
+            trigger_logits, direction_logits, hard_gate=False
+        )
         main_loss = F.nll_loss(
             torch.log(probabilities.clamp_min(1e-8)),
             labels,
@@ -286,6 +391,15 @@ class FusedThreeClassTask(DirectThreeClassTask):
 
 
 def build_task(task_type: str, config: TrainConfig, device: torch.device, model: Optional[torch.nn.Module] = None) -> TaskStrategy:
+    if task_type == TrainTask.REGRESSION:
+        if model is not None and (
+            hasattr(model, "head_trigger") or hasattr(model, "head_direction")
+        ):
+            raise TypeError(
+                "REGRESSION requires a single-output model, "
+                f"model:{config.model_cfg.model_type} {config.model_cfg.model_version}"
+            )
+        return ThreeClassRegressionTask(config, device)
     if task_type == TrainTask.DIRECT_3CLASS:
         if model is not None and (
             hasattr(model, "head_trigger") or hasattr(model, "head_direction")

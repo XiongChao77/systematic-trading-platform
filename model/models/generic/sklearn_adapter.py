@@ -43,6 +43,7 @@ class SklearnEstimatorAdapter(BaseTimeSeriesModel):
         self.n_classes = int(n_classes)
         self.seq_len = int(seq_len) if seq_len is not None else None
         self.use_scaler = bool(use_scaler)
+        self.device = torch.device(device)
 
         estimator, self.hp = self._build_estimator(**kwargs)
         steps = [("scaler", StandardScaler())] if self.use_scaler else []
@@ -98,7 +99,16 @@ class SklearnEstimatorAdapter(BaseTimeSeriesModel):
             return np.full((Xf.shape[0], self.n_classes), 1.0 / self.n_classes)
         return self.pipeline.predict_proba(Xf)
 
+    def predict_values(self, X) -> np.ndarray:
+        Xf = self._flatten(X)
+        if not self.is_fitted:
+            raise RuntimeError("Cannot run regression inference before the estimator is fitted")
+        return np.asarray(self.pipeline.predict(Xf), dtype=np.float64).reshape(-1)
+
     def forward(self, x):
+        if self.n_classes == 1:
+            values = self.predict_values(x)
+            return torch.as_tensor(values, dtype=torch.float32, device=x.device).reshape(-1, 1)
         probs_np = self.predict_proba(x)
         probs = torch.as_tensor(probs_np, dtype=torch.float32, device=x.device)
         return torch.log(probs.clamp_min(1e-8))

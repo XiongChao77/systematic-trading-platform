@@ -71,6 +71,21 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
     # common.print_zret_statistics(df)
     # Label the complete selected history before splitting; events may occur in the backtest period.
     df = common.attach_label(df, para=para,label_col = label_col)
+    if para.label_type == "TBM" and not is_pure_binary:
+        common.log_tbm_reach_time_percentiles(df, logger)
+        df.drop(columns=list(common.TBM_REACH_TIME_COLUMNS.values()), inplace=True)
+    if "expected_vol" in df.columns:
+        plot_path = os.path.join(
+            prep_output_dir,
+            "label_proportion_by_expected_vol.png",
+        )
+        common.plot_label_proportions_by_expected_vol(
+            df,
+            output_path=plot_path,
+            label_col=label_col,
+            bins=200,
+        )
+        logger.info("📈 Label proportions by expected_vol saved to: %s", plot_path)
     # common.print_label_performance_stats(df, para)
     # # common.attach_macd_event_lifecycle_label(df, interval_ms=interval_ms)
     # # common.attach_boll_event_lifecycle_label(df, interval_ms=interval_ms)
@@ -97,7 +112,12 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
         common.log_threshold_percentiles(df, logger)
 
     for label_val, cnt in counts.items():
-        label_name = "Down" if label_val == 0 else ("Up" if label_val == 2 else ("Range" if label_val == 1 else "INVALID"))
+        label_name = {
+            common.Signal.INVALID: "INVALID",
+            common.Signal.NEGATIVE: "Down",
+            common.Signal.NEUTRAL: "Range",
+            common.Signal.POSITIVE: "Up",
+        }.get(label_val, "UNKNOWN")
         pct_val = proportions[label_val]
         logger.info(f"Label {label_val} ({label_name}): {cnt} rows, ratio {pct_val:.4%}")
     logger.info("==========================\n")
@@ -106,7 +126,7 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
     # 3. Split and persist datasets
     # ---------------------------------------------------------
     if not is_pure_binary:
-        split_ts = pd.to_datetime(df['open_time_date_utc'].iloc[-1]) - pd.DateOffset(months=8)
+        split_ts = pd.to_datetime(df['open_time_date_utc'].iloc[-1], utc=True) - pd.DateOffset(months=8)
     times = pd.to_datetime(df['open_time_date_utc'], utc=True)
     train_df, test_df = df[times < split_ts], df[times >= split_ts]
 

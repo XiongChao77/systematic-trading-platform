@@ -14,10 +14,16 @@ from numba import njit
 
 
 class Signal(IntEnum):
-    INVALID = -1
-    NEGATIVE = 0
-    NEUTRAL = 1
-    POSITIVE = 2
+    INVALID = -2
+    NEGATIVE = -1
+    NEUTRAL = 0
+    POSITIVE = 1
+
+
+_SIGNAL_INVALID = int(Signal.INVALID)
+_SIGNAL_NEGATIVE = int(Signal.NEGATIVE)
+_SIGNAL_NEUTRAL = int(Signal.NEUTRAL)
+_SIGNAL_POSITIVE = int(Signal.POSITIVE)
 
 
 eps = 1e-8
@@ -469,6 +475,120 @@ def calculate_thresholds(df, para=BaseDefine, **kwargs):
     return df
 
 
+def plot_label_proportions_by_expected_vol(
+    df,
+    output_path,
+    label_col="label",
+    vol_col="expected_vol",
+    bins=200,
+):
+    """Plot per-label proportions across equal-width expected-volatility bins."""
+    if label_col not in df.columns:
+        raise ValueError(f"Missing label column: {label_col}")
+    if vol_col not in df.columns:
+        raise ValueError(f"Missing volatility column: {vol_col}")
+    if bins < 1:
+        raise ValueError("bins must be at least 1")
+
+    signal_labels = [
+        int(Signal.NEGATIVE),
+        int(Signal.NEUTRAL),
+        int(Signal.POSITIVE),
+    ]
+    values = df[[vol_col, label_col]].copy()
+    values[vol_col] = pd.to_numeric(values[vol_col], errors="coerce")
+    values[label_col] = pd.to_numeric(values[label_col], errors="coerce")
+    values = values[np.isfinite(values[vol_col]) & values[label_col].notna()]
+    if not values[label_col].mod(1).eq(0).all():
+        raise ValueError(f"Labels in {label_col} must be integer Signal values")
+    observed_labels = set(values[label_col].astype(int).unique())
+    unexpected_labels = observed_labels - {*signal_labels, int(Signal.INVALID)}
+    if unexpected_labels:
+        raise ValueError(f"Unexpected signal labels: {sorted(unexpected_labels)}")
+
+    values = values[values[label_col].isin(signal_labels)].copy()
+    if values.empty:
+        raise ValueError("No valid signal labels with finite expected_vol values")
+
+    minimum_volatility = float(values[vol_col].min())
+    maximum_volatility = float(values[vol_col].max())
+    if minimum_volatility == maximum_volatility:
+        bin_edges = np.asarray([minimum_volatility, maximum_volatility])
+        values["_volatility_bin"] = 0
+        x_values = np.asarray([minimum_volatility])
+        bin_count = 1
+    else:
+        bin_edges = np.linspace(minimum_volatility, maximum_volatility, bins + 1)
+        values["_volatility_bin"] = pd.cut(
+            values[vol_col],
+            bins=bin_edges,
+            labels=False,
+            include_lowest=True,
+        ).astype(int)
+        x_values = (bin_edges[:-1] + bin_edges[1:]) / 2
+        bin_count = bins
+
+    bin_index = pd.RangeIndex(bin_count)
+    summary = pd.DataFrame(
+        {
+            "expected_vol": x_values,
+            "sample_count": (
+                values.groupby("_volatility_bin", observed=True)
+                .size()
+                .reindex(bin_index, fill_value=0)
+                .to_numpy()
+            ),
+        }
+    )
+    proportions = pd.crosstab(
+        values["_volatility_bin"],
+        values[label_col].astype(int),
+    ).reindex(bin_index, fill_value=0)
+    sample_counts = summary["sample_count"].to_numpy()
+    for label in signal_labels:
+        summary[f"label_{label}_pct"] = np.divide(
+            proportions[label].to_numpy() * 100,
+            sample_counts,
+            out=np.full(bin_count, np.nan),
+            where=sample_counts > 0,
+        )
+
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    figure = Figure(figsize=(10, 6))
+    FigureCanvasAgg(figure)
+    axis = figure.subplots()
+    try:
+        for label, name in (
+            (int(Signal.NEGATIVE), "Negative"),
+            (int(Signal.NEUTRAL), "Neutral"),
+            (int(Signal.POSITIVE), "Positive"),
+        ):
+            axis.plot(
+                summary["expected_vol"],
+                summary[f"label_{label}_pct"],
+                marker="o",
+                markersize=3,
+                label=name,
+            )
+        axis.set(
+            xlabel="Expected volatility",
+            ylabel="Label proportion (%)",
+            title="Label proportions by expected volatility",
+            ylim=(0, 100),
+        )
+        axis.grid(True, alpha=0.3)
+        axis.legend(loc="best")
+        figure.tight_layout()
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        figure.savefig(output_path, dpi=160)
+    finally:
+        figure.clear()
+
+    return summary.reset_index(drop=True)
+
+
 def print_zret_statistics(df, label_col="label"):
     print("\n================ trend_strength Statistics ================\n")
 
@@ -502,7 +622,7 @@ def _tbm_take_profit_uses_high_low(para) -> bool:
     raise ValueError("tbm_take_profit_price must be 'close' or 'high_low', " f"got {mode!r}")
 
 
-@njit(cache=True)
+@njit(cache=False)
 def fast_triple_barrier_kernel(
     close,
     high,
@@ -512,8 +632,12 @@ def fast_triple_barrier_kernel(
     take_profit_use_high_low=False,
 ):
     n = len(close)
-    labels = np.ones(n, dtype=np.int32)  # neutral (1) by default
+    labels = np.full(n, _SIGNAL_NEUTRAL, dtype=np.int32)
     reach_times = np.full(n, window, dtype=np.int32)
+    long_tp_times = np.full(n, -1, dtype=np.int32)
+    long_sl_times = np.full(n, -1, dtype=np.int32)
+    short_tp_times = np.full(n, -1, dtype=np.int32)
+    short_sl_times = np.full(n, -1, dtype=np.int32)
 
     l_tp_p = thresholds[:, 0]
     l_sl_p = thresholds[:, 1]
@@ -544,19 +668,35 @@ def fast_triple_barrier_kernel(
             # --- long path ---
             if l_active:
                 long_tp_price = h if take_profit_use_high_low else c
-                if long_tp_price >= l_tp:  # TP hit first
+                long_tp_hit = long_tp_price >= l_tp
+                long_sl_hit = l <= l_sl
+                if long_tp_hit and long_sl_hit:
+                    l_active = False
+                    labels[i] = _SIGNAL_INVALID
+                    reach_times[i] = -1
+                elif long_tp_hit:
                     first_l_tp = j
+                    long_tp_times[i] = j
                     l_active = False  # target reached, stop updating
-                elif l <= l_sl:  # SL hit first
+                elif long_sl_hit:
+                    long_sl_times[i] = j
                     l_active = False  # dead
 
             # --- short path ---
             if s_active:
                 short_tp_price = l if take_profit_use_high_low else c
-                if short_tp_price <= s_tp:  # TP hit first
-                    first_s_tp = j
+                short_tp_hit = short_tp_price <= s_tp
+                short_sl_hit = h >= s_sl
+                if short_tp_hit and short_sl_hit:
                     s_active = False
-                elif h >= s_sl:  # SL hit first
+                    labels[i] = _SIGNAL_INVALID
+                    reach_times[i] = -1
+                elif short_tp_hit:
+                    first_s_tp = j
+                    short_tp_times[i] = j
+                    s_active = False
+                elif short_sl_hit:
+                    short_sl_times[i] = j
                     s_active = False
 
             # Leave early once both sides have a result (TP or SL)
@@ -565,17 +705,29 @@ def fast_triple_barrier_kernel(
 
         # --- final decision ---
         # Only a side that "won" its own path (TP before SL) may take part in the comparison
-        if first_l_tp <= window and first_l_tp < first_s_tp:
-            labels[i] = 2  # Signal.POSITIVE
+        if labels[i] == _SIGNAL_INVALID:
+            continue
+        if first_l_tp <= window and first_l_tp == first_s_tp:
+            labels[i] = _SIGNAL_INVALID
+            reach_times[i] = -1
+        elif first_l_tp <= window and first_l_tp < first_s_tp:
+            labels[i] = _SIGNAL_POSITIVE
             reach_times[i] = first_l_tp
         elif first_s_tp <= window and first_s_tp < first_l_tp:
-            labels[i] = 0  # Signal.NEGATIVE
+            labels[i] = _SIGNAL_NEGATIVE
             reach_times[i] = first_s_tp
         else:
-            labels[i] = 1  # Signal.NEUTRAL
+            labels[i] = _SIGNAL_NEUTRAL
             # reach_times keeps its default or is set to the time of the first SL
 
-    return labels, reach_times
+    return (
+        labels,
+        reach_times,
+        long_tp_times,
+        long_sl_times,
+        short_tp_times,
+        short_sl_times,
+    )
 
 
 def attach_triple_barrier_label(df, para=BaseDefine, label_col="label"):
@@ -594,7 +746,14 @@ def attach_triple_barrier_label(df, para=BaseDefine, label_col="label"):
     window = int(para.predict_num)
 
     # 3. Call the numba accelerated kernel
-    labels, reach_times = fast_triple_barrier_kernel(
+    (
+        labels,
+        reach_times,
+        long_tp_times,
+        long_sl_times,
+        short_tp_times,
+        short_sl_times,
+    ) = fast_triple_barrier_kernel(
         close,
         high,
         low,
@@ -606,6 +765,10 @@ def attach_triple_barrier_label(df, para=BaseDefine, label_col="label"):
     # 4. Write the results back
     df[label_col] = labels
     df["reach_time"] = reach_times
+    df["tbm_long_tp_bars"] = long_tp_times
+    df["tbm_long_sl_bars"] = long_sl_times
+    df["tbm_short_tp_bars"] = short_tp_times
+    df["tbm_short_sl_bars"] = short_sl_times
 
     # 5. Physical time check (masking)
     # Makes sure the timestamp predict_num steps later lines up with physical time
@@ -620,13 +783,15 @@ def attach_triple_barrier_label(df, para=BaseDefine, label_col="label"):
     time_match[valid_idx] = time_values[target_indices[valid_idx]] == target_times[valid_idx]
 
     # Handle the invalid rows
-    df.loc[~time_match, label_col] = -1  # Signal.INVALID
+    df.loc[~time_match, label_col] = Signal.INVALID
     df.loc[~time_match, "reach_time"] = -1  # invalid reach time
+    for col in TBM_REACH_TIME_COLUMNS.values():
+        df.loc[~time_match, col] = -1
 
     return df
 
 
-@njit(cache=True)
+@njit(cache=False)
 def fast_triple_barrier_trend_kernel(
     close,
     high,
@@ -667,10 +832,10 @@ def fast_triple_barrier_trend_kernel(
     n = len(close)
 
     # final expanded label
-    trend_labels = np.ones(n, dtype=np.int32)  # default NEUTRAL = 1
+    trend_labels = np.full(n, _SIGNAL_NEUTRAL, dtype=np.int32)
 
     # raw anchor result, not propagated
-    anchor_labels = np.ones(n, dtype=np.int32)  # default NEUTRAL = 1
+    anchor_labels = np.full(n, _SIGNAL_NEUTRAL, dtype=np.int32)
     anchor_reach_times = np.full(n, window, dtype=np.int32)
 
     # source index of propagated trend label
@@ -728,19 +893,19 @@ def fast_triple_barrier_trend_kernel(
                 break
 
         # ===== 2. Decide raw anchor label =====
-        out_label = 1
+        out_label = _SIGNAL_NEUTRAL
         reach_time = window
 
         if first_l_tp <= window and first_l_tp < first_s_tp:
-            out_label = 2  # POSITIVE
+            out_label = _SIGNAL_POSITIVE
             reach_time = first_l_tp
 
         elif first_s_tp <= window and first_s_tp < first_l_tp:
-            out_label = 0  # NEGATIVE
+            out_label = _SIGNAL_NEGATIVE
             reach_time = first_s_tp
 
         else:
-            out_label = 1  # NEUTRAL
+            out_label = _SIGNAL_NEUTRAL
             reach_time = window
 
         anchor_labels[i] = out_label
@@ -749,7 +914,7 @@ def fast_triple_barrier_trend_kernel(
         # ===== 3. Trend propagation =====
         # Only POSITIVE / NEGATIVE anchors can propagate.
         # Propagated labels themselves do not create new anchors.
-        if out_label == 0 or out_label == 2:
+        if out_label == _SIGNAL_NEGATIVE or out_label == _SIGNAL_POSITIVE:
             end_idx = i + reach_time
             if end_idx >= n:
                 end_idx = n - 1
@@ -878,7 +1043,7 @@ def attach_triple_barrier_trend_label(
     return df
 
 
-@njit(cache=True)
+@njit(cache=False)
 def fast_binary_barrier_kernel(
     close,
     high,
@@ -898,13 +1063,13 @@ def fast_binary_barrier_kernel(
         upper = close[i] * (1 + tp_long[i])
         lower = close[i] * (1 - tp_short[i])
 
-    - upper touched first  -> POSITIVE (2)
-    - lower touched first  -> NEGATIVE (0)
-    - both touched inside the same bar (order unknown) -> INVALID (-1)
+    - upper touched first  -> POSITIVE
+    - lower touched first  -> NEGATIVE
+    - both touched inside the same bar (order unknown) -> INVALID
     - no touch within ``window`` bars -> use the terminal close versus the
       anchor close to choose POSITIVE / NEGATIVE
-    - equal terminal and anchor closes -> INVALID (-1)
-    - insufficient future data / a time gap -> INVALID (-1)
+    - equal terminal and anchor closes -> INVALID
+    - insufficient future data / a time gap -> INVALID
 
     Returns:
         labels:      per-anchor label
@@ -919,7 +1084,7 @@ def fast_binary_barrier_kernel(
     """
     n = len(close)
 
-    labels = np.full(n, -1, dtype=np.int32)  # INVALID by default
+    labels = np.full(n, _SIGNAL_INVALID, dtype=np.int32)
     reach_times = np.full(n, -1, dtype=np.int32)
     scan_lens = np.zeros(n, dtype=np.int32)
     invalid_reasons = np.full(n, 2, dtype=np.int32)  # exhausted by default
@@ -954,17 +1119,17 @@ def fast_binary_barrier_kernel(
 
             if hit_up and hit_dn:
                 # Same bar touches both sides, order cannot be resolved
-                labels[i] = -1  # INVALID
+                labels[i] = _SIGNAL_INVALID
                 reach_times[i] = -1
                 invalid_reasons[i] = 1
                 break
             elif hit_up:
-                labels[i] = 2  # POSITIVE
+                labels[i] = _SIGNAL_POSITIVE
                 reach_times[i] = j
                 invalid_reasons[i] = 0
                 break
             elif hit_dn:
-                labels[i] = 0  # NEGATIVE
+                labels[i] = _SIGNAL_NEGATIVE
                 reach_times[i] = j
                 invalid_reasons[i] = 0
                 break
@@ -975,11 +1140,11 @@ def fast_binary_barrier_kernel(
         if invalid_reasons[i] == 2 and scan_lens[i] == window:
             terminal_close = close[i + window]
             if terminal_close > p0:
-                labels[i] = 2  # POSITIVE
+                labels[i] = _SIGNAL_POSITIVE
                 reach_times[i] = window
                 invalid_reasons[i] = 0
             elif terminal_close < p0:
-                labels[i] = 0  # NEGATIVE
+                labels[i] = _SIGNAL_NEGATIVE
                 reach_times[i] = window
                 invalid_reasons[i] = 0
             else:
@@ -988,17 +1153,17 @@ def fast_binary_barrier_kernel(
     return labels, reach_times, scan_lens, invalid_reasons
 
 
-@njit(cache=True)
+@njit(cache=False)
 def fast_pure_binary_kernel(close, high, low, threshold_pct):
     """Find the first future bar reaching either configured inclusive barrier.
 
     Scan from the next row through the data end, without a time limit or
-    time-gap restriction. Same-bar dual hits and no hits are INVALID (-1).
-    Valid labels are POSITIVE (2) and NEGATIVE (0). Invalid reason codes
+    time-gap restriction. Same-bar dual hits and no hits are INVALID.
+    Valid labels use Signal.POSITIVE and Signal.NEGATIVE. Invalid reason codes
     are 0 for valid, 1 for same-bar dual hits, and 2 for no future hit.
     """
     n = len(close)
-    labels = np.full(n, -1, dtype=np.int32)
+    labels = np.full(n, _SIGNAL_INVALID, dtype=np.int32)
     reach_times = np.full(n, -1, dtype=np.int32)
     scan_lens = np.zeros(n, dtype=np.int32)
     invalid_reasons = np.full(n, 2, dtype=np.int32)
@@ -1014,7 +1179,7 @@ def fast_pure_binary_kernel(close, high, low, threshold_pct):
                 invalid_reasons[i] = 1
                 break
             if hit_up or hit_down:
-                labels[i] = 2 if hit_up else 0
+                labels[i] = _SIGNAL_POSITIVE if hit_up else _SIGNAL_NEGATIVE
                 reach_times[i] = curr_idx - i
                 invalid_reasons[i] = 0
                 break
@@ -1150,6 +1315,13 @@ def attach_binary_barrier_label(
 
 
 THRESHOLD_PERCENTILES = [1, 5, 25, 50, 75, 90, 95, 99]
+TBM_REACH_TIME_COLUMNS = {
+    "Long TP": "tbm_long_tp_bars",
+    "Long SL": "tbm_long_sl_bars",
+    "Short TP": "tbm_short_tp_bars",
+    "Short SL": "tbm_short_sl_bars",
+}
+TBM_REACH_TIME_PERCENTILES = [1, 5, 25, 50, 75, 90, 95, 99]
 
 
 def log_threshold_percentiles(df, logger=None, cols=("threshold_long", "threshold_short")):
@@ -1172,6 +1344,25 @@ def log_threshold_percentiles(df, logger=None, cols=("threshold_long", "threshol
         pcts = np.percentile(vals, THRESHOLD_PERCENTILES)
         row = " | ".join(f"{v:8.4f}" for v in pcts)
         emit(f"{col:<18} | {row}")
+
+
+def log_tbm_reach_time_percentiles(df, logger=None):
+    """Log hit-distance percentiles for each TBM side and barrier."""
+    emit = logger.info if logger is not None else print
+    header = " | ".join(f"P{p}".rjust(8) for p in TBM_REACH_TIME_PERCENTILES)
+    emit("\n=== TBM barrier-hit distance (bars) ===")
+    emit(f"{'Barrier':<10} | {'Count':>8} | {header}")
+
+    for name, col in TBM_REACH_TIME_COLUMNS.items():
+        vals = df[col].to_numpy(dtype=np.int32)
+        valid_labels = df["label"].to_numpy() != Signal.INVALID
+        vals = vals[(vals >= 0) & valid_labels]
+        if len(vals) == 0:
+            row = " | ".join(f"{'n/a':>8}" for _ in TBM_REACH_TIME_PERCENTILES)
+        else:
+            pcts = np.percentile(vals, TBM_REACH_TIME_PERCENTILES)
+            row = " | ".join(f"{v:8.1f}" for v in pcts)
+        emit(f"{name:<10} | {len(vals):8d} | {row}")
 
 
 def print_binary_barrier_stats(df, label_col="label"):
@@ -1263,7 +1454,7 @@ def print_label_performance_stats(df, para=BaseDefine):
 
     # 1. Basic information
     total_len = len(df)
-    valid_df = df[df["label"] != -1].copy()  # drop INVALID (-1)
+    valid_df = df[df["label"] != Signal.INVALID].copy()
     predict_num = para.predict_num
 
     print(f"Total Samples: {total_len}")
@@ -1273,7 +1464,11 @@ def print_label_performance_stats(df, para=BaseDefine):
 
     # 2. Label distribution
     label_counts = valid_df["label"].value_counts().sort_index()
-    label_map = {0: "NEGATIVE (Short Win)", 1: "NEUTRAL (Time-out/SL)", 2: "POSITIVE (Long Win)"}
+    label_map = {
+        Signal.NEGATIVE: "NEGATIVE (Short Win)",
+        Signal.NEUTRAL: "NEUTRAL (Time-out/SL)",
+        Signal.POSITIVE: "POSITIVE (Long Win)",
+    }
 
     print(f"{'Label Type':<25} | {'Count':<10} | {'Percentage':<10}")
     for lbl, count in label_counts.items():
@@ -1294,7 +1489,7 @@ def print_label_performance_stats(df, para=BaseDefine):
 
     # 4. Efficiency analysis: fast trigger vs slow trigger
     print("\n🚀 Efficiency Analysis (Speed of Signal):")
-    for lbl in [0, 2]:
+    for lbl in [Signal.NEGATIVE, Signal.POSITIVE]:
         sub = valid_df[valid_df["label"] == lbl]
         if len(sub) > 0:
             name = label_map[lbl]
@@ -1485,9 +1680,9 @@ def _boll_audit(df, event_indices):
     stats = df.loc[event_indices, "label"].value_counts()
     print(f"\n📊 [BOLL Lifecycle Audit]")
     print(f"  - Total triggers: {total}")
-    print(f"  - POSITIVE  (2) valid: {stats.get(Signal.POSITIVE , 0)} ({(stats.get(Signal.POSITIVE , 0)/total)*100:.2f}%)")
-    print(f"  - NEGATIVE (0) valid: {stats.get(Signal.NEGATIVE, 0)} ({(stats.get(Signal.NEGATIVE, 0)/total)*100:.2f}%)")
-    print(f"  - NEUTRAL (1) noise: {stats.get(Signal.NEUTRAL, 0)}")
+    print(f"  - POSITIVE ({Signal.POSITIVE}) valid: {stats.get(Signal.POSITIVE, 0)} ({(stats.get(Signal.POSITIVE, 0)/total)*100:.2f}%)")
+    print(f"  - NEGATIVE ({Signal.NEGATIVE}) valid: {stats.get(Signal.NEGATIVE, 0)} ({(stats.get(Signal.NEGATIVE, 0)/total)*100:.2f}%)")
+    print(f"  - NEUTRAL ({Signal.NEUTRAL}) noise: {stats.get(Signal.NEUTRAL, 0)}")
 
 
 def attach_sma_7_25_crossover_label(

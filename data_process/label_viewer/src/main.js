@@ -281,19 +281,19 @@ function renderChart(candles) {
 }
 
 function labelColor(label) {
-  if (label === 2) return "#26a69a";
-  if (label === 0) return "#ef5350";
-  if (label === 1) return "#b2b2b2";
-  if (label === -1) return "#fbc02d";
+  if (label === 1) return "#26a69a";
+  if (label === -1) return "#ef5350";
+  if (label === 0) return "#b2b2b2";
+  if (label === -2) return "#fbc02d";
 
   return "#999999";
 }
 
 function labelName(label) {
-  if (label === 2) return "POSITIVE / Long";
-  if (label === 0) return "NEGATIVE / Short";
-  if (label === 1) return "NEUTRAL";
-  if (label === -1) return "INVALID";
+  if (label === 1) return "POSITIVE / Long";
+  if (label === -1) return "NEGATIVE / Short";
+  if (label === 0) return "NEUTRAL";
+  if (label === -2) return "INVALID";
 
   return "UNKNOWN";
 }

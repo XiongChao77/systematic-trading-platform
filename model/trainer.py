@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import f1_score, log_loss
+from sklearn.metrics import f1_score, log_loss, mean_absolute_error, mean_squared_error
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -104,6 +104,12 @@ class TorchTrainer:
                 zero_division=0,
             )
             validation_loss = float(validation.loss)
+            validation_values = (
+                validation.predictions if task.is_regression else validation.y_pred
+            )
+            validation_mae = float(
+                mean_absolute_error(validation.y_true, validation_values)
+            )
             scheduler.step(validation_loss)
 
             epoch_metrics = {
@@ -112,16 +118,25 @@ class TorchTrainer:
                 "validation_loss": validation_loss,
                 "validation_macro_f1": validation_f1,
             }
+            if task.is_regression:
+                epoch_metrics["validation_mae"] = validation_mae
             history.append(epoch_metrics)
             self.logger.info(
-                "Epoch %03d | train_loss %.4f | validation_loss %.4f | validation_macro_f1 %.4f",
+                "Epoch %03d | train_loss %.4f | validation_loss %.4f | validation_macro_f1 %.4f%s",
                 epoch,
                 train_loss,
                 validation_loss,
                 validation_f1,
+                f" | validation_mae {validation_mae:.4f}" if task.is_regression else "",
             )
 
-            score = validation_f1 if maximize else validation_loss
+            score = (
+                validation_f1
+                if maximize
+                else validation_mae
+                if selection_metric == "mae"
+                else validation_loss
+            )
             improved = score > best_score + 1e-6 if maximize else score < best_score - 1e-6
             if improved:
                 best_score = score
@@ -130,6 +145,11 @@ class TorchTrainer:
                     "loss": validation_loss,
                     "macro_f1": validation_f1,
                 }
+                if task.is_regression:
+                    best_validation["mae"] = validation_mae
+                    best_validation["rmse"] = float(
+                        mean_squared_error(validation.y_true, validation.predictions) ** 0.5
+                    )
                 stale_epochs = 0
             else:
                 stale_epochs += 1
@@ -157,6 +177,8 @@ class TorchTrainer:
         model.eval()
         loader = DataLoader(split, batch_size=self.config.batch_size, shuffle=False)
         probabilities = []
+        predictions = []
+        predicted_labels = []
         truths = []
         total_loss = 0.0
         total_samples = 0
@@ -172,13 +194,33 @@ class TorchTrainer:
             batch_size = len(inputs)
             total_loss += loss.item() * batch_size
             total_samples += batch_size
-            probabilities.append(probs.detach().cpu().numpy())
+            outputs = probs.detach().cpu().numpy()
+            if task.is_regression:
+                predictions.append(outputs.reshape(-1))
+                predicted_labels.append(task.decode(outputs))
+            else:
+                probabilities.append(outputs)
             truths.append(labels.detach().cpu().numpy())
 
+        raw_truths = np.concatenate(truths)
+        if task.is_regression:
+            predicted_values = np.concatenate(predictions)
+            decoded_predictions = np.concatenate(predicted_labels)
+            probability_values = None
+        else:
+            probability_values = np.concatenate(probabilities)
+            raw_truths = task.decode_class_indices(raw_truths.astype(np.int64))
+            decoded_predictions = task.decode_class_indices(
+                probability_values.argmax(axis=1)
+            )
+            predicted_values = None
+
         return PredictionResult(
-            y_true=np.concatenate(truths),
-            probabilities=np.concatenate(probabilities),
+            y_true=raw_truths,
+            probabilities=probability_values,
             loss=total_loss / max(total_samples, 1),
+            predictions=predicted_values,
+            predicted_labels=decoded_predictions,
         )
 
 
@@ -197,13 +239,13 @@ class SklearnTrainer:
                 validation_split.X,
                 validation_split.y,
             )
-            for metrics in history:
-                self.logger.info(
-                    "Round %03d | Train loss %.5f | Validation loss %.5f",
-                    int(metrics["epoch"]),
-                    metrics["train_loss"],
-                    metrics["validation_loss"],
-                )
+            # for metrics in history:
+            #     self.logger.info(
+            #         "Round %03d | Train loss %.5f | Validation loss %.5f",
+            #         int(metrics["epoch"]),
+            #         metrics["train_loss"],
+            #         metrics["validation_loss"],
+            #     )
             if history and model.best_iteration is not None:
                 best = history[model.best_iteration]
                 self.logger.info(
@@ -223,8 +265,24 @@ class SklearnTrainer:
             zero_division=0,
         )
         validation_metrics = {"loss": float(validation.loss), "macro_f1": float(macro_f1)}
+        validation_values = (
+            validation.predictions if task.is_regression else validation.y_pred
+        )
+        validation_metrics["mae"] = float(
+            mean_absolute_error(validation.y_true, validation_values)
+        )
+        if task.is_regression:
+            validation_metrics["rmse"] = float(
+                mean_squared_error(validation.y_true, validation.predictions) ** 0.5
+            )
         selection_metric = self.config.selection_metric
-        score = macro_f1 if selection_metric == "macro_f1" else float(validation.loss)
+        score = (
+            macro_f1
+            if selection_metric == "macro_f1"
+            else validation_metrics["mae"]
+            if selection_metric == "mae"
+            else float(validation.loss)
+        )
         return FitResult(
             selection_metric=selection_metric,
             validation_score=float(score),
@@ -233,12 +291,29 @@ class SklearnTrainer:
         )
 
     def predict(self, model: Any, task: TaskStrategy, split: TensorSplit) -> PredictionResult:
+        if task.is_regression:
+            y_true = split.labels
+            predictions = model.predict_values(split.X).reshape(-1)
+            return PredictionResult(
+                y_true=y_true,
+                probabilities=None,
+                loss=float(mean_squared_error(y_true, predictions)),
+                predictions=predictions,
+                predicted_labels=task.decode(predictions),
+            )
         probabilities = model.predict_proba(split.X)
-        y_true = split.labels
+        class_indices = split.labels.astype(np.int64)
+        y_true = task.decode_class_indices(class_indices)
+        predicted_labels = task.decode_class_indices(probabilities.argmax(axis=1))
         return PredictionResult(
             y_true=y_true,
             probabilities=probabilities,
-            loss=log_loss(y_true, probabilities, labels=task.labels),
+            loss=log_loss(
+                class_indices,
+                probabilities,
+                labels=list(range(probabilities.shape[1])),
+            ),
+            predicted_labels=predicted_labels,
         )
 
 

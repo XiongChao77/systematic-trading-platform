@@ -16,7 +16,7 @@ from model.models.generic.sklearn_adapter import SVCAdapter, LogisticRegressionS
 from model.models.generic.lstm import LSTM1D_V1
 from model.models.generic.lstm_v2 import LSTM1D_V2
 from model.models.generic.conv_lstm_v1 import ConvLSTM1D_V1
-from model.models.generic.transformer_v2 import Transformer1D_V2
+from model.models.generic.transformer_v1 import Transformer1D_V1
 from model.models.generic.logistic_regression import LogisticRegressionTS_V1
 
 # ---- dual_head: fixed trigger(2)+direction(2) heads, fused by an inference wrapper ----
@@ -50,7 +50,7 @@ class ModelFactory:
         LSTM1D_V1,
         LSTM1D_V2,
         ConvLSTM1D_V1,
-        Transformer1D_V2,
+        Transformer1D_V1,
         LogisticRegressionTS_V1,
 
         # ---- dual_head (fixed 2+2 trigger/direction heads) ----
@@ -114,7 +114,10 @@ class ModelFactory:
         **model_kwargs: Any,
     ) -> BaseTimeSeriesModel:
         model_cls = cls.get_model_class(model_type, model_version)
-        model = model_cls(**model_kwargs)
+        if model_cls.TRAINING_BACKEND == "sklearn":
+            model = model_cls(device=device, **model_kwargs)
+        else:
+            model = model_cls(**model_kwargs)
         return model.to(device)
 
     # =============================

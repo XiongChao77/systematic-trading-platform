@@ -82,9 +82,15 @@ class FitResult:
 @dataclass(frozen=True)
 class PredictionResult:
     y_true: np.ndarray
-    probabilities: np.ndarray
+    probabilities: np.ndarray | None
     loss: float | None = None
+    predictions: np.ndarray | None = None
+    predicted_labels: np.ndarray | None = None
 
     @property
     def y_pred(self) -> np.ndarray:
+        if self.predicted_labels is not None:
+            return self.predicted_labels
+        if self.probabilities is None:
+            raise ValueError("Classification results require probabilities or predicted_labels")
         return self.probabilities.argmax(axis=1)

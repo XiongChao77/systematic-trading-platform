@@ -81,31 +81,27 @@ class FusionWrapper(nn.Module):
         self.models = nn.ModuleDict(models_dict)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        logits, probabilities, _ = self.forward_with_submodel_logits(x)
+        return logits, probabilities
+
+    def forward_with_submodel_logits(self, x: torch.Tensor):
+        """Return fused output and reuse each model's logits for evaluation."""
+        outputs = {name: model(x) for name, model in self.models.items()}
         if self.task_type == TrainTask.TRIGGER_DIRECTION:
-            return self._forward_trigger_direction(x)
-        if self.task_type == TrainTask.LONG_SHORT_OVR:
-            return self._forward_long_short_ovr(x)
-        raise ValueError(f"Unknown pipeline task_type: {self.task_type}")
+            probabilities = fuse_trigger_direction_logits(outputs["trigger"], outputs["direction"])
+        elif self.task_type == TrainTask.LONG_SHORT_OVR:
+            probabilities = self._long_short_probabilities(outputs)
+        else:
+            raise ValueError(f"Unknown pipeline task_type: {self.task_type}")
+        return probabilities_to_logits(probabilities), probabilities, outputs
 
-    def _forward_trigger_direction(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # 1. Trigger Inference
-        logits_trig = self.models["trigger"](x)
-
-        # 2. Direction Inference
-        logits_dir = self.models["direction"](x)
-
-        # 3. Fusion Logic
-        fused_probs = fuse_trigger_direction_logits(logits_trig, logits_dir)
-        fused_logits = probabilities_to_logits(fused_probs)
-        
-        return fused_logits, fused_probs
-
-    def _forward_long_short_ovr(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        logits_long = self.models["long_ovr"](x)
+    @staticmethod
+    def _long_short_probabilities(outputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        logits_long = outputs["long_ovr"]
         probs_long = torch.softmax(logits_long, dim=1)
         p_long = probs_long[:, 1]
 
-        logits_short = self.models["short_ovr"](x)
+        logits_short = outputs["short_ovr"]
         probs_short = torch.softmax(logits_short, dim=1)
         p_short = probs_short[:, 1]
 
@@ -115,5 +111,4 @@ class FusionWrapper(nn.Module):
         p_long_only = p_long * (1.0 - p_short)
         p_neutral = (1.0 - p_short) * (1.0 - p_long) + p_short * p_long
         fused_probs = torch.stack((p_short_only, p_neutral, p_long_only), dim=1)
-        fused_logits = probabilities_to_logits(fused_probs)
-        return fused_logits, fused_probs
+        return fused_probs

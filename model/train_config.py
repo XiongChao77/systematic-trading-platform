@@ -33,6 +33,7 @@ class BaseModelConfig:
 
 class TrainTask:
     DIRECT_3CLASS = "DIRECT_3CLASS"
+    REGRESSION = "REGRESSION"
     DUAL_HEAD_3CLASS = "DUAL_HEAD_3CLASS"
     TRIGGER_DIRECTION = "TRIGGER_DIRECTION"
     LONG_SHORT_OVR = "LONG_SHORT_OVR"
@@ -143,10 +144,10 @@ class MambaConfig(BaseModelConfig):
 class XGBoostConfig(BaseModelConfig):
     seq_len: int = 96
     model_type: str = "xgboost"
-    model_version: int = 2
+    model_version: int = 1
 
-    xgb_depth: int = 4
-    xgb_estimators: int = 300
+    xgb_depth: int = 6
+    xgb_estimators: int = 2000
     xgb_early_stopping_rounds: int = 30
     learning_rate: float = 0.03
 
@@ -156,9 +157,8 @@ class XGBoostConfig(BaseModelConfig):
     reg_alpha: float = 0.0
 
     tree_method: str = "hist"
-    xgb_device: str = "cuda"  # "cpu" or "cuda"
     eval_metric: str = "logloss"
-    use_scaler: bool = False  # tree models need no standardization
+    use_scaler: bool = True  # tree models need no standardization
 
 
 @dataclass
@@ -177,7 +177,7 @@ class LightGBMConfig(BaseModelConfig):
     reg_lambda: float = 1.0
     reg_alpha: float = 0.0
     min_child_samples: int = 20
-    use_scaler: bool = False
+    use_scaler: bool = True
 
 
 @dataclass
@@ -217,7 +217,7 @@ class CNNConfig(BaseModelConfig):
 
 @dataclass
 class TrainConfig:
-    model_cfg: BaseModelConfig = field(default_factory=lambda: ConvLSTMConfig(model_version=3))
+    model_cfg: BaseModelConfig = field(default_factory=lambda: ConvLSTMConfig(model_version=1))
     data_cfg: DataConfig = field(default_factory=DataConfig)
     feature_conf_list: Optional[List[str]] = field(default_factory=lambda: feature.FEATURE_LIST_CRYPTOCURRENCY)
     epochs: int = 100
@@ -238,14 +238,14 @@ class TrainConfig:
     minority_sampling_ratio: Optional[float] = None
     mag_warmup_epochs: int = 8
     temperature: float = 2.0
-    selection_metric: str = "macro_f1"  # "macro_f1" or "loss"
+    selection_metric: str = "mae"  # "mae", "macro_f1", or "loss"
     label_smoothing: float = 0.02
     train_compatibility: str = ""
-    train_task: str = TrainTask.DIRECT_3CLASS
+    train_task: str = TrainTask.REGRESSION
 
     def __post_init__(self):
-        if self.selection_metric not in {"macro_f1", "loss"}:
-            raise ValueError("selection_metric must be 'macro_f1' or 'loss'")
+        if self.selection_metric not in {"mae", "macro_f1", "loss"}:
+            raise ValueError("selection_metric must be 'mae', 'macro_f1', or 'loss'")
         if self.epochs <= 0 or self.batch_size <= 0 or self.patience <= 0:
             raise ValueError("epochs, batch_size and patience must be positive")
         if self.minority_sampling_ratio is not None and not 0 < self.minority_sampling_ratio < 0.5:
@@ -271,10 +271,10 @@ COMBO_SUB_TASKS = {
     TrainTask.LONG_SHORT_OVR: (TrainTask.LONG_OVR, TrainTask.SHORT_OVR),
 }
 
-seq_len = 48
+seq_len = 64
 SingleModelConfig = TrainConfig(
-    model_cfg=XGBoostConfig(model_version=2, seq_len=seq_len),
+    model_cfg=XGBoostConfig(model_version=1, seq_len=seq_len),
     feature_conf_list=None,#feature.FEATURE_LIST_CRYPTOCURRENCY,
-    train_task=TrainTask.DIRECT_3CLASS,
-    stride=2,
+    train_task=TrainTask.TRIGGER,
+    stride=4,
 )

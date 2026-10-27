@@ -15,12 +15,12 @@ DOGE_15m_TBM =common.BaseDefine(
 DOGE_1m_TBM = replace(
     DOGE_15m_TBM,
     interval="1m",
-    vol_ewma_span = 60*24,
-    predict_num = 120,
-    vol_multiplier_long = 1,
-    stop_multiplier_rate_long = 0.8,
-    vol_multiplier_short = 1,
-    stop_multiplier_rate_short = 0.8,
+    vol_ewma_span = 60*24*7,
+    predict_num = 60*12,
+    vol_multiplier_long = 20,
+    stop_multiplier_rate_long = 0.6,
+    vol_multiplier_short = 20,
+    stop_multiplier_rate_short = 0.6,
     min_expected_move_pct=0.1,
     tbm_take_profit_price = "high_low"
 )

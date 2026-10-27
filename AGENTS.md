@@ -18,3 +18,6 @@ Do not accumulate permanent bug-specific, timing, dashboard, concurrency or
 other isolated regression tests after fixes. Use temporary verification for
 such changes and remove it after validation. Explicit manual exchange and
 offline model-validation tools may remain outside default pytest discovery.
+
+
+## Don't update Readme or Architecture file automatically

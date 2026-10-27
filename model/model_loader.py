@@ -31,7 +31,7 @@ class MetaConfig:
         # If a sub-model is binary, the wrapper will handle mapping to 3 classes.
         self.classes = meta.get("classes", [0, 1]) 
         self.label_col = meta.get("label_col", "label")
-        
+
         self.raw_config = meta.get("feature_group_list", [])
         self.feature_group_list = []
         for class_name, params in self.raw_config:
@@ -40,6 +40,25 @@ class MetaConfig:
                 self.feature_group_list.append(FeatureContainer(cls, **params))
 
 TASK_DESCRIPTION_FILENAME = "task_description.json"
+
+
+def _decode_regression_scores(scores):
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if not np.isfinite(scores).all():
+        raise ValueError("Regression model produced non-finite class scores")
+    centers = np.asarray(
+        [int(Signal.NEGATIVE), int(Signal.NEUTRAL), int(Signal.POSITIVE)]
+    )
+    return centers[np.abs(scores[:, None] - centers[None, :]).argmin(axis=1)]
+
+
+def _decode_class_indices(indices):
+    signal_values = np.asarray(
+        [int(Signal.NEGATIVE), int(Signal.NEUTRAL), int(Signal.POSITIVE)],
+        dtype=np.int64,
+    )
+    return signal_values[np.asarray(indices, dtype=np.int64)]
+
 
 class ModelHandler(MetaConfig):
     
@@ -76,8 +95,12 @@ class ModelHandler(MetaConfig):
         elif self.task_type in TrainTask.BINARY_TASKS:
             # produced by save_single_run for a lone TRIGGER/DIRECTION/LONG_OVR/SHORT_OVR model
             self._load_binary_mode()
-        elif self.task_type in (TrainTask.DIRECT_3CLASS, TrainTask.DUAL_HEAD_3CLASS):
-            # produced by save_single_run for a 3-class model
+        elif self.task_type in (
+            TrainTask.REGRESSION,
+            TrainTask.DIRECT_3CLASS,
+            TrainTask.DUAL_HEAD_3CLASS,
+        ):
+            # produced by save_single_run for a regression or 3-class model
             self._load_3class_mode()
         else:
             raise ValueError(f"Unknown task type: {self.task_type}")
@@ -93,15 +116,17 @@ class ModelHandler(MetaConfig):
         self._init_config_from_meta(meta)
         self.classes = meta["classes"]  # In single mode, use classes from meta directly
 
-        # 2. Load the raw training model, then adapt it to the common inference
-        # contract: (three_class_logits, three_class_probabilities).
+        # 2. Load the raw training model, then adapt classifiers to the shared
+        # three-class probability interface. Regression emits a single score.
         raw_model, _ = ModelFactory.load_from_checkpoint(
             model_path=model_path,
             meta_path=meta_path,
             device=self.device
         )
         raw_model.eval()
-        if self.task_type == TrainTask.DIRECT_3CLASS:
+        if self.task_type == TrainTask.REGRESSION:
+            self.model = raw_model
+        elif self.task_type == TrainTask.DIRECT_3CLASS:
             self.model = DirectThreeClassInferenceWrapper(raw_model)
         else:
             self.model = DualHeadInferenceWrapper(raw_model)
@@ -191,249 +216,155 @@ class ModelHandler(MetaConfig):
         self.model.eval()
         self.loaded_sub_models = loaded_sub_models
 
-    def evaluate_sub_models(self, df, kline_interval_ms, batch_size=2048):
-        """
-        Composite tasks (TRIGGER_DIRECTION/LONG_SHORT_OVR) only: on the given df (usually the backtest range),
-        run every sub-model separately and compute its metrics, instead of only looking at the fused 3-class result.
+    @staticmethod
+    def _inference_batches(ds, batch_size):
+        if isinstance(ds, TimeSeriesWindowDataset):
+            return ds.iter_batches(batch_size)
+        return DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
-        The label mapping reuses model.tasks.strategies.BinaryTask.dataset_split, so it matches the binary task
-        definitions used during training (trigger: is there an action; direction: long/short; long_ovr/short_ovr: OvR)
-        exactly, instead of inventing a mapping on the spot.
-
-        Returns {} for non composite tasks (self.loaded_sub_models empty).
-        """
-        if not self.loaded_sub_models:
-            return {}
-
+    def _collect_sub_model_batch(self, outputs, labels, returns, collected):
+        """Transform only small batch logits, never the full feature tensor."""
         from model.tasks.strategies import BinaryTask
-        from model.train_config import TrainConfig
         from model.training_types import TensorSplit
 
-        results = {}
-        for name, sub_model in self.loaded_sub_models.items():
-            conf = self.sub_model_conf.get(name)
-            sub_task_type = self.sub_model_task_type.get(name)
-            if conf is None or sub_task_type is None:
-                self.logger.warning(f"⚠️ evaluate_sub_models: missing conf/task_type for sub-model '{name}', skip")
-                continue
+        for name, logits in outputs.items():
+            task_type = self.sub_model_task_type[name]
+            transformed = BinaryTask(task_type, TrainConfig(), self.device).dataset_split(
+                TensorSplit(logits.detach().cpu(), labels.cpu(), returns.cpu())
+            )
+            if len(transformed):
+                collected[name][0].append(transformed.X.argmax(dim=1).numpy())
+                collected[name][1].append(transformed.y.numpy())
 
+    def _sub_model_metrics(self, collected):
+        results = {}
+        for name, (predictions, targets) in collected.items():
+            if not predictions:
+                results[name] = {}
+                continue
+            stats = self.evaluate_performance(
+                np.concatenate(targets), np.concatenate(predictions)
+            )
+            stats.pop("signal", None)
+            results[name] = {"task_type": self.sub_model_task_type[name], **stats}
+        return results
+
+    def evaluate_sub_models(self, df, kline_interval_ms, batch_size=2048, ds=None):
+        """Evaluate binary tasks on shared batches without copying all windows."""
+        if not self.loaded_sub_models:
+            return {}
+        if ds is None:
             ds = TimeSeriesWindowDataset(
                 df=df,
                 kline_interval_ms=kline_interval_ms,
-                feature_cols=conf.feature_cols,
-                label_col=conf.label_col,
-                seq_len=conf.seq_len,
+                feature_cols=self.feature_cols,
+                label_col=self.label_col,
+                seq_len=self.seq_len,
                 is_live=False,
+                materialize_windows=False,
             )
-            if len(ds) == 0:
-                self.logger.warning(f"⚠️ evaluate_sub_models: no valid windows for sub-model '{name}', skip")
-                results[name] = {}
-                continue
+        self._validate_inference_dataset(ds)
+        collected = {name: ([], []) for name in self.loaded_sub_models}
+        for model in self.loaded_sub_models.values():
+            model.eval()
+        with torch.no_grad():
+            for inputs, labels, returns in self._inference_batches(ds, batch_size):
+                inputs = inputs.to(self.device)
+                outputs = {name: model(inputs) for name, model in self.loaded_sub_models.items()}
+                self._collect_sub_model_batch(outputs, labels, returns, collected)
+        return self._sub_model_metrics(collected)
 
-            transformed = BinaryTask(sub_task_type, TrainConfig(), self.device).dataset_split(
-                TensorSplit(ds.X, ds.y, ds.returns)
-            )
-            X_t, y_t = transformed.X, transformed.y
-            if len(y_t) == 0:
-                results[name] = {}
-                continue
-
-            sub_model.eval()
-            preds_list = []
-            with torch.no_grad():
-                for start in range(0, len(X_t), batch_size):
-                    xb = X_t[start:start + batch_size].to(self.device)
-                    logits = sub_model(xb)
-                    preds_list.append(torch.argmax(logits, dim=1).cpu().numpy())
-            y_pred = np.concatenate(preds_list)
-            y_true = y_t.cpu().numpy()
-
-            stats = self.evaluate_performance(y_true, y_pred)
-            # "signal" (short/long win rate etc.) is written against the 3-class Short/Neutral/Long
-            # Signal semantics, while a sub-model here has its own binary labels (0/1). The semantics
-            # do not line up and showing them would mislead, so only the generic classification metrics are kept.
-            stats.pop("signal", None)
-
-            results[name] = {
-                "task_type": sub_task_type,
-                **stats,
-            }
-
-        return results
-
-    def predict(self, df, kline_interval_ms, is_live=True, batch_size=2048, diff_thresh=None, min_thresh=0.3, stride =1,
-                   cache_path = '', use_cache= False, show_feature_distribution = True):
-        """
-        Run inference with optional strategy enhancement based on probability differences.
-        
-        :param df: input DataFrame (raw features included)
-        :param is_live: whether running in live mode.
-                        - True (live): optimize memory; only output the latest bar's signal
-                        - False (backtest): keep index mapping; align signals strictly with the time axis
-        :param batch_size: batch size
-        :param diff_thresh: probability difference threshold (P_long - P_short)
-        :param min_thresh: minimum probability gate
-        :return: (df_out, stats) 
-                 df_out includes full bars and columns like 'pred', 'pred_prob', 'net_score', etc.
-        """
-        self.logger.debug(f"Starting inference pipeline (Mode={'Live' if is_live else 'Backtest'}, diff_thresh={diff_thresh})...")
-        
-        # 1. Prepare dataset: pass is_live to control index recording behavior
+    def predict(self, df, kline_interval_ms, is_live=True, batch_size=2048,
+                diff_thresh=None, min_thresh=0.3, stride=1, cache_path='',
+                use_cache=False, show_feature_distribution=True):
+        """Predict with bounded window memory and original timestamp alignment."""
         ds = TimeSeriesWindowDataset(
-            df=df, 
-            kline_interval_ms = kline_interval_ms,
-            feature_cols=self.feature_cols, 
+            df=df,
+            kline_interval_ms=kline_interval_ms,
+            feature_cols=self.feature_cols,
             label_col=self.label_col,
             seq_len=self.seq_len,
             is_live=is_live,
-            stride= stride,
-            cache_path = cache_path,
-            use_cache = use_cache,
-            show_feature_distribution = show_feature_distribution
+            stride=stride,
+            cache_path=cache_path,
+            use_cache=use_cache,
+            show_feature_distribution=show_feature_distribution,
+            materialize_windows=use_cache,
         )
-        
-        # Check whether any valid windows were generated (data too short or discontinuous windows may be dropped)
-        if len(ds) == 0:
-            self.logger.warning("No valid windows generated after continuity check!")
-            df_empty = df.copy()
-            for c in ['pred', 'pred_prob', 'prob_short', 'prob_neutral', 'prob_long', 'net_score']:
-                df_empty[c] = np.nan
-            return df_empty, {}
+        frame, stats, _ = self.predict_with_ds(
+            ds, df, is_live=is_live, batch_size=batch_size,
+            diff_thresh=diff_thresh, min_thresh=min_thresh,
+        )
+        return frame, stats
 
-        self.logger.info(f"Dataset created. Valid windows: {len(ds)}")
-        dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
-
-        # 2. Inference loop (logits -> probabilities)
-        probs_list = []
-        with torch.no_grad():
-            for xb, _, _ in dl:
-                xb = xb.to(self.device)
-                _, fused_probs = self.model(xb)
-                
-                # Convert to numpy for downstream processing
-                probs_list.append(fused_probs.cpu().numpy())
-
-        # Concatenate all batches
-        probs_all = np.concatenate(probs_list)
-        p_short = probs_all[:, 0]    # Down probability
-        p_neutral = probs_all[:, 1]  # Neutral/range probability
-        p_long = probs_all[:, 2]     # Up probability
-        net_score = p_long - p_short # Net score
-
-        # 3. Final signal logic
-        if diff_thresh is not None:
-            final_pred = np.full(len(probs_all), int(Signal.NEUTRAL))
-            final_conf = np.zeros(len(probs_all))
-            
-            # Long logic
-            mask_long = (net_score > diff_thresh) & (p_long > min_thresh)
-            final_pred[mask_long] = int(Signal.POSITIVE )
-            final_conf[mask_long] = net_score[mask_long]
-            
-            # Short logic
-            mask_short = (net_score < -diff_thresh) & (p_short > min_thresh)
-            final_pred[mask_short] = int(Signal.NEGATIVE)
-            final_conf[mask_short] = -net_score[mask_short]
-        else:
-            final_pred = probs_all.argmax(axis=1)
-            final_conf = probs_all.max(axis=1)
-
-        # 4. Core fix: precise alignment and backfill
-        # Create a copy and initialize columns with NaN so discontinuity "gaps" are preserved for position management
-        df_out = df.copy()
-        cols_to_init = ['pred', 'pred_prob', 'prob_short', 'prob_neutral', 'prob_long', 'net_score']
-        for c in cols_to_init:
-            df_out[c] = np.nan
-        
-        if not is_live:
-            # === Backtest mode: pin signals to the correct original timestamps using ds.indices ===
-            if ds.indices is not None:
-                # Ensure index and prediction lengths align
-                valid_len = min(len(ds.indices), len(final_pred))
-                active_indices = ds.indices[:valid_len]
-                
-                df_out.loc[active_indices, 'pred'] = final_pred[:valid_len]
-                df_out.loc[active_indices, 'pred_prob'] = final_conf[:valid_len]
-                df_out.loc[active_indices, 'prob_short'] = p_short[:valid_len]
-                df_out.loc[active_indices, 'prob_neutral'] = p_neutral[:valid_len]
-                df_out.loc[active_indices, 'prob_long'] = p_long[:valid_len]
-                df_out.loc[active_indices, 'net_score'] = net_score[:valid_len]
-        else:
-            # === Live mode: only fill the latest bar ===
-            if len(final_pred) > 0:
-                last_idx = df.index[-1]
-                df_out.at[last_idx, 'pred'] = final_pred[-1]
-                df_out.at[last_idx, 'pred_prob'] = final_conf[-1]
-                df_out.at[last_idx, 'net_score'] = net_score[-1]
-
-        # 5. Compute evaluation metrics (only when not live and label column exists)
-        stats = {}
-        if not is_live and self.label_col in df_out.columns:
-            # Only evaluate rows that have both predictions and labels
-            df_valid = df_out.dropna(subset=['pred', self.label_col])
-            if not df_valid.empty:
-                y_true = df_valid[self.label_col].values.astype(int)
-                y_pred = df_valid['pred'].values.astype(int)
-                stats = self.evaluate_performance(y_true, y_pred)
-                self._log_performance_summary(stats)
-        stats['feature_config'] = self.raw_config
-        stats['feature_cols']   = self.feature_cols
-        self.logger.info(f"Inference complete. Valid signals: {len(final_pred)}")
-        return df_out, stats
-    
-    def predict_with_ds(self, ds, df, is_live=True, batch_size=512, diff_thresh=None, min_thresh=0.3):
+    def predict_with_ds(self, ds, df, is_live=True, batch_size=512, diff_thresh=None,
+                        min_thresh=0.3, evaluate_sub_models=False):
+        """Return aligned predictions, fused metrics and optional sub-model metrics."""
         self.logger.info(f"Starting inference pipeline (Mode={'Live' if is_live else 'Backtest'}, diff_thresh={diff_thresh})...")
         self._validate_inference_dataset(ds)
         # Check whether any valid windows were generated (may be dropped if too short or discontinuous)
         if len(ds) == 0:
             self.logger.warning("No valid windows generated after continuity check!")
             df_empty = df.copy()
-            for c in ['pred', 'pred_prob', 'prob_short', 'prob_neutral', 'prob_long', 'net_score']:
+            for c in ['pred', 'pred_prob', 'prob_short', 'prob_neutral', 'prob_long', 'net_score', 'regression_score']:
                 df_empty[c] = np.nan
-            return df_empty, {}
+            return df_empty, {}, {}
 
         self.logger.info(f"Dataset created. Valid windows: {len(ds)}")
-        dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
         # 2. Inference loop (logits -> probabilities)
+        is_regression = self.task_type == TrainTask.REGRESSION
+        if is_regression and diff_thresh is not None:
+            raise ValueError("diff_thresh is a probability threshold and is not supported for regression scores")
         probs_list = []
+        collected = {name: ([], []) for name in self.loaded_sub_models} if evaluate_sub_models else {}
+        self.model.eval()
         with torch.no_grad():
-            for xb, _, _ in dl:
+            for xb, labels, returns in self._inference_batches(ds, batch_size):
                 xb = xb.to(self.device)
-                _, fused_probs = self.model(xb)
-                
-                # Convert to numpy for downstream processing
-                probs_list.append(fused_probs.cpu().numpy())
+                if is_regression:
+                    probs_list.append(self.model(xb).reshape(-1).cpu().numpy())
+                else:
+                    if collected:
+                        _, fused_probs, outputs = self.model.forward_with_submodel_logits(xb)
+                        self._collect_sub_model_batch(outputs, labels, returns, collected)
+                    else:
+                        _, fused_probs = self.model(xb)
+                    probs_list.append(fused_probs.cpu().numpy())
 
         # Concatenate all batches
         probs_all = np.concatenate(probs_list)
-        p_short = probs_all[:, 0]    # Down probability
-        p_neutral = probs_all[:, 1]  # Neutral/range probability
-        p_long = probs_all[:, 2]     # Up probability
-        net_score = p_long - p_short # Net score
-
-        # 3. Final signal logic
-        if diff_thresh is not None:
-            final_pred = np.full(len(probs_all), int(Signal.NEUTRAL))
-            final_conf = np.zeros(len(probs_all))
-            
-            # Long logic
-            mask_long = (net_score > diff_thresh) & (p_long > min_thresh)
-            final_pred[mask_long] = int(Signal.POSITIVE )
-            final_conf[mask_long] = net_score[mask_long]
-            
-            # Short logic
-            mask_short = (net_score < -diff_thresh) & (p_short > min_thresh)
-            final_pred[mask_short] = int(Signal.NEGATIVE)
-            final_conf[mask_short] = -net_score[mask_short]
+        regression_scores = probs_all.reshape(-1) if is_regression else None
+        if is_regression:
+            final_pred = _decode_regression_scores(regression_scores)
+            final_conf = np.full(len(final_pred), np.nan)
+            p_short = p_neutral = p_long = np.full(len(final_pred), np.nan)
+            net_score = regression_scores
         else:
-            final_pred = probs_all.argmax(axis=1)
-            final_conf = probs_all.max(axis=1)
+            p_short = probs_all[:, 0]
+            p_neutral = probs_all[:, 1]
+            p_long = probs_all[:, 2]
+            net_score = p_long - p_short
+
+            # 3. Final signal logic
+            if diff_thresh is not None:
+                final_pred = np.full(len(probs_all), int(Signal.NEUTRAL))
+                final_conf = np.zeros(len(probs_all))
+
+                mask_long = (net_score > diff_thresh) & (p_long > min_thresh)
+                final_pred[mask_long] = int(Signal.POSITIVE)
+                final_conf[mask_long] = net_score[mask_long]
+                mask_short = (net_score < -diff_thresh) & (p_short > min_thresh)
+                final_pred[mask_short] = int(Signal.NEGATIVE)
+                final_conf[mask_short] = -net_score[mask_short]
+            else:
+                final_pred = _decode_class_indices(probs_all.argmax(axis=1))
+                final_conf = probs_all.max(axis=1)
 
         # 4. Core fix: precise alignment and backfill
         # Create a copy and initialize columns with NaN so discontinuity "gaps" are preserved for position management
         df_out = df.copy()
-        cols_to_init = ['pred', 'pred_prob', 'prob_short', 'prob_neutral', 'prob_long', 'net_score']
+        cols_to_init = ['pred', 'pred_prob', 'prob_short', 'prob_neutral', 'prob_long', 'net_score', 'regression_score']
         for c in cols_to_init:
             df_out[c] = np.nan
         
@@ -450,6 +381,8 @@ class ModelHandler(MetaConfig):
                 df_out.loc[active_indices, 'prob_neutral'] = p_neutral[:valid_len]
                 df_out.loc[active_indices, 'prob_long'] = p_long[:valid_len]
                 df_out.loc[active_indices, 'net_score'] = net_score[:valid_len]
+                if is_regression:
+                    df_out.loc[active_indices, 'regression_score'] = regression_scores[:valid_len]
         else:
             # === Live mode: only fill the latest bar ===
             if len(final_pred) > 0:
@@ -457,12 +390,14 @@ class ModelHandler(MetaConfig):
                 df_out.at[last_idx, 'pred'] = final_pred[-1]
                 df_out.at[last_idx, 'pred_prob'] = final_conf[-1]
                 df_out.at[last_idx, 'net_score'] = net_score[-1]
+                if is_regression:
+                    df_out.at[last_idx, 'regression_score'] = regression_scores[-1]
 
         # 5. Compute evaluation metrics (only when not live and label column exists)
         stats = {}
         if not is_live and self.label_col in df_out.columns:
             # Only evaluate rows that have both predictions and labels
-            df_valid = df_out.dropna(subset=['pred', self.label_col])
+            df_valid = df_out[['pred', self.label_col]].dropna()
             if not df_valid.empty:
                 y_true = df_valid[self.label_col].values.astype(int)
                 y_pred = df_valid['pred'].values.astype(int)
@@ -473,7 +408,7 @@ class ModelHandler(MetaConfig):
         stats['feature_config'] = self.raw_config
         stats['feature_cols']   = self.feature_cols
         self.logger.info(f"Inference complete. Valid signals: {len(final_pred)}")
-        return df_out, stats
+        return df_out, stats, self._sub_model_metrics(collected)
 
     def _validate_inference_dataset(self, ds) -> None:
         """Require exact feature identity/order before accepting a prebuilt dataset."""
@@ -494,19 +429,19 @@ class ModelHandler(MetaConfig):
                 f"expected_order={expected_features}, actual_order={actual_features}"
             )
 
-        inputs = getattr(ds, "X", None)
-        if inputs is None or inputs.ndim != 3:
+        if isinstance(ds, TimeSeriesWindowDataset):
+            shape = ds.input_shape
+        else:
+            inputs = getattr(ds, "X", None)
             shape = None if inputs is None else tuple(inputs.shape)
+        if shape is None or len(shape) != 3:
+            raise ValueError(f"Inference dataset must have shape [N, T, F], got {shape}")
+        if shape[1] != self.seq_len or shape[2] != len(expected_features):
             raise ValueError(
-                f"Inference dataset must expose X with shape [N, T, F], got {shape}"
+                "Inference dataset shape is incompatible with model metadata: "
+                f"expected [N, {self.seq_len}, {len(expected_features)}], got {shape}"
             )
-        if inputs.shape[1] != self.seq_len or inputs.shape[2] != len(expected_features):
-            raise ValueError(
-                "Inference dataset tensor shape is incompatible with model metadata: "
-                f"expected [N, {self.seq_len}, {len(expected_features)}], "
-                f"got {tuple(inputs.shape)}"
-            )
-    
+
     def scan_thresholds(self, df, kline_interval_ms, thresholds=[0.05, 0.1, 0.15, 0.2, 0.25, 0.3], batch_size=1024):
         """
         Scan multiple thresholds in one run to compare model performance.
@@ -517,25 +452,25 @@ class ModelHandler(MetaConfig):
         3. Compute per-threshold signal density, precision, and recall.
         """
         self.logger.info(f"🔍 Scanning thresholds: {thresholds}...")
+        if self.task_type == TrainTask.REGRESSION:
+            raise ValueError("Probability threshold scans are not defined for regression outputs")
         
         # 1. Prepare data & run inference (reuse dataset logic)
         ds = TimeSeriesWindowDataset(
             df=df, 
             kline_interval_ms = kline_interval_ms,
-            feature_config_list = self.feature_group_list,
             feature_cols=self.feature_cols, 
             label_col=self.label_col,
             seq_len=self.seq_len,
             is_live = False,
+            materialize_windows=False,
         )
-        # shuffle=False to keep order consistent
-        dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
         # 2. Get raw probabilities
         probs_list = []
         self.model.eval()
         with torch.no_grad():
-            for xb, _ in dl:
+            for xb, _, _ in self._inference_batches(ds, batch_size):
                 xb = xb.to(self.device)
                 # Common inference interface returns a [B, 3] probability distribution.
                 _, fused_probs = self.model(xb)
@@ -550,7 +485,7 @@ class ModelHandler(MetaConfig):
         
         # 3. Align true labels (y_true)
         # TimeSeriesWindowDataset outputs start from seq_len-1
-        valid_idx = df.index[self.seq_len-1:]
+        valid_idx = ds.indices
         
         # Truncate to avoid length mismatch
         min_len = min(len(valid_idx), len(probs_all))
@@ -565,7 +500,7 @@ class ModelHandler(MetaConfig):
         y_true = df.loc[valid_idx, self.label_col].values.astype(int)
 
         # 4. Precompute net score
-        # Assume 0:Short, 1:Neutral, 2:Long
+        # Probability columns are ordered Short, Neutral, Long.
         p_short = probs_all[:, 0]
         p_long = probs_all[:, 2]
         net_score = p_long - p_short  # range [-1, 1]

@@ -206,7 +206,7 @@ def _resolve_device(device_name):
 
 
 _MODEL_TIME_REGION_CACHE: dict[tuple, dict] = {}
-_PREDICTION_CACHE_SCHEMA = 2
+_PREDICTION_CACHE_SCHEMA = 3
 _PREDICTION_COLUMNS = (
     "pred",
     "pred_prob",
@@ -467,18 +467,15 @@ def _infer_prediction_payload(
         label_col=handler.label_col,
         seq_len=handler.seq_len,
         is_live=False,
+        materialize_windows=False,
     )
-    predicted_frame, model_stats = handler.predict_with_ds(
+    predicted_frame, model_stats, sub_model_stats = handler.predict_with_ds(
         dataset,
         frame,
         is_live=False,
         batch_size=inference_batch_size,
         diff_thresh=None,
-    )
-    sub_model_stats = handler.evaluate_sub_models(
-        frame,
-        kline_interval_ms=interval_ms,
-        batch_size=inference_batch_size,
+        evaluate_sub_models=True,
     )
     first_valid_idx = predicted_frame["pred"].first_valid_index()
     if first_valid_idx is None:
@@ -722,9 +719,9 @@ def main(logger: logging.Logger, config: RunnerConfig, period: str):
     candle_columns.extend(name for name in ("pred", "label") if name in frame.columns)
     candles = frame[candle_columns].copy()
     if "pred" in candles:
-        candles["pred"] = candles["pred"].fillna(0.0)
+        candles["pred"] = candles["pred"].fillna(float(Signal.INVALID))
     if "label" in candles:
-        candles["label"] = candles["label"].fillna(-1).astype(int)
+        candles["label"] = candles["label"].fillna(int(Signal.INVALID)).astype(int)
     candles.rename(columns={"open_time_date_utc": "time"}, inplace=True)
     candles["time"] = candles["time"].apply(lambda dt: int(dt.timestamp()))
 
@@ -739,13 +736,20 @@ def main(logger: logging.Logger, config: RunnerConfig, period: str):
 
 
 def _load_train_config(train_output_dir: str) -> train_config.TrainConfig:
-    """Restore the exact TrainConfig persisted with the model artifact."""
+    """Restore the exact TrainConfig persisted with the model artifact.
+
+    Composite/fusion artifacts (e.g. TRIGGER_DIRECTION) are assembled from
+    existing single-model runs and carry no train_config.json of their own;
+    fall back to the first sub-model dir referenced by task_description.json.
+    """
 
     artifact_dir = train_output_dir
     if not os.path.isabs(artifact_dir):
         artifact_dir = os.path.join(PROJECT_DIR, artifact_dir)
     config_path = os.path.join(artifact_dir, "train_config.json")
     if not os.path.isfile(config_path):
+        config_path = _fusion_train_config_path(artifact_dir)
+    if config_path is None:
         raise FileNotFoundError(
             f"train_config.json not found in training output: {artifact_dir}",
         )
@@ -754,6 +758,24 @@ def _load_train_config(train_output_dir: str) -> train_config.TrainConfig:
     if not isinstance(payload, dict):
         raise ValueError(f"train_config.json must contain an object: {config_path}")
     return config_from_dict_train(payload)
+
+
+def _fusion_train_config_path(artifact_dir: str) -> Optional[str]:
+    """Locate a train_config.json inside a fusion artifact's sub-model dirs."""
+    task_desc_path = os.path.join(artifact_dir, model_loader.TASK_DESCRIPTION_FILENAME)
+    if not os.path.isfile(task_desc_path):
+        return None
+    with open(task_desc_path, "r", encoding="utf-8") as task_file:
+        task_desc = json.load(task_file)
+    models = task_desc.get("models", {})
+    if "main" in models:
+        # Single-run layout; train_config.json is genuinely missing.
+        return None
+    for role_dir in models.values():
+        candidate = os.path.join(artifact_dir, role_dir, "train_config.json")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def build_daily_df(daily_stats):
@@ -1354,13 +1376,12 @@ def generate_backtest_report(
 
 
 if __name__ == "__main__":
-    train_output_dir = os.path.join(common.TRAIN_OUT_DIR, train_config.SingleModelConfig.train_task)
+    train_output_dir = os.path.join(common.TRAIN_OUT_DIR, train_config.TrainTask.TRIGGER_DIRECTION)
     start_time = time.time()
     pre_para: BaseDefine = common.load_pre_params_from_dir(train_output_dir)
     exp_dir = common.create_experiment_dir(os.path.join(common.PERSISTENCE_DIR, "simulation"), pre_para.symbol, pre_para.interval)
     logger, _ = common.setup_session_logger(log_file_path=os.path.join(exp_dir, "experiment.log"), console_level=logging.INFO, file_level=logging.INFO)
-    strategy_config = BbmStrategyConfig(fixed_hold_bars=int(pre_para.predict_num))
-    # strategy_config = MlStrategyConfig(fixed_hold_bars =pre_para.predict_num )
+    strategy_config = BbmStrategyConfig(fixed_hold_bars=60*24)#int(pre_para.predict_num))
     broker_config = BrokerConfig()
     runner_config = RunnerConfig(
         strategy_config=strategy_config,
