@@ -296,11 +296,12 @@ class FeatureMAStructure(FeatureBase):
     - BAR_S_L   = log(MA_bar_short / MA_bar_long)
     - BAR_M_L   = log(MA_bar_mid   / MA_bar_long)
     - DAY_S_L   = log(MA_day_short / MA_day_long)
-    - WEEK_M_L  = log(MA_week_mid  / MA_week_long)
+    - WEEK_M_L  = log(MA_week_mid  / MA_week_long), when include_week=True
 
     Optional:
     - Δ_BAR_S_L
     - Δ_DAY_S_L
+    - Weekly features, controlled by include_week
     """
 
     def __init__(self, **kwargs):
@@ -310,6 +311,7 @@ class FeatureMAStructure(FeatureBase):
         self.bar_windows = kwargs.get("bar_windows", (7, 21, 63))  # short, mid, long
         self.day_windows = kwargs.get("day_windows", (5, 20))  # short, long
         self.week_windows = kwargs.get("week_windows", (7, 25))  # mid, long
+        self.include_week = kwargs.get("include_week", True)
         self.slope_window = kwargs.get("slope_window", 5)
 
         self.add_delta = kwargs.get("add_delta", False)
@@ -321,9 +323,9 @@ class FeatureMAStructure(FeatureBase):
             "MA_BAR_S_L",
             "MA_BAR_M_L",
             "MA_DAY_S_L",
-            "MA_WEEK_M_L",
-            "MA_WEEK_L_SLOPE",
         ]
+        if self.include_week:
+            self.features.extend(["MA_WEEK_M_L", "MA_WEEK_L_SLOPE"])
 
         if self.add_delta:
             self.features += [
@@ -371,11 +373,12 @@ class FeatureMAStructure(FeatureBase):
         ma_dl = self._ma(close, d_l * kpd)
         res["MA_DAY_S_L"] = np.log(ma_ds / ma_dl)
 
-        w_m, w_l = self.week_windows
-        ma_wm = self._ma(close, w_m * kpw)
-        ma_wl = self._ma(close, w_l * kpw)
-        res["MA_WEEK_M_L"] = np.log(ma_wm / ma_wl)
-        res["MA_WEEK_L_SLOPE"] = np.log(ma_wl / ma_wl.shift(self.slope_window))
+        if self.include_week:
+            w_m, w_l = self.week_windows
+            ma_wm = self._ma(close, w_m * kpw)
+            ma_wl = self._ma(close, w_l * kpw)
+            res["MA_WEEK_M_L"] = np.log(ma_wm / ma_wl)
+            res["MA_WEEK_L_SLOPE"] = np.log(ma_wl / ma_wl.shift(self.slope_window))
 
         # === Δ ===
         if self.add_delta:
@@ -408,14 +411,13 @@ class FeatureMAStructure(FeatureBase):
     # Minimal history requirement
     # ------------------------------------------------------------------
     def _min_history_request(self, kline_interval_ms: int) -> int:
-        # Slope requires looking back slope_window steps
-        kpd, kpw = self._calc_klines_per_day_week(self.kline_interval_ms)
-        max_week = max(self.week_windows) * kpw
-
-        base = max(max(self.bar_windows), max(self.day_windows) * kpd, max_week)
-
-        # Add extra buffer for slope
-        base += self.slope_window
+        kpd, kpw = self._calc_klines_per_day_week(kline_interval_ms)
+        history_windows = [max(self.bar_windows), max(self.day_windows) * kpd]
+        if self.include_week:
+            history_windows.append(max(self.week_windows) * kpw)
+        base = max(history_windows)
+        if self.include_week:
+            base += self.slope_window
 
         if self.method == "ema":
             base = int(base * 3.5)
@@ -1384,6 +1386,9 @@ class FeatureOrigin(FeatureBase):  # add taker_buy_base_volume/volume and taker_
         return 1
 
 
+_SMART_MONEY_CONTEXT_BARS = 5
+
+
 @njit(cache=True)
 def _smart_money_window_ratio(start, end, scores, volumes, prices, secondary=None, secondary_descending=True):
     """Return smart-trade VWAP / all-trade VWAP for one trailing window."""
@@ -1468,14 +1473,14 @@ def _smart_money_rolling(close, volume, price, window):
 
     impact = np.full(size, np.nan)
     volume_decay = np.full(size, np.nan)
-    for i in range(5, size - 5):
+    for i in range(_SMART_MONEY_CONTEXT_BARS, size - _SMART_MONEY_CONTEXT_BARS):
         if np.isnan(smartness[i]):
             continue
         before_return = 0.0
         after_return = 0.0
         before_volume = 0.0
         after_volume = 0.0
-        for offset in range(1, 6):
+        for offset in range(1, _SMART_MONEY_CONTEXT_BARS + 1):
             before_return += returns[i - offset]
             after_return += returns[i + offset]
             before_volume += volume[i - offset]
@@ -1488,13 +1493,17 @@ def _smart_money_rolling(close, volume, price, window):
         start = end - window + 1
         result[end, 0] = _smart_money_window_ratio(start, end, smartness, volume, price)
 
-        # Secondary features use only minutes with a complete five-bar context
-        # on each side, so no data beyond the current rolling-window end enters.
+        # Keep candidates inside the configured window with a complete
+        # t-5..t+5 context observable by this output time.
+        eligible_start = max(start, _SMART_MONEY_CONTEXT_BARS)
+        eligible_end = end - _SMART_MONEY_CONTEXT_BARS
+        if eligible_end < eligible_start:
+            continue
         result[end, 1] = _smart_money_window_ratio(
-            start, end, smartness, volume, price, impact, True
+            eligible_start, eligible_end, smartness, volume, price, impact, True
         )
         result[end, 2] = _smart_money_window_ratio(
-            start, end, smartness, volume, price, volume_decay, False
+            eligible_start, eligible_end, smartness, volume, price, volume_decay, False
         )
     return result
 
@@ -1529,13 +1538,9 @@ class FeatureSmartMoneyMinute(FeatureBase):
         return pd.DataFrame(res, index=df.index)
 
     def normalize(self, X: np.ndarray, feature_cols: list[str], factory):
-        # Standardize each factor independently. The enhanced factor is already
-        # composed from raw Smart_PriceImpact and Smart_VolDecay values in generate().
-        for feature in self.features:
-            self._normalize_z_score(X, feature_cols, [feature], feature_base=feature, factory=factory)
-
+        pass #no need for smart money
     def _min_history_request(self, kline_interval_ms: int = None) -> int:
-        return max(self.windows)
+        return max(self.windows) + 2 * _SMART_MONEY_CONTEXT_BARS
 
 
 # MA / momentum / structure
@@ -1546,6 +1551,7 @@ FCMA = FeatureContainer(
     bar_windows=(7, 21, 63),
     day_windows=(5, 20),
     week_windows=(7, 25),
+    include_week=False,
     add_delta=True,
     method="sma",
     strict=True,

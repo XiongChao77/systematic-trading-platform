@@ -77,12 +77,23 @@ class BaseDefine(MarketDataSourceConfig):
     vol_multiplier_short: float = 1.7
     stop_multiplier_rate_short: Optional[float] = None
     tbm_take_profit_price: Optional[Literal["close", "high_low"]] = None
+    tbm_intrabar_interval: Optional[str] = None  # Auto-select 1m for TBM intervals above 1m.
     min_expected_move_pct: float = 0.01
     version: float = 0.1
 
     def __post_init__(self):
         if self.label_type == "PURE_BINARY":
             raise ValueError("PURE_BINARY requires PureBinaryDefine")
+        if self.tbm_intrabar_interval is not None and self.label_type != "TBM":
+            raise ValueError("tbm_intrabar_interval is only supported for TBM labels")
+
+    def resolve_tbm_intrabar_interval(self) -> Optional[str]:
+        """Use minute paths by default for every higher-interval TBM task."""
+        if self.label_type != "TBM":
+            return None
+        if self.tbm_intrabar_interval is not None:
+            return self.tbm_intrabar_interval
+        return "1m" if get_interval_ms(self.interval) > 60000 else None
 
 
 @dataclass
@@ -362,14 +373,14 @@ def attch_open_time_sn(para: MarketDataSourceConfig, df):
     return df
 
 
-def attach_label(df, para=BaseDefine, label_col="label"):
+def attach_label(df, para=BaseDefine, label_col="label", intrabar_df=None):
     df = attch_open_time_sn(para, df)
     if isinstance(para, PureBinaryDefine):
         return attach_pure_binary_label(df, para=para, label_col=label_col)
     if para.label_type == "FTHL":
         df = attach_fthl_label(df, para=para, label_col=label_col)
     elif para.label_type == "TBM":
-        df = attach_triple_barrier_label(df, para=para, label_col=label_col)
+        df = attach_triple_barrier_label(df, para=para, label_col=label_col, intrabar_df=intrabar_df)
     elif para.label_type == "TBM_TREND":
         df = attach_triple_barrier_trend_label(df, para=para, label_col=label_col)
     elif para.label_type == "BBM":
@@ -630,8 +641,13 @@ def fast_triple_barrier_kernel(
     thresholds,
     window,
     take_profit_use_high_low=False,
+    anchor_close=None,
+    window_starts=None,
+    valid_windows=None,
+    take_profit_mask=None,
 ):
-    n = len(close)
+    """Scan barriers from main candles or explicitly aligned finer-candle paths."""
+    n = len(thresholds)
     labels = np.full(n, _SIGNAL_NEUTRAL, dtype=np.int32)
     reach_times = np.full(n, window, dtype=np.int32)
     long_tp_times = np.full(n, -1, dtype=np.int32)
@@ -644,8 +660,19 @@ def fast_triple_barrier_kernel(
     s_tp_p = thresholds[:, 2]
     s_sl_p = thresholds[:, 3]
 
-    for i in range(n - window):
-        p0 = close[i]
+    for i in range(n):
+        if window_starts is None:
+            if i + window >= n:
+                continue
+            start = i + 1
+            p0 = close[i]
+        else:
+            if not valid_windows[i]:
+                labels[i] = _SIGNAL_INVALID
+                reach_times[i] = -1
+                continue
+            start = window_starts[i]
+            p0 = anchor_close[i]
 
         # Independent price barriers
         l_tp = p0 * (1 + l_tp_p[i])
@@ -662,13 +689,14 @@ def fast_triple_barrier_kernel(
         s_active = True
 
         for j in range(1, window + 1):
-            curr_idx = i + j
+            curr_idx = start + j - 1
             h, l, c = high[curr_idx], low[curr_idx], close[curr_idx]
+            tp_allowed = take_profit_mask is None or take_profit_mask[curr_idx]
 
             # --- long path ---
             if l_active:
                 long_tp_price = h if take_profit_use_high_low else c
-                long_tp_hit = long_tp_price >= l_tp
+                long_tp_hit = tp_allowed and long_tp_price >= l_tp
                 long_sl_hit = l <= l_sl
                 if long_tp_hit and long_sl_hit:
                     l_active = False
@@ -685,7 +713,7 @@ def fast_triple_barrier_kernel(
             # --- short path ---
             if s_active:
                 short_tp_price = l if take_profit_use_high_low else c
-                short_tp_hit = short_tp_price <= s_tp
+                short_tp_hit = tp_allowed and short_tp_price <= s_tp
                 short_sl_hit = h >= s_sl
                 if short_tp_hit and short_sl_hit:
                     s_active = False
@@ -730,7 +758,8 @@ def fast_triple_barrier_kernel(
     )
 
 
-def attach_triple_barrier_label(df, para=BaseDefine, label_col="label"):
+def attach_triple_barrier_label(df, para=BaseDefine, label_col="label", intrabar_df=None):
+    """Label main candles; finer scans report distances in fractional main bars."""
     # 1. Base thresholds
     df = calculate_thresholds(df, para)
 
@@ -744,6 +773,54 @@ def attach_triple_barrier_label(df, para=BaseDefine, label_col="label"):
     ).astype(np.float64)
 
     window = int(para.predict_num)
+    if window <= 0:
+        raise ValueError("predict_num must be positive for TBM labels")
+    use_high_low = _tbm_take_profit_uses_high_low(para)
+    interval_ms = get_interval_ms(para.interval)
+    intrabar_args = {}
+    scan_window = window
+    ratio = 1
+    intrabar_interval = para.resolve_tbm_intrabar_interval()
+    if intrabar_interval is not None:
+        if intrabar_df is None:
+            raise ValueError("TBM intrabar labeling requires the configured lower-interval data")
+        fine_interval_ms = get_interval_ms(intrabar_interval)
+        if fine_interval_ms >= interval_ms or interval_ms % fine_interval_ms:
+            raise ValueError("TBM intrabar interval must be a smaller exact divisor of the main interval")
+        validate_kline_source(intrabar_df, fine_interval_ms, source="TBM intrabar data")
+        fine_times = intrabar_df["open_time_ms_utc"].to_numpy(dtype=np.int64)
+        anchor_times = df["open_time_ms_utc"].to_numpy(dtype=np.int64)
+        if np.any(np.diff(anchor_times) <= 0):
+            raise ValueError("TBM anchor timestamps must be strictly increasing")
+        # The anchor price is known only when its main candle has closed.
+        start_times = anchor_times + interval_ms
+        end_times = start_times + window * interval_ms
+        starts = np.searchsorted(fine_times, start_times)
+        ends = np.searchsorted(fine_times, end_times)
+        ratio = interval_ms // fine_interval_ms
+        scan_window = window * ratio
+        valid = (ends - starts == scan_window) & (starts < len(fine_times))
+        safe_starts = np.minimum(starts, len(fine_times) - 1)
+        valid &= fine_times[safe_starts] == start_times
+        intrabar_args = {
+            "anchor_close": close,
+            "window_starts": starts,
+            "valid_windows": valid,
+        }
+        if not use_high_low:
+            # Close-based TP remains a main-candle-close rule; SL is checked
+            # at every fine candle, including those before the main close.
+            intrabar_args["take_profit_mask"] = (
+                np.isin(fine_times + fine_interval_ms, anchor_times + interval_ms)
+            )
+        close = intrabar_df["close"].to_numpy(dtype=np.float64)
+        high = intrabar_df["high"].to_numpy(dtype=np.float64)
+        low = intrabar_df["low"].to_numpy(dtype=np.float64)
+        logging.getLogger(__name__).info(
+            "TBM intrabar scan | main_interval=%s | scan_interval=%s | "
+            "window=%d main bars | incomplete_intrabar_windows=%d",
+            para.interval, intrabar_interval, window, int((~valid).sum()),
+        )
 
     # 3. Call the numba accelerated kernel
     (
@@ -758,9 +835,18 @@ def attach_triple_barrier_label(df, para=BaseDefine, label_col="label"):
         high,
         low,
         thresholds,
-        window,
-        _tbm_take_profit_uses_high_low(para),
+        scan_window,
+        use_high_low,
+        **intrabar_args,
     )
+
+    if ratio != 1:
+        # Keep existing distance columns in main-bar units, with fractional
+        # bars retaining the finer scan resolution. Preserve the -1 sentinel.
+        reach_times, long_tp_times, long_sl_times, short_tp_times, short_sl_times = (
+            np.where(values >= 0, values / ratio, -1.0)
+            for values in (reach_times, long_tp_times, long_sl_times, short_tp_times, short_sl_times)
+        )
 
     # 4. Write the results back
     df[label_col] = labels
@@ -772,7 +858,6 @@ def attach_triple_barrier_label(df, para=BaseDefine, label_col="label"):
 
     # 5. Physical time check (masking)
     # Makes sure the timestamp predict_num steps later lines up with physical time
-    interval_ms = get_interval_ms(para.interval)
     time_values = df["open_time_ms_utc"].values
     target_times = time_values + (window * interval_ms)
     target_indices = np.searchsorted(time_values, target_times, side="left")
@@ -1354,7 +1439,7 @@ def log_tbm_reach_time_percentiles(df, logger=None):
     emit(f"{'Barrier':<10} | {'Count':>8} | {header}")
 
     for name, col in TBM_REACH_TIME_COLUMNS.items():
-        vals = df[col].to_numpy(dtype=np.int32)
+        vals = df[col].to_numpy(dtype=np.float64)
         valid_labels = df["label"].to_numpy() != Signal.INVALID
         vals = vals[(vals >= 0) & valid_labels]
         if len(vals) == 0:

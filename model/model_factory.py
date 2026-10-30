@@ -56,7 +56,7 @@ class ModelFactory:
         # ---- dual_head (fixed 2+2 trigger/direction heads) ----
         TCN1D_V1,
         Mamba1D_V1,
-        LSTM1D_V3,  #good
+        LSTM1D_V3,  #goos
         ConvLSTM1D_V3,
         CNN1D_V1,
         Transformer1D_V3,

@@ -64,7 +64,7 @@ def complete_experiment_detail(
     dataset_id: str,
     record_id: str,
 ) -> dict[str, Any]:
-    """Return one continuous Train/Valid/Test/OOD strategy payload."""
+    """Return one continuous Train/Valid/Test/OOS strategy payload."""
 
     try:
         return service.load_experiment_backtest(dataset_id, record_id, "all")

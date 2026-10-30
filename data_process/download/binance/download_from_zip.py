@@ -10,8 +10,8 @@ Main behavior:
     - Prefer existing ZIP files. For uncached ranges, prefer monthly ZIP files
       for complete months and daily ZIP files for partial months.
     - If a daily ZIP is absent, use its monthly archive as a fallback.
-    - If --start is not specified, query the Binance Vision S3 XML API and infer
-      the earliest available daily ZIP date for this market/symbol/interval.
+    - If --start is not specified, reuse the cached earliest data date for the
+      market/symbol, or query the Binance Vision S3 XML API when no date is cached.
       Explicit date ranges use local archives first without listing remote files.
     - If --end is not specified, default to the latest completed UTC day.
     - Treat local ZIP files as the cache. download_info.json is a human-readable
@@ -38,8 +38,13 @@ Output:
         download_info.json
         zips/<symbol>-<interval>-YYYY-MM-DD.zip
         monthly_zips/<symbol>-<interval>-YYYY-MM.zip
+    <out_dir>/earliest_dates.json stores earliest dates for all market/symbols.
 
     The validated CSV is moved to common.market_data_path(para).
+
+    For um/cm markets, monthly fundingRate ZIPs are also downloaded (once per
+    symbol, cached under <out_dir>/<market>/<symbol>/fundingRate/) and merged to
+    <market_data dir>/<symbol>_fundingRate.csv. Use --no-funding-rate to skip.
 """
 
 import argparse
@@ -72,7 +77,11 @@ from data_process import common
 
 BASE_URL = "https://data.binance.vision"
 S3_LIST_URL = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
+HTTP_TIMEOUT_SECONDS = 1
+HTTP_RETRIES = 3
+RETRY_DELAY_SECONDS = 1
 INFO_FILENAME = "download_info.json"
+EARLIEST_DATES_FILENAME = "earliest_dates.json"
 ZIP_DIRNAME = "zips"
 MONTHLY_ZIP_DIRNAME = "monthly_zips"
 
@@ -88,7 +97,7 @@ MARKET_ROOTS = {
     "cm": "data/futures/cm",
 }
 
-# Fallback only. Normally --start=None will infer earliest date from the S3 listing.
+# Fallback only when the S3 listing cannot provide an earliest date.
 FALLBACK_START = {
     "spot": date(2017, 8, 17),
     "um": date(2020, 1, 1),
@@ -189,6 +198,55 @@ def build_csv_path(output_dir: Path, symbol: str, interval: str) -> Path:
 
 def build_info_path(output_dir: Path) -> Path:
     return output_dir / INFO_FILENAME
+
+
+def build_earliest_dates_path(base_dir: Path) -> Path:
+    return base_dir / EARLIEST_DATES_FILENAME
+
+
+def load_earliest_dates(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        return {}
+    with path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    if not isinstance(payload, dict) or not isinstance(payload.get("earliest_dates"), dict):
+        raise ValueError(f"Invalid earliest-date file format: {path}")
+    earliest_dates = payload["earliest_dates"]
+    for key, value in earliest_dates.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError(f"Invalid earliest-date entry in {path}: {key!r}={value!r}")
+        parse_date(value)
+    return earliest_dates
+
+
+def record_earliest_date(
+    path: Path,
+    market: str,
+    symbol: str,
+    discovered_date: date,
+) -> date:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    earliest_dates = load_earliest_dates(path)
+    key = f"{market}:{symbol.upper()}"
+    existing_date = parse_date(earliest_dates.get(key))
+    earliest_date = min(existing_date, discovered_date) if existing_date else discovered_date
+    earliest_dates[key] = earliest_date.isoformat()
+
+    temp_path = path.with_suffix(path.suffix + ".temp")
+    with temp_path.open("w", encoding="utf-8") as file:
+        json.dump(
+            {
+                "schema_version": 1,
+                "earliest_dates": earliest_dates,
+                "last_updated_utc": utc_now_iso(),
+            },
+            file,
+            indent=2,
+            sort_keys=True,
+        )
+        file.write("\n")
+    os.replace(temp_path, path)
+    return earliest_date
 
 
 def write_download_info(info_path: Path, info: dict[str, Any]) -> None:
@@ -313,7 +371,21 @@ def list_s3_keys(session: requests.Session, prefix: str) -> list[str]:
         params = {"prefix": prefix, "max-keys": "1000"}
         if marker:
             params["marker"] = marker
-        response = session.get(S3_LIST_URL, params=params, timeout=30)
+        for attempt in range(HTTP_RETRIES + 1):
+            try:
+                response = session.get(
+                    S3_LIST_URL,
+                    params=params,
+                    timeout=HTTP_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                break
+            except requests.RequestException as exc:
+                if attempt == HTTP_RETRIES:
+                    raise RuntimeError(
+                        f"S3 listing failed after {HTTP_RETRIES} retries: {exc}"
+                    ) from exc
+                time.sleep(RETRY_DELAY_SECONDS)
         response.raise_for_status()
         root = ET.fromstring(response.content)
 
@@ -387,17 +459,26 @@ def resolve_start_end(
     interval: str,
     start_arg: Optional[str],
     end_arg: Optional[str],
-) -> tuple[date, date]:
+    cached_start: Optional[date] = None,
+) -> tuple[date, date, bool]:
     requested_start = parse_date(start_arg)
     requested_end = parse_date(end_arg) or (datetime.now(timezone.utc).date() - timedelta(days=1))
 
-    if requested_start is not None and requested_start > requested_end:
-        raise ValueError(
-            f"start must be <= end, got start={requested_start}, end={requested_end}"
-        )
-
-    if requested_start is not None:
-        return requested_start, requested_end
+    if cached_start is not None:
+        effective_end = requested_end
+        if cached_start > effective_end:
+            raise ValueError(
+                "No available data in requested date range: "
+                f"cached_start={cached_start}, requested_end={requested_end}"
+            )
+        if requested_start is not None and requested_start != cached_start:
+            print(
+                f"ℹ️ Ignoring --start={requested_start}; using recorded earliest "
+                f"date for {market}:{symbol}: {cached_start}"
+            )
+        else:
+            print(f"✅ Using cached earliest date for {market}:{symbol}: {cached_start}")
+        return cached_start, effective_end, True
 
     dates = infer_available_dates_from_listing(session, market, symbol, interval)
 
@@ -408,7 +489,7 @@ def resolve_start_end(
         if effective_start > effective_end:
             raise ValueError(
                 "No available ZIP files in requested date range: "
-                f"requested_start={dates[0]}, requested_end={requested_end}, "
+                f"earliest_available={dates[0]}, requested_end={requested_end}, "
                 f"source_start={dates[0]}, source_end={latest_available}"
             )
         if effective_end < requested_end:
@@ -416,13 +497,26 @@ def resolve_start_end(
                 "⚠️ Requested end date is later than data-source end; "
                 f"requested_end={requested_end}, using_end={effective_end}"
             )
-        print(f"✅ --start not specified. Using earliest available file date: {effective_start}")
-        return effective_start, effective_end
+        if requested_start is not None and requested_start != effective_start:
+            print(
+                f"ℹ️ Ignoring --start={requested_start}; using earliest listed "
+                f"date for {market}:{symbol}:{interval}: {effective_start}"
+            )
+        else:
+            print(f"✅ Using earliest available file date: {effective_start}")
+        return effective_start, effective_end, True
 
-    fallback = FALLBACK_START[market]
+    fallback = requested_start or FALLBACK_START[market]
     effective_start = fallback
-    print(f"⚠️ Failed to infer earliest date from listing. Falling back to {effective_start}.")
-    return effective_start, requested_end
+    print(
+        "⚠️ Failed to infer earliest date from listing. "
+        f"Using fallback start date {effective_start}."
+    )
+    if effective_start > requested_end:
+        raise ValueError(
+            f"start must be <= end, got start={effective_start}, end={requested_end}"
+        )
+    return effective_start, requested_end, False
 
 
 def read_kline_rows_from_zip(zip_bytes: bytes, source_name: str) -> list[list[str]]:
@@ -473,27 +567,20 @@ def read_kline_rows_from_zip(zip_bytes: bytes, source_name: str) -> list[list[st
 def download_zip_url(
     session: requests.Session,
     url: str,
-    *,
-    retries: int = 3,
-    sleep_s: float = 1.0,
 ) -> tuple[Optional[bytes], Optional[str]]:
     """Download and structurally validate one Binance Vision ZIP."""
-    for attempt in range(1, retries + 1):
+    for attempt in range(HTTP_RETRIES + 1):
         try:
-            response = session.get(url, timeout=30)
+            response = session.get(url, timeout=HTTP_TIMEOUT_SECONDS)
             if response.status_code == 404:
                 return None, "missing"
-            if response.status_code in (418, 429) or response.status_code >= 500:
-                if attempt < retries:
-                    time.sleep(sleep_s * attempt)
-                    continue
             response.raise_for_status()
             if not read_kline_rows_from_zip(response.content, url):
                 raise ValueError("Downloaded archive contains no candles")
             return response.content, None
         except Exception as exc:
-            if attempt < retries:
-                time.sleep(sleep_s * attempt)
+            if attempt < HTTP_RETRIES:
+                time.sleep(RETRY_DELAY_SECONDS)
                 continue
             return None, f"failed: {type(exc).__name__}: {exc}"
     return None, "failed: unknown error"
@@ -609,9 +696,21 @@ def download_symbol_interval(
     monthly_zip_dir = output_dir / MONTHLY_ZIP_DIRNAME
     out_path = build_csv_path(output_dir, symbol, interval)
     info_path = build_info_path(output_dir)
+    earliest_dates_path = build_earliest_dates_path(
+        Path(args.out_dir).expanduser().resolve()
+    )
+    cached_start = parse_date(
+        load_earliest_dates(earliest_dates_path).get(f"{market}:{symbol}")
+    )
 
-    start, end = resolve_start_end(
-        session, market, symbol, interval, args.start, args.end
+    start, end, earliest_date_confirmed = resolve_start_end(
+        session,
+        market,
+        symbol,
+        interval,
+        args.start,
+        args.end,
+        cached_start=cached_start,
     )
     if start > end:
         raise ValueError(f"start must be <= end, got start={start}, end={end}")
@@ -710,7 +809,7 @@ def download_symbol_interval(
         record_source(
             key, frequency=frequency, status="failed", path=path, url=url, error=error
         )
-        return None, error
+        raise RuntimeError(f"Failed to download source {url}: {error}")
 
     def load_monthly(month: date) -> tuple[Optional[list[list[str]]], Optional[str]]:
         return load_source(
@@ -889,6 +988,10 @@ def download_symbol_interval(
 
     if counters["failed"]:
         raise RuntimeError(f"Source download/read failures={counters['failed']}")
+    # Binance publishes daily archives with a delay, so when downloading up to
+    # the present, a missing final day is expected and ignored.
+    if end >= datetime.now(timezone.utc).date() - timedelta(days=1):
+        unresolved_dates = [day for day in unresolved_dates if day != end]
     if unresolved_dates:
         dates_text = ", ".join(day.isoformat() for day in unresolved_dates[:10])
         raise RuntimeError(
@@ -920,6 +1023,14 @@ def download_symbol_interval(
         last_candle_ms / 1000, tz=timezone.utc
     ).date()
     write_output_csv(out_path, filtered_rows)
+    earliest_asset_date = None
+    if earliest_date_confirmed:
+        earliest_asset_date = record_earliest_date(
+            earliest_dates_path,
+            market,
+            symbol,
+            first_candle_date,
+        )
 
     recovered_daily = sum(
         entry["status"] == "filled_from_monthly"
@@ -945,6 +1056,8 @@ def download_symbol_interval(
             "complete": True,
         },
     })
+    if earliest_asset_date is not None:
+        info["asset_earliest_date"] = earliest_asset_date.isoformat()
     write_download_info(info_path, info)
 
     print("\n" + "=" * 80)
@@ -979,6 +1092,157 @@ def download_symbol_interval(
     return market_data_path
 
 
+def read_funding_rows_from_zip(zip_bytes: bytes, source_name: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        csv_names = [name for name in zf.namelist() if name.lower().endswith(".csv")]
+        if not csv_names:
+            raise ValueError(f"No CSV file inside ZIP: {source_name}")
+        with zf.open(csv_names[0], "r") as f:
+            for row in csv.reader(io.TextIOWrapper(f, encoding="utf-8")):
+                if not row or not row[0].strip().lstrip("-").isdigit():
+                    continue  # header or blank line
+                if len(row) < 3:
+                    raise ValueError(f"Bad funding row in {source_name}: {row}")
+                calc_ms = normalize_ts_to_ms(row[0])
+                rows.append([str(calc_ms), ms_to_dt(calc_ms), row[1], row[2]])
+    return rows
+
+
+def download_funding_rate(
+    args: argparse.Namespace,
+    session: requests.Session,
+    symbol: str,
+) -> Optional[Path]:
+    """Download monthly fundingRate ZIPs (um/cm only) and write one merged CSV."""
+    market = args.market
+    if market not in {"um", "cm"}:
+        return None
+    symbol = symbol.upper()
+    para = common.MarketDataSourceConfig(
+        market_category="Cryptocurrency",
+        data_source="binance_public_data",
+        symbol=symbol,
+        interval="fundingRate",
+        trading_type=market,
+    )
+    target = Path(common.market_data_path(para)).expanduser().resolve()
+    today = datetime.now(timezone.utc).date()
+    end = parse_date(args.end) or (today - timedelta(days=1))
+    start = parse_date(args.start) or FALLBACK_START[market]
+    if target.is_file() and not args.force:
+        try:
+            last_ms = int(pd.read_csv(target, usecols=[0]).iloc[-1, 0])
+            last_date = datetime.fromtimestamp(last_ms / 1000, tz=timezone.utc).date()
+        except Exception:
+            last_date = None
+        # Funding settles every 1-8h, so the last row may be a day before `end`.
+        if last_date is not None and last_date >= end - timedelta(days=1):
+            print(f"Skipping existing funding rate CSV: {target}")
+            return target
+    zip_dir = Path(args.out_dir).expanduser().resolve() / market / symbol / "fundingRate"
+    base = f"{BASE_URL}/{MARKET_ROOTS[market]}/monthly/fundingRate/{symbol}"
+
+    all_rows: list[list[str]] = []
+    missing: list[str] = []
+    for month in iter_month_starts(start, end):
+        name = f"{symbol}-fundingRate-{month:%Y-%m}.zip"
+        path = zip_dir / name
+        content: Optional[bytes] = None
+        if path.is_file() and not args.force:
+            try:
+                content = path.read_bytes()
+                read_funding_rows_from_zip(content, name)
+            except Exception:
+                content = None
+        if content is None:
+            for attempt in range(HTTP_RETRIES + 1):
+                try:
+                    response = session.get(
+                        f"{base}/{name}",
+                        timeout=HTTP_TIMEOUT_SECONDS,
+                    )
+                    if response.status_code == 404:
+                        break
+                    response.raise_for_status()
+                    read_funding_rows_from_zip(response.content, name)
+                    content = response.content
+                    write_zip_cache(path, content)
+                    break
+                except Exception as exc:
+                    if attempt == HTTP_RETRIES:
+                        raise RuntimeError(f"Funding rate download failed for {name}: {exc}") from exc
+                    time.sleep(RETRY_DELAY_SECONDS)
+        if content is None:
+            missing.append(f"{month:%Y-%m}")
+            continue
+        all_rows.extend(read_funding_rows_from_zip(content, name))
+
+    # Vision only publishes monthly funding archives after the month ends,
+    # so fill the remaining recent period from the REST API.
+    all_rows.sort(key=lambda r: int(r[0]))
+    last_interval = all_rows[-1][2] if all_rows else "8"
+    start_ms = int(datetime(start.year, start.month, start.day, tzinfo=timezone.utc).timestamp() * 1000)
+    end_next = end + timedelta(days=1)
+    end_ms = int(datetime(end_next.year, end_next.month, end_next.day, tzinfo=timezone.utc).timestamp() * 1000)
+    cursor = max(start_ms, int(all_rows[-1][0]) + 1) if all_rows else start_ms
+    api_url = (
+        "https://fapi.binance.com/fapi/v1/fundingRate"
+        if market == "um"
+        else "https://dapi.binance.com/dapi/v1/fundingRate"
+    )
+    api_rows = 0
+    while cursor < end_ms:
+        data = None
+        for attempt in range(HTTP_RETRIES + 1):
+            try:
+                response = session.get(
+                    api_url,
+                    params={"symbol": symbol, "startTime": cursor, "endTime": end_ms - 1, "limit": 1000},
+                    timeout=HTTP_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                data = response.json()
+                break
+            except Exception as exc:
+                if attempt == HTTP_RETRIES:
+                    raise RuntimeError(f"Funding rate API failed for {symbol}: {exc}") from exc
+                time.sleep(RETRY_DELAY_SECONDS)
+        if not data:
+            break
+        for item in data:
+            t = int(item["fundingTime"])
+            all_rows.append([str(t), ms_to_dt(t), last_interval, str(item["fundingRate"])])
+        api_rows += len(data)
+        cursor = int(data[-1]["fundingTime"]) + 1
+        if len(data) < 1000:
+            break
+    if api_rows:
+        print(f"Funding rate rows from REST API: {api_rows}")
+
+    if not all_rows:
+        raise RuntimeError(f"No funding rate rows found for {symbol} ({market}).")
+
+    by_time = {int(r[0]): r for r in all_rows}
+    rows = [by_time[k] for k in sorted(by_time)]
+    rows = filter_rows_by_dates(rows, start, end)
+    if missing:
+        print(f"ℹ️ Funding rate monthly archives not available (tail filled by API): {', '.join(missing)}")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".temp")
+    with tmp.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "calc_time_ms_utc", "calc_time_date_utc",
+            "funding_interval_hours", "last_funding_rate",
+        ])
+        writer.writerows(rows)
+    os.replace(tmp, target)
+    print(f"Funding rate CSV       : {target} ({len(rows)} rows)")
+    return target
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Download Binance Vision monthly-first kline ZIP files and merge them."
@@ -989,17 +1253,25 @@ def main() -> int:
         "--symbols",
         "--symbol",
         nargs="+",
-        default=["BTCUSDT","ETHUSDT","SOLUSDT","ZECUSDT","XRPUSDT","NEARUSDT","BNBUSDT","DOGEUSDT","UNIUSDT","AVAXUSDT","QNTUSDT","ADAUSDT","LINKUSDT","LTCUSDT","TRXUSDT","HBARUSDT","AAVEUSDT","FETUSDT","XLMUSDT","BCHUSDT","FILUSDT","INJUSDT","PAXGUSDT","DASHUSDT","DOTUSDT","ONEUSDT","VTHOUSDT","ICPUSDT","SANDUSDT","MOVRUSDT","RAYUSDT","RLCUSDT","CAKEUSDT","ALGOUSDT","ARUSDT","LSKUSDT","GTCUSDT","PHAUSDT","OGNUSDT","CRVUSDT","SHIBUSDT","RUNEUSDT"],#"ETHUSDT",
+        default=["DOGEUSDT","BTCUSDT","ETHUSDT","SOLUSDT","ZECUSDT","XRPUSDT","NEARUSDT","BNBUSDT","DOGEUSDT","UNIUSDT","AVAXUSDT","QNTUSDT","ADAUSDT","LINKUSDT","LTCUSDT","TRXUSDT","HBARUSDT","AAVEUSDT","FETUSDT","XLMUSDT","BCHUSDT","FILUSDT","INJUSDT","PAXGUSDT","DASHUSDT","DOTUSDT","ONEUSDT","VTHOUSDT","ICPUSDT","SANDUSDT","MOVRUSDT","RAYUSDT","RLCUSDT","CAKEUSDT","ALGOUSDT","ARUSDT","LSKUSDT","GTCUSDT","PHAUSDT","OGNUSDT","CRVUSDT","SHIBUSDT","RUNEUSDT"],#"ETHUSDT",
         help="One or more symbols, e.g. --symbols BTCUSDT DOGEUSDT",
     )
     parser.add_argument(
         "--intervals",
         "--interval",
         nargs="+",
-        default=["1m"],
+        default=["1m","5m","15m"],#,"30m","1h","2h","4h"
         help="One or more intervals, e.g. --intervals 15m 30m 1h",
     )
-    parser.add_argument("--start", default="2022-01-01", help="Start day UTC, YYYY-MM-DD. Default: earliest available date.")
+    parser.add_argument(
+        "--start",
+        default=None,
+        help=(
+            "Fallback start day UTC, YYYY-MM-DD. A cached earliest date for "
+            "market+symbol takes precedence; otherwise the earliest listed "
+            "Binance Vision date takes precedence."
+        ),
+    )
     parser.add_argument(
         "--end",
         default=None,
@@ -1018,16 +1290,26 @@ def main() -> int:
         action="store_true",
         help="Rebuild the final CSV even if it already exists.",
     )
+    parser.add_argument(
+        "--no-funding-rate",
+        action="store_true",
+        help="Do not download funding rates (downloaded by default for um/cm markets).",
+    )
     args = parser.parse_args()
 
     symbols = list(dict.fromkeys(symbol.upper() for symbol in args.symbols))
     intervals = list(dict.fromkeys(args.intervals))
     total_tasks = len(symbols) * len(intervals)
-    failures: list[tuple[str, str, str]] = []
 
     with make_session() as session:
         task_number = 0
         for symbol in symbols:
+            if args.market in {"um", "cm"} and not args.no_funding_rate:
+                try:
+                    download_funding_rate(args, session, symbol)
+                except Exception as exc:
+                    print(f"❌ Failed {symbol} fundingRate: {exc}")
+                    return 1
             for interval in intervals:
                 task_number += 1
                 print(f"\n[Task {task_number}/{total_tasks}] {symbol} {interval}")
@@ -1035,15 +1317,10 @@ def main() -> int:
                     destination = download_symbol_interval(args, session, symbol, interval)
                     print(f"✅ Completed {symbol} {interval}: {destination}")
                 except Exception as exc:
-                    failures.append((symbol, interval, str(exc)))
                     print(f"❌ Failed {symbol} {interval}: {exc}")
+                    return 1
 
-    print(f"\nCompleted {total_tasks - len(failures)}/{total_tasks} download task(s).")
-    if failures:
-        print("Failed tasks:")
-        for symbol, interval, error in failures:
-            print(f"  - {symbol} {interval}: {error}")
-        return 1
+    print(f"\nCompleted {total_tasks}/{total_tasks} download task(s).")
     return 0
 
 

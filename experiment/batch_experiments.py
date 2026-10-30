@@ -1403,7 +1403,7 @@ def run_combo_fusion_and_backtest(
         # train_output_dir as far as backtest_runner.main is concerned), so instead of calling backtest_runner.main
         # sequentially here, every sim_task is pushed into the same sim_task_queue the single model mode uses and
         # handled in parallel by the MAX_SIM _worker_sim processes already running -- in combo mode those worker
-        # processes are idle anyway (the sub-model tasks attach no sim_tasks), so they are put to good use.
+        # processes are idle anyway (the sub-model tasks attach no sim_tasks), so they are put to goos use.
         extra_report_fields = {
             "fusion_hash": fusion_hash,
             "train_compatibility": compat,

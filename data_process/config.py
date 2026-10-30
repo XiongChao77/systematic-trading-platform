@@ -17,9 +17,23 @@ DOGE_1m_TBM = replace(
     interval="1m",
     vol_ewma_span = 60*24*7,
     predict_num = 60*12,
-    vol_multiplier_long = 20,
+    vol_multiplier_long = 25,
     stop_multiplier_rate_long = 0.6,
-    vol_multiplier_short = 20,
+    vol_multiplier_short = 25,
+    stop_multiplier_rate_short = 0.6,
+    min_expected_move_pct=0.1,
+    tbm_take_profit_price = "high_low"
+)
+
+DOGE_5m_TBM = replace(
+    DOGE_15m_TBM,
+    interval="5m",
+    tbm_intrabar_interval="1m",
+    vol_ewma_span = 12*24*7,
+    predict_num =12*8,
+    vol_multiplier_long = 12,
+    stop_multiplier_rate_long = 0.6,
+    vol_multiplier_short = 12,
     stop_multiplier_rate_short = 0.6,
     min_expected_move_pct=0.1,
     tbm_take_profit_price = "high_low"

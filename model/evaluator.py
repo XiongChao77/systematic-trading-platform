@@ -124,27 +124,59 @@ def plot_threshold_precision_recall_curve(
 
 
 def plot_training_curves(fit_result: FitResult, output_path: str) -> None:
-    """Save per-epoch training and validation loss curves."""
+    """Save per-epoch or per-round loss and positive-class precision curves."""
     if not fit_result.history:
         return
     epochs = [entry["epoch"] for entry in fit_result.history]
-    train_losses = [entry["train_loss"] for entry in fit_result.history]
-    validation_losses = [entry["validation_loss"] for entry in fit_result.history]
+    first_entry = fit_result.history[0]
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    figure = Figure(figsize=(8, 6))
+    has_precision = any(key.endswith("_precision") for key in first_entry)
+    x_axis_label = "Boosting round" if "train_precision" in first_entry else "Epoch"
+    figure = Figure(figsize=(10, 8) if has_precision else (8, 6))
     FigureCanvasAgg(figure)
-    axis = figure.subplots()
+    axes = figure.subplots(2, 1, sharex=True) if has_precision else [figure.subplots()]
     try:
-        axis.plot(epochs, train_losses, label="Train loss")
-        axis.plot(epochs, validation_losses, label="Validation loss")
+        axis = axes[0]
+        for name, label in (
+            ("train", "Train"),
+            ("validation", "Validation"),
+            ("test", "Test"),
+        ):
+            key = f"{name}_loss"
+            if key in first_entry:
+                axis.plot(
+                    epochs,
+                    [entry[key] for entry in fit_result.history],
+                    label=f"{label} loss",
+                )
         axis.set(
-            xlabel="Epoch",
+            xlabel=x_axis_label,
             ylabel="Loss",
-            title="Training and Validation Loss",
+            title=f"Loss by {x_axis_label.lower()}",
         )
         axis.grid(True, alpha=0.3)
         axis.legend(loc="best")
+        if has_precision:
+            axis = axes[1]
+            for name, label in (
+                ("train", "Train"),
+                ("validation", "Validation"),
+                ("test", "Test"),
+            ):
+                key = f"{name}_precision"
+                if key in first_entry:
+                    axis.plot(
+                        epochs,
+                        [entry[key] for entry in fit_result.history],
+                        label=f"{label} precision",
+                    )
+            axis.set(
+                xlabel=x_axis_label, ylabel="Positive-class precision",
+                title="Positive-class precision at the fixed decision rule", ylim=(0, 1),
+            )
+            axis.grid(True, alpha=0.3)
+            axis.legend(loc="best")
         figure.tight_layout()
         figure.savefig(output_path, dpi=160)
     finally:

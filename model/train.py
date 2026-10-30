@@ -25,7 +25,6 @@ from model.train_config import (
     SingleModelConfig,
     TrainConfig,
     TrainTask,
-    XGBoostConfig,
 )
 from model.tasks.strategies import TaskStrategy
 from model.trainer import build_trainer
@@ -212,7 +211,7 @@ def train_single(
     splits = _dataset_splits(task, prepared.splits)
     trainer = build_trainer(model, config, device, logger)
 
-    fit_result = trainer.fit(model, task, splits.train, splits.validation)
+    fit_result = trainer.fit(model, task, splits.train, splits.validation, splits.test)
     prediction = trainer.predict(model, task, splits.test)
     metrics = (
         evaluate_regression(prediction, task.labels)
@@ -336,11 +335,11 @@ if __name__ == "__main__":
     started_at = time.perf_counter()
     session_logger, _ = common.setup_session_logger(sub_folder="train", file_level=logging.DEBUG)
     try:
-        # save_dir = os.path.join(common.TRAIN_OUT_DIR, TrainTask.TRIGGER_DIRECTION)
-        # fusion_trigger_dir(session_logger, r'/home/chao/work/financial-ml-system/output/train/TRIGGER',
-        #                     r'/home/chao/work/financial-ml-system/output/train/DIRECTION', save_dir)
-        # exit()
         save_dir = os.path.join(common.TRAIN_OUT_DIR, config.train_task)
         train(config=config, save_dir=save_dir, logger=session_logger)
+        save_dir = os.path.join(common.TRAIN_OUT_DIR, TrainTask.TRIGGER_DIRECTION)
+        fusion_trigger_dir(session_logger, r'/home/chao/work/financial-ml-system/output/train/TRIGGER',
+                            r'/home/chao/work/financial-ml-system/output/train/DIRECTION', save_dir)
+        # exit()
     finally:
         session_logger.info("Total run time: %.2f s", time.perf_counter() - started_at)

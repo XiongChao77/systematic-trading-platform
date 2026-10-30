@@ -516,7 +516,7 @@ def plot_all_equities(
             equity_dir,
             filename,
             equity_scale=equity_scale,
-            include_ood=True,
+            include_oos=True,
         )
         if path:
             paths.append(path)

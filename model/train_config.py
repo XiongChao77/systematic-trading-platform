@@ -146,15 +146,23 @@ class XGBoostConfig(BaseModelConfig):
     model_type: str = "xgboost"
     model_version: int = 1
 
-    xgb_depth: int = 6
+    xgb_depth: int = 5
     xgb_estimators: int = 2000
     xgb_early_stopping_rounds: int = 30
-    learning_rate: float = 0.03
+    class_weight_power: float = 1.0  # 0: disabled, 0.5: partial, 1: balanced class totals.
+    learning_rate: float = 0.02
 
     subsample: float = 0.8
     colsample_bytree: float = 0.8
-    reg_lambda: float = 1.5
+    reg_lambda: float = 10
     reg_alpha: float = 0.0
+    # Minimum Hessian sum per leaf; constrains small-sample branches.
+    min_child_weight: float = 1.0
+    # Minimum loss reduction required for a split.
+    gamma: float = 0.0
+    # Regression only. None keeps the asymmetric Huber loss; the alternatives
+    # compare it against plain and robust built-in regression objectives.
+    objective: Optional[str] = None
 
     tree_method: str = "hist"
     eval_metric: str = "logloss"
@@ -271,10 +279,34 @@ COMBO_SUB_TASKS = {
     TrainTask.LONG_SHORT_OVR: (TrainTask.LONG_OVR, TrainTask.SHORT_OVR),
 }
 
-seq_len = 64
-SingleModelConfig = TrainConfig(
-    model_cfg=XGBoostConfig(model_version=1, seq_len=seq_len),
+TriggerModelLogistic = TrainConfig(
+    model_cfg=XGBoostConfig(seq_len=32),
+    feature_conf_list=None,#feature.FEATURE_LIST_CRYPTOCURRENCY,
+    train_task=TrainTask.DIRECT_3CLASS,
+    stride=4,
+)
+DirectionModelLogistic = TrainConfig(
+    model_cfg=LogisticConfig(seq_len=32),
+    feature_conf_list=None,#feature.FEATURE_LIST_CRYPTOCURRENCY,
+    train_task=TrainTask.DIRECTION,
+    stride=2,
+)
+
+TriggerModel = TrainConfig(
+    model_cfg=XGBoostConfig(seq_len=32 , xgb_depth = 5, xgb_estimators =2000, model_version=1,
+                             learning_rate=0.02,subsample=0.8, colsample_bytree=0.8, reg_lambda=10, 
+                              reg_alpha=0 ),
     feature_conf_list=None,#feature.FEATURE_LIST_CRYPTOCURRENCY,
     train_task=TrainTask.TRIGGER,
     stride=4,
 )
+
+DirectionModel = TrainConfig(
+    model_cfg=XGBoostConfig(seq_len=32 , xgb_depth = 1, xgb_estimators =2000, model_version=1,
+                             learning_rate=0.002,subsample=0.8, colsample_bytree=0.7, reg_lambda=10, 
+                              reg_alpha=0 ),
+    feature_conf_list=None,#feature.FEATURE_LIST_CRYPTOCURRENCY,
+    train_task=TrainTask.DIRECTION,
+    stride=2,
+)
+SingleModelConfig = TriggerModel

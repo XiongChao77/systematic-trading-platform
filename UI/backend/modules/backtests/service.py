@@ -245,12 +245,12 @@ def _combine_reports(
         report_regions = report.get("time", {}).get("regions")
         if isinstance(report_regions, Mapping):
             regions.update(deepcopy(dict(report_regions)))
-    ood_region = regions.setdefault("ood", {})
+    oos_region = regions.setdefault("oos", {})
     forward_time = forward_report.get("time", {})
     if forward_time.get("start") is not None:
-        ood_region["start"] = forward_time["start"]
+        oos_region["start"] = forward_time["start"]
     if forward_time.get("end") is not None:
-        ood_region["end"] = forward_time["end"]
+        oos_region["end"] = forward_time["end"]
     combined["time"]["regions"] = regions
     combined.setdefault("raw_analyzer", {}).setdefault(
         "customize",

@@ -1276,7 +1276,7 @@ def regenerate_equity_images(
         selected_output_dir,
         batch_size=EQUITY_BATCH_SIZE,
         equity_scale=reports_view.EQUITY_SCALE,
-        plot_ood=True,
+        plot_oos=True,
     )
     selected_indicators_path = os.path.join(
         selected_output_dir,
@@ -1302,7 +1302,7 @@ def regenerate_equity_images(
             ),
             batch_size=EQUITY_BATCH_SIZE,
             equity_scale=reports_view.EQUITY_SCALE,
-            plot_ood=True,
+            plot_oos=True,
         )
 
     logger.info(

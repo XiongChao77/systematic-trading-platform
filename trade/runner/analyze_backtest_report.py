@@ -229,7 +229,7 @@ def simulate_ftmo_challenges(
     ``-loss_limit_pct`` determines the outcome; samples with no hit before the
     period ends are right-censored as ``unresolved``.
 
-    An ``all`` backtest is split at the OOD boundary and simulated separately,
+    An ``all`` backtest is split at the OOS boundary and simulated separately,
     so a long-period start can never use forward-period equity to finish.
     """
     import pandas as pd
@@ -247,11 +247,11 @@ def simulate_ftmo_challenges(
     split_at = None
 
     if period == "all":
-        raw_boundary = safe_get(report, ["time", "regions", "ood", "start"])
+        raw_boundary = safe_get(report, ["time", "regions", "oos", "start"])
         split_at = pd.to_datetime(raw_boundary, utc=True, errors="coerce")
         if pd.isna(split_at):
             raise ValueError(
-                "period='all' FTMO simulation requires time.regions.ood.start"
+                "period='all' FTMO simulation requires time.regions.oos.start"
             )
         split_at = split_at.tz_convert(None).normalize()
         segments = {
@@ -434,7 +434,7 @@ def time_region_boundaries(time_regions: dict) -> list[tuple[str, object]]:
     import pandas as pd
 
     boundaries = []
-    for name in ("train", "valid", "test", "ood"):
+    for name in ("train", "valid", "test", "oos"):
         start = safe_get(time_regions, [name, "start"])
         timestamp = pd.to_datetime(start, utc=True, errors="coerce")
         if not pd.isna(timestamp):
@@ -491,7 +491,7 @@ def plot_equity_curves(
     align_curve_extrema: bool = False,
     equity_scale: str = "both",
     label_by_index: bool = False,
-    include_ood: bool = True,
+    include_oos: bool = True,
     logger=None,
 ) -> str | None:
     """Plot one or more report equity curves over the underlying market price.
@@ -508,8 +508,8 @@ def plot_equity_curves(
     separate right-side axes. Pass ``equity_scale="linear"`` or ``"log"`` to
     draw only one representation. ``label_by_index=True`` labels strategies as
     ``S0``, ``S1``, etc. instead of using report hashes. Set
-    ``include_ood=False`` to omit the forward/OOD equity segment and crop the
-    chart at the OOD boundary. The saved image path is returned.
+    ``include_oos=False`` to omit the forward/OOS equity segment and crop the
+    chart at the OOS boundary. The saved image path is returned.
     """
     import matplotlib.pyplot as plt
     import pandas as pd
@@ -529,7 +529,7 @@ def plot_equity_curves(
 
     period_order = ("long", "short", "forward", "all")
 
-    def period_reports(result: dict, *, include_forward=include_ood):
+    def period_reports(result: dict, *, include_forward=include_oos):
         if not isinstance(result, dict):
             return []
         details = {}
@@ -584,15 +584,15 @@ def plot_equity_curves(
         ),
         {},
     )
-    ood_start = None
-    if not include_ood:
-        parsed_ood_start = pd.to_datetime(
-            safe_get(time_regions, ["ood", "start"]),
+    oos_start = None
+    if not include_oos:
+        parsed_oos_start = pd.to_datetime(
+            safe_get(time_regions, ["oos", "start"]),
             utc=True,
             errors="coerce",
         )
-        if not pd.isna(parsed_ood_start):
-            ood_start = parsed_ood_start.tz_convert(None)
+        if not pd.isna(parsed_oos_start):
+            oos_start = parsed_oos_start.tz_convert(None)
 
     if price_file is None:
         market_params = safe_get(first_report, ["params", "common"])
@@ -636,8 +636,8 @@ def plot_equity_curves(
             reports_by_period,
             normalize_equity=normalize_equity,
         )
-        if ood_start is not None:
-            full_path = full_path[full_path.index < ood_start]
+        if oos_start is not None:
+            full_path = full_path[full_path.index < oos_start]
         for period, split_date in result_split_dates.items():
             split_dates.setdefault(period, split_date)
         if full_path.empty:
@@ -762,7 +762,7 @@ def plot_equity_curves(
             "train": "#2e8b57",
             "valid": "#d98c00",
             "test": "#2878b5",
-            "ood": "#c43c39",
+            "oos": "#c43c39",
         }
         for name, boundary in region_starts[1:]:
             price_axis.axvline(
@@ -829,7 +829,7 @@ def plot_equity_curves(
     )
     if region_starts:
         region_names = " -> ".join(
-            "OOD" if name == "ood" else name.title()
+            "OOS" if name == "oos" else name.title()
             for name, _ in region_starts
         )
         title = f"Strategy Equity Curve: {region_names}"

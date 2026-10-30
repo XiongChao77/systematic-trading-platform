@@ -111,7 +111,7 @@ Set a sensible stop loss from the statistics of the adverse excursion on correct
     -- when to close?
         The current strategy closes when a choppy or reversal signal is detected. Try not closing on chop within hold_bar, on the grounds that the previous prediction is still valid.
         Run high risk / high return strategies small (e.g. CAGR 1000% with a 40% drawdown); with a large size risk control comes first and the return second
-        The FTMO limits must hold: 5% daily loss (kept under 3.5%) and 10% total loss (kept under 8%). The high risk share can be raised on a good day and shrunk/disabled on a bad one
+        The FTMO limits must hold: 5% daily loss (kept under 3.5%) and 10% total loss (kept under 8%). The high risk share can be raised on a goos day and shrunk/disabled on a bad one
         The current strategy works in persistently trending markets (BTC/ETH) and fails completely on DOGE
 
 # Restartable Martingale

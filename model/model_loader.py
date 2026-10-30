@@ -236,6 +236,39 @@ class ModelHandler(MetaConfig):
                 collected[name][0].append(transformed.X.argmax(dim=1).numpy())
                 collected[name][1].append(transformed.y.numpy())
 
+    def _sub_model_prediction_frame(self, df, ds, sub_model_probs, is_live):
+        """Build per-bar sub-model predictions aligned to the original frame."""
+        if not sub_model_probs:
+            return pd.DataFrame(index=df.index)
+
+        probabilities = {
+            name: np.concatenate(batches)
+            for name, batches in sub_model_probs.items()
+            if batches
+        }
+        if not probabilities:
+            return pd.DataFrame(index=df.index)
+
+        output = pd.DataFrame(index=df.index)
+        for name, probs in probabilities.items():
+            if is_live:
+                positions = [df.index[-1]]
+                batch = probs[-1:]
+            else:
+                if ds.indices is None:
+                    continue
+                valid_len = min(len(ds.indices), len(probs))
+                positions = np.asarray(ds.indices[:valid_len])
+                batch = probs[:valid_len]
+            pred_column = f"sub_{name}_pred"
+            output[pred_column] = np.nan
+            output.loc[positions, pred_column] = batch.argmax(axis=1)
+            for class_index in range(batch.shape[1]):
+                column = f"sub_{name}_prob_{class_index}"
+                output[column] = np.nan
+                output.loc[positions, column] = batch[:, class_index]
+        return output
+
     def _sub_model_metrics(self, collected):
         results = {}
         for name, (predictions, targets) in collected.items():
@@ -274,6 +307,114 @@ class ModelHandler(MetaConfig):
                 self._collect_sub_model_batch(outputs, labels, returns, collected)
         return self._sub_model_metrics(collected)
 
+    # Every training stage is reported under its strategy-facing name; the
+    # out-of-distribution region is the tradable forward period of the backtest.
+    STAGE_REGIONS = (
+        ("train", "train"),
+        ("valid", "valid"),
+        ("test", "test"),
+        ("forward", "oos"),
+    )
+
+    @staticmethod
+    def _binary_task_targets(labels, task_type):
+        """Map Signal labels to a binary sub-model target, mirroring BinaryTask.
+
+        Returns a boolean mask of usable rows plus the full-length binary
+        target, so predictions can be scored with the task's own semantics.
+        """
+        from model.train_config import TrainTask
+
+        labels = np.asarray(labels, dtype=np.int64)
+        neutral = int(Signal.NEUTRAL)
+        positive = int(Signal.POSITIVE)
+        negative = int(Signal.NEGATIVE)
+        if task_type == TrainTask.TRIGGER:
+            return np.ones(len(labels), dtype=bool), (labels != neutral).astype(np.int64)
+        if task_type == TrainTask.DIRECTION:
+            return labels != neutral, (labels == positive).astype(np.int64)
+        if task_type == TrainTask.LONG_OVR:
+            return np.ones(len(labels), dtype=bool), (labels == positive).astype(np.int64)
+        if task_type == TrainTask.SHORT_OVR:
+            return np.ones(len(labels), dtype=bool), (labels == negative).astype(np.int64)
+        raise ValueError(f"Unsupported binary task: {task_type}")
+
+    def stage_performance(self, frame, time_regions, sub_model_predictions=None):
+        """Evaluate fused and sub-model metrics separately for every stage.
+
+        ``frame`` must carry the label column and the fused ``pred`` column.
+        ``time_regions`` provides the stage timestamp boundaries produced by
+        ``backtest_runner._model_time_regions``.
+        """
+        if time_regions is None or not time_regions:
+            return {}
+        if self.label_col not in frame.columns:
+            return {}
+
+        metric_frame = frame
+        sub_model_columns = ()
+        if sub_model_predictions is not None and len(sub_model_predictions.columns):
+            sub_model_columns = list(sub_model_predictions.columns)
+            metric_frame = frame.join(sub_model_predictions)
+        sub_model_pred_columns = [
+            column
+            for column in sub_model_columns
+            if column.startswith("sub_")
+            and column.endswith("_pred")
+            and column[len("sub_") : -len("_pred")] in self.sub_model_task_type
+        ]
+
+        times = pd.to_datetime(metric_frame["open_time_date_utc"], utc=True)
+        results = {}
+        for stage, region_key in self.STAGE_REGIONS:
+            region = time_regions.get(region_key)
+            if not region:
+                continue
+            start = pd.Timestamp(region["start"])
+            end = pd.Timestamp(region["end"])
+            stage_frame = metric_frame.loc[(times >= start) & (times <= end)]
+            stage_result = {
+                "start": region["start"],
+                "end": region["end"],
+                "bar_count": int(len(stage_frame)),
+            }
+
+            fused_rows = stage_frame[["pred", self.label_col]].dropna()
+            stage_result["predicted_count"] = int(len(fused_rows))
+            stage_result["fused"] = (
+                self.evaluate_performance(
+                    fused_rows[self.label_col].astype(int).to_numpy(),
+                    fused_rows["pred"].astype(int).to_numpy(),
+                )
+                if not fused_rows.empty
+                else {}
+            )
+
+            sub_models = {}
+            for column in sub_model_pred_columns:
+                name = column[len("sub_") : -len("_pred")]
+                task_type = self.sub_model_task_type[name]
+                rows = stage_frame[[self.label_col, column]].dropna()
+                if rows.empty:
+                    sub_models[name] = {
+                        "task_type": task_type,
+                        "sample_count": 0,
+                    }
+                    continue
+                labels = rows[self.label_col].astype(int).to_numpy()
+                predictions = rows[column].astype(int).to_numpy()
+                mask, targets = self._binary_task_targets(labels, task_type)
+                stats = self.evaluate_performance(targets[mask], predictions[mask])
+                stats.pop("signal", None)
+                sub_models[name] = {
+                    "task_type": task_type,
+                    "sample_count": int(mask.sum()),
+                    **stats,
+                }
+            stage_result["sub_models"] = sub_models
+            results[stage] = stage_result
+        return results
+
     def predict(self, df, kline_interval_ms, is_live=True, batch_size=2048,
                 diff_thresh=None, min_thresh=0.3, stride=1, cache_path='',
                 use_cache=False, show_feature_distribution=True):
@@ -291,7 +432,7 @@ class ModelHandler(MetaConfig):
             show_feature_distribution=show_feature_distribution,
             materialize_windows=use_cache,
         )
-        frame, stats, _ = self.predict_with_ds(
+        frame, stats, _, _ = self.predict_with_ds(
             ds, df, is_live=is_live, batch_size=batch_size,
             diff_thresh=diff_thresh, min_thresh=min_thresh,
         )
@@ -299,16 +440,24 @@ class ModelHandler(MetaConfig):
 
     def predict_with_ds(self, ds, df, is_live=True, batch_size=512, diff_thresh=None,
                         min_thresh=0.3, evaluate_sub_models=False):
-        """Return aligned predictions, fused metrics and optional sub-model metrics."""
+        """Return aligned predictions, fused metrics, optional sub-model metrics and
+        per-row sub-model predictions.
+
+        The fourth value holds one row per input bar (same index as ``df``) with
+        ``sub_{name}_pred``, ``sub_{name}_prob_0`` and ``sub_{name}_prob_1`` for
+        every loaded sub-model, so composite models can be evaluated component
+        by component.
+        Rows without a valid window stay NaN. It is empty for single models.
+        """
         self.logger.info(f"Starting inference pipeline (Mode={'Live' if is_live else 'Backtest'}, diff_thresh={diff_thresh})...")
         self._validate_inference_dataset(ds)
         # Check whether any valid windows were generated (may be dropped if too short or discontinuous)
         if len(ds) == 0:
             self.logger.warning("No valid windows generated after continuity check!")
             df_empty = df.copy()
-            for c in ['pred', 'pred_prob', 'prob_short', 'prob_neutral', 'prob_long', 'net_score', 'regression_score']:
+            for c in ['pred', 'pred_prob', 'prob_short', 'prob_neutral', 'prob_long', 'net_score', 'regression_score', 'direction_pred']:
                 df_empty[c] = np.nan
-            return df_empty, {}, {}
+            return df_empty, {}, {}, pd.DataFrame(index=df.index)
 
         self.logger.info(f"Dataset created. Valid windows: {len(ds)}")
 
@@ -317,7 +466,9 @@ class ModelHandler(MetaConfig):
         if is_regression and diff_thresh is not None:
             raise ValueError("diff_thresh is a probability threshold and is not supported for regression scores")
         probs_list = []
+        direction_preds_list = []
         collected = {name: ([], []) for name in self.loaded_sub_models} if evaluate_sub_models else {}
+        sub_model_probs = {name: [] for name in collected}
         self.model.eval()
         with torch.no_grad():
             for xb, labels, returns in self._inference_batches(ds, batch_size):
@@ -328,6 +479,18 @@ class ModelHandler(MetaConfig):
                     if collected:
                         _, fused_probs, outputs = self.model.forward_with_submodel_logits(xb)
                         self._collect_sub_model_batch(outputs, labels, returns, collected)
+                        for name, logits in outputs.items():
+                            sub_model_probs[name].append(
+                                torch.softmax(logits.detach().float(), dim=1).cpu().numpy()
+                            )
+                        if self.task_type == TrainTask.TRIGGER_DIRECTION:
+                            direction_indices = outputs["direction"].argmax(dim=1)
+                            direction_predictions = torch.where(
+                                direction_indices == 0,
+                                int(Signal.NEGATIVE),
+                                int(Signal.POSITIVE),
+                            )
+                            direction_preds_list.append(direction_predictions.cpu().numpy())
                     else:
                         _, fused_probs = self.model(xb)
                     probs_list.append(fused_probs.cpu().numpy())
@@ -364,7 +527,7 @@ class ModelHandler(MetaConfig):
         # 4. Core fix: precise alignment and backfill
         # Create a copy and initialize columns with NaN so discontinuity "gaps" are preserved for position management
         df_out = df.copy()
-        cols_to_init = ['pred', 'pred_prob', 'prob_short', 'prob_neutral', 'prob_long', 'net_score', 'regression_score']
+        cols_to_init = ['pred', 'pred_prob', 'prob_short', 'prob_neutral', 'prob_long', 'net_score', 'regression_score', 'direction_pred']
         for c in cols_to_init:
             df_out[c] = np.nan
         
@@ -381,6 +544,9 @@ class ModelHandler(MetaConfig):
                 df_out.loc[active_indices, 'prob_neutral'] = p_neutral[:valid_len]
                 df_out.loc[active_indices, 'prob_long'] = p_long[:valid_len]
                 df_out.loc[active_indices, 'net_score'] = net_score[:valid_len]
+                if direction_preds_list:
+                    direction_predictions = np.concatenate(direction_preds_list)
+                    df_out.loc[active_indices, 'direction_pred'] = direction_predictions[:valid_len]
                 if is_regression:
                     df_out.loc[active_indices, 'regression_score'] = regression_scores[:valid_len]
         else:
@@ -392,6 +558,10 @@ class ModelHandler(MetaConfig):
                 df_out.at[last_idx, 'net_score'] = net_score[-1]
                 if is_regression:
                     df_out.at[last_idx, 'regression_score'] = regression_scores[-1]
+
+        sub_model_predictions = self._sub_model_prediction_frame(
+            df, ds, sub_model_probs, is_live
+        )
 
         # 5. Compute evaluation metrics (only when not live and label column exists)
         stats = {}
@@ -408,7 +578,12 @@ class ModelHandler(MetaConfig):
         stats['feature_config'] = self.raw_config
         stats['feature_cols']   = self.feature_cols
         self.logger.info(f"Inference complete. Valid signals: {len(final_pred)}")
-        return df_out, stats, self._sub_model_metrics(collected)
+        return (
+            df_out,
+            stats,
+            self._sub_model_metrics(collected),
+            sub_model_predictions,
+        )
 
     def _validate_inference_dataset(self, ds) -> None:
         """Require exact feature identity/order before accepting a prebuilt dataset."""

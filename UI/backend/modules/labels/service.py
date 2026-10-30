@@ -71,6 +71,7 @@ class LabelConfig(BaseModel):
     vol_multiplier_short: PositiveFiniteFloat = 1.7
     stop_multiplier_rate_short: NonNegativeFiniteFloat | None = None
     tbm_take_profit_price: Literal["close", "high_low"] | None = None
+    tbm_intrabar_interval: Interval | None = None
     min_expected_move_pct: NonNegativeFiniteFloat = 0.01
     version: NonNegativeFiniteFloat = 0.1
 
@@ -83,6 +84,13 @@ class LabelConfig(BaseModel):
             raise ValueError(
                 "tbm_take_profit_price is required for TBM and TBM_TREND labels"
             )
+        if self.tbm_intrabar_interval is not None:
+            if self.label_type != "TBM":
+                raise ValueError("tbm_intrabar_interval is only supported for TBM labels")
+            main_ms = common.get_interval_ms(self.interval)
+            fine_ms = common.get_interval_ms(self.tbm_intrabar_interval)
+            if fine_ms >= main_ms or main_ms % fine_ms:
+                raise ValueError("TBM intrabar interval must be a smaller exact divisor of the main interval")
         return self
 
     def to_base_define(self) -> common.BaseDefine:

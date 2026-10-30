@@ -11,7 +11,7 @@ const REGION_COLORS = {
   train: "#2e8b57",
   valid: "#d98c00",
   test: "#2878b5",
-  ood: "#c43c39",
+  oos: "#c43c39",
 };
 
 export class EquityChart {
@@ -266,7 +266,7 @@ function normalizeEquityPoints(rawPoints, report) {
 
 function normalizeRegions(rawRegions) {
   if (!rawRegions || typeof rawRegions !== "object") return [];
-  return ["train", "valid", "test", "ood"].map((name) => {
+  return ["train", "valid", "test", "oos"].map((name) => {
     const region = rawRegions[name];
     if (!region || typeof region !== "object") return null;
     const start = normalizeTimestamp(region.start);

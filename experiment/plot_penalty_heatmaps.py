@@ -90,7 +90,7 @@ def load_and_process(path: Path, period: str = 'forward') -> pd.DataFrame:
                 }
                 return res
             except Exception as e:
-                # Only print when there is a real error to avoid flooding logs
+                # Only print when there is a real error to avoid floosing logs
                 return None
 
         # 4. Transform and filter
@@ -120,7 +120,7 @@ def load_and_process(path: Path, period: str = 'forward') -> pd.DataFrame:
 
 def calculate_robustness(pivot_df: pd.DataFrame):
     """
-    Compute robustness score: mean of current cell and its neighborhood.
+    Compute robustness score: mean of current cell and its neighborhoos.
     Helps identify parameter plateaus and avoid isolated spikes.
     """
     if pivot_df.empty:

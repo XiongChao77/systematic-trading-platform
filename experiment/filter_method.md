@@ -2,9 +2,9 @@
 
 ## Objective
 
-The purpose of this pipeline is to eliminate obvious overfitting, parameter sensitivity, time-split dependence, concentrated returns, and execution-dependent strategies before using the final OOD dataset.
+The purpose of this pipeline is to eliminate obvious overfitting, parameter sensitivity, time-split dependence, concentrated returns, and execution-dependent strategies before using the final OOS dataset.
 
-The model and all decision rules must remain frozen during each validation stage. The OOD dataset is reserved for auditing the complete screening process rather than selecting individual strategies.
+The model and all decision rules must remain frozen during each validation stage. The OOS dataset is reserved for auditing the complete screening process rather than selecting individual strategies.
 
 ## Stage 1: Train / Valid / Test Performance Retention
 
@@ -43,7 +43,7 @@ Keep the trained model and its predictions fixed. Perturb only downstream strate
 - Cooldown period
 - Fees, slippage, and execution delay
 
-The objective is to determine whether the model's predictive advantage remains usable across a reasonable neighborhood of trading parameters. A credible strategy should lie on a stable performance region rather than depend on one isolated parameter combination.
+The objective is to determine whether the model's predictive advantage remains usable across a reasonable neighborhoos of trading parameters. A credible strategy should lie on a stable performance region rather than depend on one isolated parameter combination.
 
 This test does not require deploying multiple strategies or models.
 
@@ -127,33 +127,33 @@ Freeze the following before testing other historical periods or economically rel
 
 Different assets do not need to produce identical CAGR. The main question is whether the predictive direction, source of returns, and advantage over the null baseline can be reproduced without adaptation.
 
-These datasets are part of the screening process and are not the final OOD audit dataset.
+These datasets are part of the screening process and are not the final OOS audit dataset.
 
-## Final Stage: OOD Process Audit
+## Final Stage: OOS Process Audit
 
-Before revealing the OOD results, freeze:
+Before revealing the OOS results, freeze:
 
 - The complete candidate strategy set
 - Every model and parameter
 - All screening criteria
-- The OOD success definition
-- The expected OOD success rate
+- The OOS success definition
+- The expected OOS success rate
 
-OOD evaluates the effectiveness of the complete strategy-discovery and screening process. Its primary outputs are:
+OOS evaluates the effectiveness of the complete strategy-discovery and screening process. Its primary outputs are:
 
-- Number of strategies entering OOD
-- OOD success count and success rate
+- Number of strategies entering OOS
+- OOS success count and success rate
 - Performance retention relative to Valid+Test
 - Common failure modes across the candidate set
 
-OOD must not be used to keep individual winners and discard individual losers. Doing so would turn OOD into another selection dataset.
+OOS must not be used to keep individual winners and discard individual losers. Doing so would turn OOS into another selection dataset.
 
 The valid conclusions are process-level conclusions:
 
-- If the predefined OOD success rate is achieved, the screening pipeline receives independent support.
+- If the predefined OOS success rate is achieved, the screening pipeline receives independent support.
 - If the success rate is materially below expectation, the screening pipeline is not validated and should be revised as a whole.
 
-Once OOD results influence any rule, parameter, or model decision, that OOD period has been consumed. A revised pipeline requires new future data for another independent audit.
+Once OOS results influence any rule, parameter, or model decision, that OOS period has been consumed. A revised pipeline requires new future data for another independent audit.
 
 ## Complete Workflow
 
@@ -167,7 +167,7 @@ Train/Valid/Test\ Retention
 \rightarrow Execution\ Robustness
 \rightarrow Cross\ Period/Asset\ Validation
 \rightarrow Freeze\ Candidate\ Set
-\rightarrow OOD\ Process\ Audit
+\rightarrow OOS\ Process\ Audit
 \]
 
 The central principle is that each stage should contribute a different type of evidence instead of repeatedly extracting highly correlated metrics from the same equity curve.

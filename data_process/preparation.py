@@ -3,7 +3,7 @@ from tkinter import TRUE
 import pandas as pd
 import numpy as np
 import datetime, os, sys, re, math, json, logging
-from dataclasses import asdict
+from dataclasses import asdict, replace
 current_work_dir = os.path.dirname(__file__)
 sys.path.append(os.path.join(current_work_dir,'..'))
 from data_process import common
@@ -37,7 +37,34 @@ def _source_descriptor(df: pd.DataFrame, path: str) -> dict:
         **_time_range(df),
     }
 
+
+def _load_tbm_intrabar_data(para, logger):
+    """Resolve matching market data while keeping the main labeling interval."""
+    if not isinstance(para, common.BaseDefine):
+        return None, None
+    intrabar_interval = para.resolve_tbm_intrabar_interval()
+    if intrabar_interval is None:
+        return None, None
+    interval_ms = common.get_interval_ms(para.interval)
+    fine_interval_ms = common.get_interval_ms(intrabar_interval)
+    if fine_interval_ms >= interval_ms or interval_ms % fine_interval_ms:
+        raise ValueError("TBM intrabar interval must be a smaller exact divisor of the main interval")
+    source = replace(para, interval=intrabar_interval, tbm_intrabar_interval=None)
+    path = common.market_data_path(source)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"TBM intrabar data file not found: {path}")
+    logger.info("Loading TBM intrabar data: %s", path)
+    frame = pd.read_csv(path, usecols=[
+        "open_time_ms_utc", "close_time_ms_utc", "open", "high", "low", "close",
+    ])
+    return frame, {"interval": source.interval, **_source_descriptor(frame, path)}
+
+
 def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,feature_conf_list=[],para: common.PreparationConfig = common.BaseDefine(), prep_output_dir =common.DATA_OUT_DIR ):
+    if isinstance(para, common.BaseDefine):
+        # Persist the effective scan interval so downstream artifacts describe
+        # the actual labeling source rather than an unresolved automatic value.
+        para = replace(para, tbm_intrabar_interval=para.resolve_tbm_intrabar_interval())
     file = common.market_data_path(para)
     logger.info(f"using file :{file}")
     # 1. Convert interval string to milliseconds
@@ -54,6 +81,7 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
             logger=logger,
         )
     df = common.clean_data_quality_auto(df,logger)
+    intrabar_df, intrabar_source = _load_tbm_intrabar_data(para, logger)
     is_pure_binary = isinstance(para, common.PureBinaryDefine)
     if is_pure_binary:
         df['open_time_date_utc'] = pd.to_datetime(df['open_time_ms_utc'], unit='ms', utc=True)
@@ -70,7 +98,8 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
         df = common.attach_attr(df, feature_group_list , feature_conf_list, para)
     # common.print_zret_statistics(df)
     # Label the complete selected history before splitting; events may occur in the backtest period.
-    df = common.attach_label(df, para=para,label_col = label_col)
+    df = common.attach_label(df, para=para, label_col=label_col, intrabar_df=intrabar_df)
+    del intrabar_df
     if para.label_type == "TBM" and not is_pure_binary:
         common.log_tbm_reach_time_percentiles(df, logger)
         df.drop(columns=list(common.TBM_REACH_TIME_COLUMNS.values()), inplace=True)
@@ -161,6 +190,8 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
         "time": _time_range(df),
         "split_time": pd.Timestamp(split_ts).isoformat(),
     }
+    if intrabar_source is not None:
+        manifest_payload["label_source"] = intrabar_source
     manifest = {
         **manifest_payload,
         "data_id": common.data_manifest_id(manifest_payload),
@@ -185,7 +216,7 @@ if __name__ == "__main__":
 #**********column info: open_time_date_utc,open,high,low,close,volume,close_time_ms_utc,quote_asset_volume,number_of_trades,taker_buy_base_volume,taker_buy_quote_volume,ignore
     logger, _ = common.setup_session_logger(sub_folder='data_process')
     pare_para = config.DOGE_1m_PURE_BINARY
-    pare_para = config.DOGE_1m_TBM
+    pare_para = config.DOGE_5m_TBM
     if pare_para.market_category == 'Forex':
         feature_conf_list = feature.FEATURE_LIST_COMMODITY
     else:

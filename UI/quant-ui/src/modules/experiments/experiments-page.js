@@ -590,7 +590,7 @@ function experimentTemplate() {
           <section class="panel compact-panel">
             <div class="panel-header"><h2>Filters</h2><button data-action="reset-filters" class="text-button" type="button">Reset</button></div>
             <label class="field-label" for="experiment-period">Period</label>
-            <select id="experiment-period" data-role="period" class="field-control"><option value="long">Long / full history</option><option value="forward">Forward / OOD</option></select>
+            <select id="experiment-period" data-role="period" class="field-control"><option value="long">Long / full history</option><option value="forward">Forward / OOS</option></select>
             <div data-role="filter-list" class="filter-list"></div>
             <button data-action="add-filter" class="secondary-button full-button" type="button">Add condition</button>
             <button data-action="apply-filters" class="primary-button full-button" type="button">Apply filters</button>

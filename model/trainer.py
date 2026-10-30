@@ -6,7 +6,13 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import f1_score, log_loss, mean_absolute_error, mean_squared_error
+from sklearn.metrics import (
+    f1_score,
+    log_loss,
+    mean_absolute_error,
+    mean_squared_error,
+    precision_score,
+)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -50,9 +56,10 @@ class TorchTrainer:
         task: TaskStrategy,
         train_split: TensorSplit,
         validation_split: TensorSplit,
+        test_split: TensorSplit,
     ) -> FitResult:
-        if not len(train_split) or not len(validation_split):
-            raise ValueError("Training and validation splits must not be empty")
+        if not len(train_split) or not len(validation_split) or not len(test_split):
+            raise ValueError("Training, validation and test splits must not be empty")
 
         self.task = task
         task.configure(train_split.labels)
@@ -96,6 +103,7 @@ class TorchTrainer:
 
             train_loss = total_loss / max(total_samples, 1)
             validation = self.predict(model, task, validation_split)
+            test = self.predict(model, task, test_split)
             validation_f1 = f1_score(
                 validation.y_true,
                 validation.y_pred,
@@ -116,10 +124,22 @@ class TorchTrainer:
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "validation_loss": validation_loss,
+                "test_loss": float(test.loss),
                 "validation_macro_f1": validation_f1,
             }
             if task.is_regression:
                 epoch_metrics["validation_mae"] = validation_mae
+            else:
+                # Multiclass tasks need per-class precision; the positive class is
+                # the last configured label for both binary and three-class tasks.
+                class_precisions = precision_score(
+                    test.y_true,
+                    test.y_pred,
+                    labels=list(task.labels),
+                    average=None,
+                    zero_division=0,
+                )
+                epoch_metrics["test_precision"] = float(class_precisions[-1])
             history.append(epoch_metrics)
             self.logger.info(
                 "Epoch %03d | train_loss %.4f | validation_loss %.4f | validation_macro_f1 %.4f%s",
@@ -229,15 +249,21 @@ class SklearnTrainer:
         self.config = config
         self.logger = logger
 
-    def fit(self, model: Any, task: TaskStrategy, train_split: TensorSplit, validation_split: TensorSplit) -> FitResult:
+    def fit(
+        self,
+        model: Any,
+        task: TaskStrategy,
+        train_split: TensorSplit,
+        validation_split: TensorSplit,
+        test_split: TensorSplit,
+    ) -> FitResult:
         task.configure(train_split.labels)
         fit_with_validation = getattr(model, "fit_with_validation", None)
         if callable(fit_with_validation):
             history = fit_with_validation(
-                train_split.X,
-                train_split.y,
-                validation_split.X,
-                validation_split.y,
+                train_split.X, train_split.y,
+                validation_split.X, validation_split.y,
+                test_split.X, test_split.y,
             )
             # for metrics in history:
             #     self.logger.info(

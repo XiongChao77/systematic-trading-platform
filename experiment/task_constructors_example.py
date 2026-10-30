@@ -184,7 +184,7 @@ def construct_TBM_DIRECT_3CLASS_doge(symbol: str, interval: str, train_mode):
                     training_task.append(train_conf)
 
     simulation_task: List[Any] = []
-    for risk_per_trade_pct,max_daily_loss_pct in [(0.01, 0.015),(0.02, 0.025),]: # (0.02, 0.99) not good
+    for risk_per_trade_pct,max_daily_loss_pct in [(0.01, 0.015),(0.02, 0.025),]: # (0.02, 0.99) not goos
         for fixed_hold_bars in [32,48,64]: #64>48>32
             simulation_task.append(
                 backtest_runner.BbmStrategyConfig(

@@ -1594,7 +1594,7 @@ def show_performance(
     batch_size=5,
     equity_scale=EQUITY_SCALE,
     addition_info=None,
-    plot_ood=False,
+    plot_oos=False,
     strategy_num_start=1,
     feature_map=None,
 ):
@@ -1625,7 +1625,7 @@ def show_performance(
         output_dir,
         batch_size,
         equity_scale=equity_scale,
-        plot_ood=plot_ood,
+        plot_oos=plot_oos,
     )
 
 
@@ -1752,7 +1752,7 @@ def compute_correlation(all_results, output_dir, strategy_numbers=None):
     print(f"Dynamic-size correlation heatmap saved (Size: {fig_width:.1f}x{fig_height:.1f} in): {save_path}")
 
 
-def _equity_reports_by_period(row, plot_ood=False):
+def _equity_reports_by_period(row, plot_oos=False):
     """Materialize the same period reports used by the equity plotter."""
     report = row.get("raw", {})
     details = row.get("report_details", {})
@@ -1764,7 +1764,7 @@ def _equity_reports_by_period(row, plot_ood=False):
     detail_results = details.get("results", {}) if isinstance(details, dict) else {}
     reports_by_period = []
     for period in ("long", "short", "forward", "all"):
-        if period == "forward" and not plot_ood:
+        if period == "forward" and not plot_oos:
             continue
         period_result = period_results.get(period)
         if not isinstance(period_result, dict) or not period_result:
@@ -1777,29 +1777,29 @@ def _equity_reports_by_period(row, plot_ood=False):
     return reports_by_period
 
 
-def _equity_end_value(row, plot_ood=False):
+def _equity_end_value(row, plot_oos=False):
     """Return the final value of the unscaled, visible equity curve."""
-    all_reports_by_period = _equity_reports_by_period(row, plot_ood=True)
-    reports_by_period = all_reports_by_period if plot_ood else [item for item in all_reports_by_period if item[0] != "forward"]
+    all_reports_by_period = _equity_reports_by_period(row, plot_oos=True)
+    reports_by_period = all_reports_by_period if plot_oos else [item for item in all_reports_by_period if item[0] != "forward"]
     equity_path, _ = build_continuous_equity_path(
         reports_by_period,
         normalize_equity=False,
     )
-    if not plot_ood:
-        ood_start = next(
+    if not plot_oos:
+        oos_start = next(
             (
                 pd.to_datetime(
-                    report.get("time", {}).get("regions", {}).get("ood", {}).get("start"),
+                    report.get("time", {}).get("regions", {}).get("oos", {}).get("start"),
                     utc=True,
                     errors="coerce",
                 )
                 for _, report in all_reports_by_period
-                if report.get("time", {}).get("regions", {}).get("ood", {}).get("start") is not None
+                if report.get("time", {}).get("regions", {}).get("oos", {}).get("start") is not None
             ),
             None,
         )
-        if ood_start is not None and not pd.isna(ood_start):
-            equity_path = equity_path[equity_path.index < ood_start.tz_convert(None)]
+        if oos_start is not None and not pd.isna(oos_start):
+            equity_path = equity_path[equity_path.index < oos_start.tz_convert(None)]
     if equity_path.empty:
         return None
     values = pd.to_numeric(
@@ -1816,7 +1816,7 @@ def _group_equity_plots_by_log_end_value(
     all_results,
     batch_size,
     max_log_ratio=MAX_LOG_END_VALUE_RATIO,
-    plot_ood=False,
+    plot_oos=False,
 ):
     """Group curves whose positive log(end value) coordinates are comparable.
 
@@ -1833,7 +1833,7 @@ def _group_equity_plots_by_log_end_value(
     for fallback_index, row in enumerate(all_results, start=1):
         strategy_number = row.get("_strategy_num", fallback_index)
         strategy_label = row.get("_strategy_label", f"S{strategy_number}")
-        end_value = _equity_end_value(row, plot_ood=plot_ood)
+        end_value = _equity_end_value(row, plot_oos=plot_oos)
         log_end_value = math.log(end_value) if end_value is not None and end_value > 1 else None
         item = (strategy_label, row, end_value, log_end_value)
         items.append(item)
@@ -1881,13 +1881,13 @@ def plot_in_batches(
     output_dir,
     batch_size=5,
     equity_scale=EQUITY_SCALE,
-    plot_ood=False,
+    plot_oos=False,
 ):
     sns.set_theme(style="white")
     groups = _group_equity_plots_by_log_end_value(
         all_results,
         batch_size,
-        plot_ood=plot_ood,
+        plot_oos=plot_oos,
     )
     for figure_index, group in enumerate(groups, start=1):
         plot_payloads = [_indexed_equity_plot_payload(row, strategy_label) for strategy_label, row, _, _ in group]
@@ -1902,7 +1902,7 @@ def plot_in_batches(
             output_dir,
             filename,
             equity_scale=equity_scale,
-            include_ood=plot_ood,
+            include_oos=plot_oos,
         )
 
 
@@ -2022,7 +2022,7 @@ def main():
             "predict_num": "predict_num",
             # "hold_bars": "fixed_hold_bars",
         },
-        plot_ood=True,
+        plot_oos=True,
         feature_map=f_map,
     )
     # rc_pos_ratio_results, unselected = filter_by_criteria(
