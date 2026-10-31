@@ -19,8 +19,8 @@ Main behavior:
     - Resume automatically from valid cached archives, downloading only missing
       sources. Invalid cached archives are downloaded again.
     - Skip a series when its final CSV already exists, unless --force is used.
-    - When inferring --start, use the first/last advertised daily objects as
-      availability boundaries; internal gaps remain eligible for monthly recovery.
+    - Infer --start from the first daily ZIP in the sorted S3 XML listing,
+      without scanning the full history; gaps remain eligible for monthly recovery.
     - Aggregate the selected sources and strictly validate the final K-line sequence.
 
 Examples:
@@ -77,9 +77,10 @@ from data_process import common
 
 BASE_URL = "https://data.binance.vision"
 S3_LIST_URL = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
-HTTP_TIMEOUT_SECONDS = 1
+HTTP_TIMEOUT_SECONDS = 30
 HTTP_RETRIES = 3
 RETRY_DELAY_SECONDS = 1
+DOWNLOAD_DELAY_SECONDS = 0.3
 INFO_FILENAME = "download_info.json"
 EARLIEST_DATES_FILENAME = "earliest_dates.json"
 ZIP_DIRNAME = "zips"
@@ -363,54 +364,28 @@ def build_monthly_zip_path(
 
 
 def list_s3_keys(session: requests.Session, prefix: str) -> list[str]:
-    """List Binance Vision objects through its S3 XML API, including pagination."""
-    keys: list[str] = []
-    marker: Optional[str] = None
-
-    while True:
-        params = {"prefix": prefix, "max-keys": "1000"}
-        if marker:
-            params["marker"] = marker
-        for attempt in range(HTTP_RETRIES + 1):
-            try:
-                response = session.get(
-                    S3_LIST_URL,
-                    params=params,
-                    timeout=HTTP_TIMEOUT_SECONDS,
-                )
-                response.raise_for_status()
-                break
-            except requests.RequestException as exc:
-                if attempt == HTTP_RETRIES:
-                    raise RuntimeError(
-                        f"S3 listing failed after {HTTP_RETRIES} retries: {exc}"
-                    ) from exc
-                time.sleep(RETRY_DELAY_SECONDS)
-        response.raise_for_status()
-        root = ET.fromstring(response.content)
-
-        page_keys = [
-            element.text
-            for element in root.iter()
-            if element.tag.rsplit("}", 1)[-1] == "Key" and element.text
-        ]
-        keys.extend(page_keys)
-
-        truncated = next(
-            (
-                (element.text or "").lower() == "true"
-                for element in root.iter()
-                if element.tag.rsplit("}", 1)[-1] == "IsTruncated"
-            ),
-            False,
-        )
-        if not truncated:
+    """Read object keys from a single S3 XML listing response."""
+    for attempt in range(HTTP_RETRIES + 1):
+        try:
+            response = session.get(
+                S3_LIST_URL,
+                params={"prefix": prefix},
+                timeout=HTTP_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
             break
-        if not page_keys:
-            raise RuntimeError(f"S3 listing was truncated without any keys: prefix={prefix}")
-        marker = page_keys[-1]
-
-    return keys
+        except requests.RequestException as exc:
+            if attempt == HTTP_RETRIES:
+                raise RuntimeError(
+                    f"S3 listing failed after {HTTP_RETRIES} retries: {exc}"
+                ) from exc
+            time.sleep(RETRY_DELAY_SECONDS)
+    root = ET.fromstring(response.content)
+    return [
+        element.text
+        for element in root.iter()
+        if element.tag.rsplit("}", 1)[-1] == "Key" and element.text
+    ]
 
 
 def infer_available_dates_from_listing(
@@ -419,37 +394,24 @@ def infer_available_dates_from_listing(
     symbol: str,
     interval: str,
 ) -> list[date]:
-    """
-    Query the backing S3 bucket and extract dates from daily ZIP object keys.
-
-    The public Binance Vision HTML page is only a JavaScript shell and cannot
-    be parsed for filenames reliably. The S3 XML API is the actual listing
-    source used by that page.
-    """
+    """Find the earliest daily ZIP from the lexicographically sorted S3 XML keys."""
     prefix = build_archive_prefix(market, "daily", symbol, interval)
-    print("🔎 Querying Binance Vision S3 listing to infer available dates:")
+    print("Querying Binance Vision S3 listing for the earliest daily ZIP:")
     print(f"   {S3_LIST_URL}?prefix={prefix}")
-    keys = list_s3_keys(session, prefix)
-
-    # Match real ZIP object keys, excluding adjacent .zip.CHECKSUM objects.
-    # Use negative lookahead to avoid matching ".zip.CHECKSUM".
     pattern = re.compile(
-        rf"{re.escape(symbol)}-{re.escape(interval)}-(\d{{4}}-\d{{2}}-\d{{2}})\.zip(?!\.CHECKSUM)",
-        re.IGNORECASE,
+        rf"{re.escape(prefix)}{re.escape(symbol)}-{re.escape(interval)}-"
+        rf"(\d{{4}}-\d{{2}}-\d{{2}})\.zip",
     )
+    # ISO dates sort chronologically; checksum objects and directory keys are ignored.
+    for key in list_s3_keys(session, prefix):
+        match = pattern.fullmatch(key)
+        if match is not None:
+            earliest = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+            print(f"Earliest daily ZIP: {earliest}")
+            return [earliest]
 
-    dates = sorted({
-        datetime.strptime(match.group(1), "%Y-%m-%d").date()
-        for key in keys
-        if (match := pattern.search(key)) is not None
-    })
-
-    if dates:
-        print(f"✅ Listing parsed: {len(dates)} daily ZIP file(s), earliest={dates[0]}, latest={dates[-1]}")
-    else:
-        print("⚠️ Listing parsed but no daily ZIP filename was found.")
-
-    return dates
+    print("S3 listing contains no daily ZIP filename.")
+    return []
 
 
 def resolve_start_end(
@@ -483,19 +445,12 @@ def resolve_start_end(
     dates = infer_available_dates_from_listing(session, market, symbol, interval)
 
     if dates:
-        latest_available = dates[-1]
-        effective_end = min(requested_end, latest_available)
+        effective_end = requested_end
         effective_start = dates[0]
         if effective_start > effective_end:
             raise ValueError(
                 "No available ZIP files in requested date range: "
-                f"earliest_available={dates[0]}, requested_end={requested_end}, "
-                f"source_start={dates[0]}, source_end={latest_available}"
-            )
-        if effective_end < requested_end:
-            print(
-                "⚠️ Requested end date is later than data-source end; "
-                f"requested_end={requested_end}, using_end={effective_end}"
+                f"earliest_available={effective_start}, requested_end={requested_end}"
             )
         if requested_start is not None and requested_start != effective_start:
             print(
@@ -583,6 +538,8 @@ def download_zip_url(
                 time.sleep(RETRY_DELAY_SECONDS)
                 continue
             return None, f"failed: {type(exc).__name__}: {exc}"
+        finally:
+            time.sleep(DOWNLOAD_DELAY_SECONDS)
     return None, "failed: unknown error"
 
 
@@ -1173,6 +1130,8 @@ def download_funding_rate(
                     if attempt == HTTP_RETRIES:
                         raise RuntimeError(f"Funding rate download failed for {name}: {exc}") from exc
                     time.sleep(RETRY_DELAY_SECONDS)
+                finally:
+                    time.sleep(DOWNLOAD_DELAY_SECONDS)
         if content is None:
             missing.append(f"{month:%Y-%m}")
             continue
@@ -1301,27 +1260,48 @@ def main() -> int:
     intervals = list(dict.fromkeys(args.intervals))
     total_tasks = len(symbols) * len(intervals)
 
+    succeeded = 0
+    failures: list[tuple[str, str, str]] = []
+    funding_succeeded = 0
+    funding_failures: list[tuple[str, str]] = []
     with make_session() as session:
         task_number = 0
         for symbol in symbols:
-            if args.market in {"um", "cm"} and not args.no_funding_rate:
-                try:
-                    download_funding_rate(args, session, symbol)
-                except Exception as exc:
-                    print(f"❌ Failed {symbol} fundingRate: {exc}")
-                    return 1
             for interval in intervals:
                 task_number += 1
                 print(f"\n[Task {task_number}/{total_tasks}] {symbol} {interval}")
                 try:
                     destination = download_symbol_interval(args, session, symbol, interval)
-                    print(f"✅ Completed {symbol} {interval}: {destination}")
+                    succeeded += 1
+                    print(f"Completed {symbol} {interval}: {destination}")
                 except Exception as exc:
-                    print(f"❌ Failed {symbol} {interval}: {exc}")
-                    return 1
+                    reason = f"{type(exc).__name__}: {exc}"
+                    failures.append((symbol, interval, reason))
+                    print(f"Failed {symbol} {interval}: {reason}")
+            if args.market in {"um", "cm"} and not args.no_funding_rate:
+                try:
+                    download_funding_rate(args, session, symbol)
+                    funding_succeeded += 1
+                except Exception as exc:
+                    reason = f"{type(exc).__name__}: {exc}"
+                    funding_failures.append((symbol, reason))
+                    print(f"Failed {symbol} fundingRate: {reason}")
 
-    print(f"\nCompleted {total_tasks}/{total_tasks} download task(s).")
-    return 0
+    print("\n" + "=" * 80)
+    print("All download tasks finished")
+    print(f"K-line tasks: total={total_tasks}, succeeded={succeeded}, failed={len(failures)}")
+    print("Existing output CSVs reused without --force count as succeeded.")
+    for symbol, interval, reason in failures:
+        print(f"  Failed {symbol} {interval}: {reason}")
+    if args.market in {"um", "cm"} and not args.no_funding_rate:
+        print(
+            f"Funding rate tasks: total={len(symbols)}, "
+            f"succeeded={funding_succeeded}, failed={len(funding_failures)}"
+        )
+        for symbol, reason in funding_failures:
+            print(f"  Failed {symbol} fundingRate: {reason}")
+    print("=" * 80)
+    return 1 if failures or funding_failures else 0
 
 
 if __name__ == "__main__":
