@@ -1987,13 +1987,17 @@ def validate_kline_source(
     *,
     source: str = "kline source",
     logger=None,
+    allowed_missing_dates: Optional[list[str]] = None,
 ) -> dict:
-    """Validate that a dataframe is one non-overlapping, contiguous K-line series.
+    """Validate a non-overlapping K-line series, requiring continuity by default.
 
     The open-time sequence alone is not sufficient: a file can alternate hourly
     candles with half-hour candles while still having an apparently perfect 30m
     open-time cadence.  Therefore this validation also checks every candle's
     close time and adjacent time ranges.
+
+    Aligned forward gaps intersecting explicitly allowed UTC dates are accepted.
+    Other gaps and structural errors remain invalid.
 
     Returns a small validation summary.  Raises ``ValueError`` on any structural
     or OHLC error so callers do not continue with contaminated market data.
@@ -2040,6 +2044,7 @@ def validate_kline_source(
         "out_of_order_count": 0,
         "unexpected_spacing_count": 0,
         "missing_candle_count": 0,
+        "allowed_gap_count": 0,
         "invalid_duration_count": 0,
         "overlap_count": 0,
         "invalid_ohlc_count": 0,
@@ -2055,6 +2060,20 @@ def validate_kline_source(
         spacing_mask = delta.notna() & (delta != interval_ms)
         forward_gap_mask = delta > interval_ms
         aligned_gap_mask = forward_gap_mask & (delta % interval_ms == 0)
+        allowed_gap_mask = pd.Series(False, index=df.index)
+        if allowed_missing_dates:
+            day_ms = 86_400_000
+            allowed_days = np.array(sorted({
+                int(pd.Timestamp(day, tz="UTC").timestamp() * 1000) // day_ms
+                for day in allowed_missing_dates
+            }), dtype="int64")
+            for idx in df.index[aligned_gap_mask]:
+                first_missing_day = (int(open_time.loc[idx] - delta.loc[idx]) + interval_ms) // day_ms
+                last_missing_day = (int(open_time.loc[idx]) - interval_ms) // day_ms
+                pos = int(np.searchsorted(allowed_days, first_missing_day))
+                if pos < len(allowed_days) and allowed_days[pos] <= last_missing_day:
+                    allowed_gap_mask.loc[idx] = True
+            spacing_mask &= ~allowed_gap_mask
         duration = close_time - open_time + 1
         invalid_duration_mask = duration != interval_ms
         overlap_mask = open_time.iloc[1:].to_numpy() <= close_time.iloc[:-1].to_numpy()
@@ -2063,6 +2082,7 @@ def validate_kline_source(
         summary["out_of_order_count"] = int(out_of_order_mask.sum())
         summary["unexpected_spacing_count"] = int(spacing_mask.sum())
         summary["missing_candle_count"] = int(((delta.loc[aligned_gap_mask] // interval_ms) - 1).sum())
+        summary["allowed_gap_count"] = int(allowed_gap_mask.sum())
         summary["invalid_duration_count"] = int(invalid_duration_mask.sum())
         summary["overlap_count"] = int(overlap_mask.sum())
 
@@ -2126,7 +2146,11 @@ def validate_kline_source(
         raise ValueError(message)
 
     if logger is not None:
-        logger.info(f"K-line validation passed: source={source}, rows={len(df)}, " f"interval_ms={interval_ms}, missing_candles=0, overlaps=0")
+        logger.info(
+            f"K-line validation passed: source={source}, rows={len(df)}, "
+            f"interval_ms={interval_ms}, missing_candles={summary['missing_candle_count']}, "
+            f"allowed_gaps={summary['allowed_gap_count']}, overlaps=0"
+        )
     return summary
 
 

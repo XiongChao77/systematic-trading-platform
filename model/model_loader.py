@@ -411,6 +411,39 @@ class ModelHandler(MetaConfig):
                     "sample_count": int(mask.sum()),
                     **stats,
                 }
+            from model.train_config import TrainTask
+
+            trigger_columns = [
+                column for column in sub_model_pred_columns
+                if self.sub_model_task_type[column[len("sub_") : -len("_pred")]]
+                == TrainTask.TRIGGER
+            ]
+            for column in sub_model_pred_columns:
+                name = column[len("sub_") : -len("_pred")]
+                if self.sub_model_task_type[name] != TrainTask.DIRECTION:
+                    continue
+                rows = stage_frame.dropna(subset=[self.label_col, column])
+                scopes = {"all_predictions": rows}
+                if trigger_columns:
+                    scopes["trigger_predicted_trade"] = rows.loc[
+                        rows[trigger_columns[0]] == 1
+                    ]
+                scope_stats = {}
+                for scope, selected in scopes.items():
+                    labels = selected[self.label_col].astype(int).to_numpy()
+                    predictions = np.where(
+                        selected[column].to_numpy() == 1,
+                        int(Signal.POSITIVE),
+                        int(Signal.NEGATIVE),
+                    )
+                    stats = self.evaluate_performance(labels, predictions) if len(labels) else {}
+                    stats.pop("signal", None)
+                    scope_stats[scope] = {
+                        "sample_count": int(len(labels)),
+                        "neutral_count": int(np.sum(labels == int(Signal.NEUTRAL))),
+                        **stats,
+                    }
+                sub_models[name]["prediction_scopes"] = scope_stats
             stage_result["sub_models"] = sub_models
             results[stage] = stage_result
         return results

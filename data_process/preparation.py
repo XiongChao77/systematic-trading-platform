@@ -155,7 +155,7 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
     # 3. Split and persist datasets
     # ---------------------------------------------------------
     if not is_pure_binary:
-        split_ts = pd.to_datetime(df['open_time_date_utc'].iloc[-1], utc=True) - pd.DateOffset(months=8)
+        split_ts = pd.to_datetime(df['open_time_date_utc'].iloc[-1], utc=True) - pd.DateOffset(months=3)
     times = pd.to_datetime(df['open_time_date_utc'], utc=True)
     train_df, test_df = df[times < split_ts], df[times >= split_ts]
 
@@ -215,8 +215,7 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
 if __name__ == "__main__":
 #**********column info: open_time_date_utc,open,high,low,close,volume,close_time_ms_utc,quote_asset_volume,number_of_trades,taker_buy_base_volume,taker_buy_quote_volume,ignore
     logger, _ = common.setup_session_logger(sub_folder='data_process')
-    pare_para = config.DOGE_1m_PURE_BINARY
-    pare_para = config.DOGE_5m_TBM
+    pare_para = config.DOGE_15m_TBM
     if pare_para.market_category == 'Forex':
         feature_conf_list = feature.FEATURE_LIST_COMMODITY
     else:

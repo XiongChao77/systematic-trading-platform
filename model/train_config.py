@@ -293,20 +293,20 @@ DirectionModelLogistic = TrainConfig(
 )
 
 TriggerModel = TrainConfig(
-    model_cfg=XGBoostConfig(seq_len=32 , xgb_depth = 5, xgb_estimators =2000, model_version=1,
+    model_cfg=XGBoostConfig(seq_len=32 , xgb_depth = 5, xgb_estimators =1000, model_version=1,
                              learning_rate=0.02,subsample=0.8, colsample_bytree=0.8, reg_lambda=10, 
-                              reg_alpha=0 ),
+                              reg_alpha=0,min_child_weight = 2 ),
     feature_conf_list=None,#feature.FEATURE_LIST_CRYPTOCURRENCY,
     train_task=TrainTask.TRIGGER,
     stride=4,
 )
 
 DirectionModel = TrainConfig(
-    model_cfg=XGBoostConfig(seq_len=32 , xgb_depth = 1, xgb_estimators =2000, model_version=1,
+    model_cfg=XGBoostConfig(seq_len=32 , xgb_depth = 3, xgb_estimators =500, model_version=1,
                              learning_rate=0.002,subsample=0.8, colsample_bytree=0.7, reg_lambda=10, 
                               reg_alpha=0 ),
     feature_conf_list=None,#feature.FEATURE_LIST_CRYPTOCURRENCY,
     train_task=TrainTask.DIRECTION,
     stride=2,
 )
-SingleModelConfig = TriggerModel
+SingleModelConfig = DirectionModel

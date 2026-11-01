@@ -338,8 +338,8 @@ if __name__ == "__main__":
         save_dir = os.path.join(common.TRAIN_OUT_DIR, config.train_task)
         train(config=config, save_dir=save_dir, logger=session_logger)
         save_dir = os.path.join(common.TRAIN_OUT_DIR, TrainTask.TRIGGER_DIRECTION)
-        fusion_trigger_dir(session_logger, r'/home/chao/work/financial-ml-system/output/train/TRIGGER',
-                            r'/home/chao/work/financial-ml-system/output/train/DIRECTION', save_dir)
+        fusion_trigger_dir(session_logger, os.path.join(common.TRAIN_OUT_DIR,'TRIGGER'),
+                             os.path.join(common.TRAIN_OUT_DIR,'DIRECTION'), save_dir)
         # exit()
     finally:
         session_logger.info("Total run time: %.2f s", time.perf_counter() - started_at)

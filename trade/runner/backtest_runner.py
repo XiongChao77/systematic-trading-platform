@@ -206,7 +206,7 @@ def _resolve_device(device_name):
 
 
 _MODEL_TIME_REGION_CACHE: dict[tuple, dict] = {}
-_PREDICTION_CACHE_SCHEMA = 5
+_PREDICTION_CACHE_SCHEMA = 6
 _PREDICTION_COLUMNS = (
     "pred",
     "direction_pred",
@@ -815,6 +815,7 @@ def _sub_model_stage_summary(stats: dict) -> dict:
     baseline, baseline_class = _baseline_from_stats(stats)
     return {
         "task_type": stats.get("task_type"),
+        "prediction_scopes": stats.get("prediction_scopes", {}),
         "sample_count": stats.get("sample_count"),
         "accuracy": stats.get("accuracy"),
         "baseline_accuracy": baseline,
@@ -1652,6 +1653,44 @@ def build_stage_summary_markdown(summary: dict) -> str:
         )
         lines.append("")
 
+        lines.append("### Direction prediction scopes")
+        lines.append("")
+        lines.append(
+            "Direction predicts long or short on every valid window, independently of trigger. "
+            "The original binary direction metrics above exclude true-neutral labels. "
+            "The scopes below include true-neutral labels as incorrect predictions: "
+            "all_predictions uses every labeled direction prediction; "
+            "trigger_predicted_trade uses only rows where trigger predicts action. "
+            "Macro F1 includes the neutral class when present."
+        )
+        lines.append("")
+        rows = []
+        for name in sub_model_names:
+            for stage_name, stage in stages.items():
+                stats = (stage.get("sub_models") or {}).get(name) or {}
+                for scope, scoped in (stats.get("prediction_scopes") or {}).items():
+                    report = scoped.get("classification_report") or {}
+                    count = scoped.get("sample_count", 0)
+                    neutral_count = scoped.get("neutral_count", 0)
+                    rows.append([
+                        name, stage_name, scope, _md_int(count),
+                        _md_int(neutral_count),
+                        _md_pct(neutral_count / count if count else None),
+                        _md_float(scoped.get("accuracy")),
+                        _md_float(scoped.get("f1_macro")),
+                        _md_float((report.get("1") or {}).get("precision")),
+                        _md_float((report.get("1") or {}).get("recall")),
+                        _md_float((report.get("-1") or {}).get("precision")),
+                        _md_float((report.get("-1") or {}).get("recall")),
+                    ])
+        if rows:
+            lines.append(_md_table([
+                "sub-model", "stage", "scope", "n", "true neutral n",
+                "true neutral share", "accuracy", "macro F1",
+                "long precision", "long recall", "short precision", "short recall",
+            ], rows))
+            lines.append("")
+
         lines.append("### Sub-model prediction distribution")
         lines.append("")
         rows = []
@@ -2386,6 +2425,21 @@ def _evaluate_stages(
                 _number((sub_report.get("0") or {}).get("recall")),
                 sub_stats.get("sample_count"),
             )
+            for scope, scoped in (sub_stats.get("prediction_scopes") or {}).items():
+                report = scoped.get("classification_report") or {}
+                logger.info(
+                    "STAGE %s SUB %s scope=%s | acc=%.4f | macro_f1=%.4f | "
+                    "p(long)=%.4f | r(long)=%.4f | p(short)=%.4f | r(short)=%.4f | "
+                    "n=%s | neutral_n=%s",
+                    stage.upper(), name, scope,
+                    _number(scoped.get("accuracy")),
+                    _number(scoped.get("f1_macro")),
+                    _number((report.get("1") or {}).get("precision")),
+                    _number((report.get("1") or {}).get("recall")),
+                    _number((report.get("-1") or {}).get("precision")),
+                    _number((report.get("-1") or {}).get("recall")),
+                    scoped.get("sample_count"), scoped.get("neutral_count"),
+                )
 
     if stage_results:
         logger.info(
@@ -2547,7 +2601,7 @@ def main(
         candles["pred"] = candles["pred"].fillna(float(Signal.INVALID))
     if "label" in candles:
         candles["label"] = candles["label"].fillna(int(Signal.INVALID)).astype(int)
-    candles.rename(columns={"open_time_date_utc": "time"}, inplace=True)
+    candles = candles.rename(columns={"open_time_date_utc": "time"})
     candles["time"] = candles["time"].apply(lambda dt: int(dt.timestamp()))
 
     result = {

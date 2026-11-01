@@ -14,14 +14,16 @@ Main behavior:
       market/symbol, or query the Binance Vision S3 XML API when no date is cached.
       Explicit date ranges use local archives first without listing remote files.
     - If --end is not specified, default to the latest completed UTC day.
-    - Treat local ZIP files as the cache. download_info.json is a human-readable
-      audit report only and is never used as downloader input.
+    - Treat local ZIP files and confirmed HTTP 404 statuses as the download cache.
+      download_info.json records both source status and run audit details.
     - Resume automatically from valid cached archives, downloading only missing
       sources. Invalid cached archives are downloaded again.
     - Skip a series when its final CSV already exists, unless --force is used.
     - Infer --start from the first daily ZIP in the sorted S3 XML listing,
       without scanning the full history; gaps remain eligible for monthly recovery.
-    - Aggregate the selected sources and strictly validate the final K-line sequence.
+    - Skip dates whose daily archives return HTTP 404 and have no monthly data.
+      Keep later available data and report gaps; download failures remain fatal.
+    - Validate candle structure and OHLC values in the merged K-line sequence.
 
 Examples:
     # Download multiple symbols and intervals (Cartesian product)
@@ -52,6 +54,8 @@ import calendar
 import csv
 import io
 import json
+import logging
+import math
 import os
 import re
 import shutil
@@ -60,6 +64,7 @@ import time
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -75,16 +80,25 @@ if str(PROJECT_ROOT) not in sys.path:
 from data_process import common
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 BASE_URL = "https://data.binance.vision"
 S3_LIST_URL = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
 HTTP_TIMEOUT_SECONDS = 30
 HTTP_RETRIES = 3
 RETRY_DELAY_SECONDS = 1
 DOWNLOAD_DELAY_SECONDS = 0.3
+FUNDING_API_MIN_INTERVAL_SECONDS = 1.0
+FUNDING_API_RATE_LIMIT_FALLBACK_SECONDS = 300.0
 INFO_FILENAME = "download_info.json"
 EARLIEST_DATES_FILENAME = "earliest_dates.json"
 ZIP_DIRNAME = "zips"
 MONTHLY_ZIP_DIRNAME = "monthly_zips"
+
+
+class NoArchiveError(RuntimeError):
+    """Raised when Binance Vision has no daily archive for a market symbol."""
 
 VALID_MARKETS = {
     "spot": "data/spot/daily/klines",
@@ -96,6 +110,12 @@ MARKET_ROOTS = {
     "spot": "data/spot",
     "um": "data/futures/um",
     "cm": "data/futures/cm",
+}
+
+SYMBOL_ALIASES = {
+    "um": {
+        "SHIBUSDT": "1000SHIBUSDT",
+    },
 }
 
 # Fallback only when the S3 listing cannot provide an earliest date.
@@ -259,6 +279,39 @@ def write_download_info(info_path: Path, info: dict[str, Any]) -> None:
     os.replace(tmp_path, info_path)
 
 
+def load_known_missing_sources(
+    info_path: Path,
+    market: str,
+    symbol: str,
+    interval: str,
+) -> set[str]:
+    if not info_path.is_file():
+        return set()
+    try:
+        with info_path.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        LOGGER.warning("Could not read source status cache %s: %s", info_path, exc)
+        return set()
+
+    if not isinstance(payload, dict):
+        return set()
+    if any(payload.get(key) != expected for key, expected in (
+        ("market", market), ("symbol", symbol), ("interval", interval)
+    )):
+        return set()
+    source_files = payload.get("source_files")
+    if not isinstance(source_files, dict):
+        return set()
+    return {
+        key for key, entry in source_files.items()
+        if isinstance(entry, dict) and (
+            entry.get("status") == "missing"
+            or entry.get("daily_archive_status") == "missing"
+        )
+    }
+
+
 def make_download_info(
     *,
     market: str,
@@ -301,6 +354,35 @@ def make_session() -> requests.Session:
         "User-Agent": "binance-vision-kline-downloader/2.0"
     })
     return session
+
+
+class FundingApiLimiter:
+    """Space funding API requests and retain cooldowns across symbols."""
+
+    def __init__(self) -> None:
+        self.next_allowed_at = 0.0
+
+    def wait(self) -> None:
+        remaining = self.next_allowed_at - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        self.next_allowed_at = time.monotonic() + FUNDING_API_MIN_INTERVAL_SECONDS
+
+    def defer(self, retry_after: Optional[str]) -> float:
+        delay = FUNDING_API_RATE_LIMIT_FALLBACK_SECONDS
+        if retry_after:
+            try:
+                delay = max(0.0, float(retry_after))
+                if not math.isfinite(delay):
+                    raise ValueError("Non-finite Retry-After value")
+            except ValueError:
+                try:
+                    retry_at = parsedate_to_datetime(retry_after)
+                    delay = max(0.0, retry_at.timestamp() - time.time())
+                except (TypeError, ValueError, OverflowError):
+                    delay = FUNDING_API_RATE_LIMIT_FALLBACK_SECONDS
+        self.next_allowed_at = max(self.next_allowed_at, time.monotonic() + delay)
+        return delay
 
 
 def build_prefix(market: str, symbol: str, interval: str) -> str:
@@ -396,8 +478,8 @@ def infer_available_dates_from_listing(
 ) -> list[date]:
     """Find the earliest daily ZIP from the lexicographically sorted S3 XML keys."""
     prefix = build_archive_prefix(market, "daily", symbol, interval)
-    print("Querying Binance Vision S3 listing for the earliest daily ZIP:")
-    print(f"   {S3_LIST_URL}?prefix={prefix}")
+    LOGGER.info("Querying Binance Vision S3 listing for the earliest daily ZIP:")
+    LOGGER.info(f"   {S3_LIST_URL}?prefix={prefix}")
     pattern = re.compile(
         rf"{re.escape(prefix)}{re.escape(symbol)}-{re.escape(interval)}-"
         rf"(\d{{4}}-\d{{2}}-\d{{2}})\.zip",
@@ -407,10 +489,10 @@ def infer_available_dates_from_listing(
         match = pattern.fullmatch(key)
         if match is not None:
             earliest = datetime.strptime(match.group(1), "%Y-%m-%d").date()
-            print(f"Earliest daily ZIP: {earliest}")
+            LOGGER.info(f"Earliest daily ZIP: {earliest}")
             return [earliest]
 
-    print("S3 listing contains no daily ZIP filename.")
+    LOGGER.warning("S3 listing contains no daily ZIP filename.")
     return []
 
 
@@ -434,12 +516,12 @@ def resolve_start_end(
                 f"cached_start={cached_start}, requested_end={requested_end}"
             )
         if requested_start is not None and requested_start != cached_start:
-            print(
-                f"ℹ️ Ignoring --start={requested_start}; using recorded earliest "
+            LOGGER.info(
+                f"Ignoring --start={requested_start}; using recorded earliest "
                 f"date for {market}:{symbol}: {cached_start}"
             )
         else:
-            print(f"✅ Using cached earliest date for {market}:{symbol}: {cached_start}")
+            LOGGER.info(f"Using cached earliest date for {market}:{symbol}: {cached_start}")
         return cached_start, effective_end, True
 
     dates = infer_available_dates_from_listing(session, market, symbol, interval)
@@ -453,25 +535,24 @@ def resolve_start_end(
                 f"earliest_available={effective_start}, requested_end={requested_end}"
             )
         if requested_start is not None and requested_start != effective_start:
-            print(
-                f"ℹ️ Ignoring --start={requested_start}; using earliest listed "
+            LOGGER.info(
+                f"Ignoring --start={requested_start}; using earliest listed "
                 f"date for {market}:{symbol}:{interval}: {effective_start}"
             )
         else:
-            print(f"✅ Using earliest available file date: {effective_start}")
+            LOGGER.info(f"Using earliest available file date: {effective_start}")
         return effective_start, effective_end, True
 
-    fallback = requested_start or FALLBACK_START[market]
-    effective_start = fallback
-    print(
-        "⚠️ Failed to infer earliest date from listing. "
-        f"Using fallback start date {effective_start}."
+    symbol_hint = (
+        " The USD-M SHIB perpetual symbol is 1000SHIBUSDT."
+        if market == "um" and symbol == "SHIBUSDT"
+        else ""
     )
-    if effective_start > requested_end:
-        raise ValueError(
-            f"start must be <= end, got start={effective_start}, end={requested_end}"
-        )
-    return effective_start, requested_end, False
+    raise NoArchiveError(
+        "No Binance Vision daily ZIPs found for "
+        f"market={market}, symbol={symbol}, interval={interval}. "
+        f"Check the market symbol.{symbol_hint}"
+    )
 
 
 def read_kline_rows_from_zip(zip_bytes: bytes, source_name: str) -> list[list[str]]:
@@ -629,11 +710,10 @@ def download_symbol_interval(
     session: requests.Session,
     symbol: str,
     interval: str,
-) -> Path:
-    """Download one series with monthly-first archives and strict validation."""
+) -> Optional[Path]:
+    """Download available archives and validate the merged candle data."""
     market = args.market
     symbol = symbol.upper()
-    interval_ms = interval_to_ms(interval)
     para = common.MarketDataSourceConfig(
         market_category="Cryptocurrency",
         data_source="binance_public_data",
@@ -643,9 +723,10 @@ def download_symbol_interval(
     )
     market_data_path = Path(common.market_data_path(para)).expanduser().resolve()
     if market_data_path.is_file() and not args.force:
-        print(f"Skipping existing output CSV: {market_data_path}")
+        LOGGER.info(f"[{symbol} {interval}] Skipping entire task because final CSV exists: {market_data_path}")
         return market_data_path
 
+    interval_ms = interval_to_ms(interval)
     output_dir = build_output_dir(
         Path(args.out_dir).expanduser().resolve(), market, symbol, interval
     )
@@ -658,6 +739,10 @@ def download_symbol_interval(
     )
     cached_start = parse_date(
         load_earliest_dates(earliest_dates_path).get(f"{market}:{symbol}")
+    )
+    known_missing_sources = (
+        set() if args.force
+        else load_known_missing_sources(info_path, market, symbol, interval)
     )
 
     start, end, earliest_date_confirmed = resolve_start_end(
@@ -743,7 +828,7 @@ def download_symbol_interval(
                 if not rows:
                     raise ValueError("Cached archive contains no candles")
             except Exception as exc:
-                print(f"Ignoring invalid cache {candidate}: {type(exc).__name__}: {exc}")
+                LOGGER.warning(f"Ignoring invalid cache {candidate}: {type(exc).__name__}: {exc}")
                 continue
             if candidate == temporary_path:
                 os.replace(temporary_path, path)
@@ -751,12 +836,19 @@ def download_symbol_interval(
             record_source(key, frequency=frequency, status="cached", path=path, url=url)
             return rows, None
 
+        if key in known_missing_sources:
+            counters[f"{frequency}_missing"] += 1
+            record_source(key, frequency=frequency, status="missing", path=path, url=url)
+            LOGGER.info(f"[{symbol} {interval}] Skipping previously confirmed missing source: {key}")
+            return None, "missing"
+
+        LOGGER.info(f"[{symbol} {interval}] Downloading {key}: {url}")
         content, error = download_zip_url(session, url)
         if content is not None:
             write_zip_cache(path, content)
             counters[f"{frequency}_downloaded"] += 1
             record_source(key, frequency=frequency, status="downloaded", path=path, url=url)
-            print(f"{key}: downloaded ZIP {len(content)} bytes")
+            LOGGER.info(f"[{symbol} {interval}] {key}: downloaded ZIP {len(content)} bytes")
             return read_kline_rows_from_zip(content, url), None
         if error == "missing":
             counters[f"{frequency}_missing"] += 1
@@ -766,7 +858,7 @@ def download_symbol_interval(
         record_source(
             key, frequency=frequency, status="failed", path=path, url=url, error=error
         )
-        raise RuntimeError(f"Failed to download source {url}: {error}")
+        raise RuntimeError(f"[{symbol} {interval}] Failed to download source {url}: {error}")
 
     def load_monthly(month: date) -> tuple[Optional[list[list[str]]], Optional[str]]:
         return load_source(
@@ -782,21 +874,21 @@ def download_symbol_interval(
             build_daily_url(market, symbol, interval, day),
         )
 
-    print("=" * 80)
-    print("Binance Vision monthly-first kline downloader")
-    print(f"Market       : {market}")
-    print(f"Symbol       : {symbol}")
-    print(f"Interval     : {interval}")
-    print(f"Scan range   : {start} -> {end} UTC")
-    print(f"Output dir   : {output_dir}")
-    print(f"Monthly cache: {monthly_zip_dir}")
-    print(f"Daily cache  : {daily_zip_dir}")
-    print(f"Info file    : {info_path}")
-    print(f"Output CSV   : {out_path}")
-    print("=" * 80)
+    LOGGER.info("=" * 80)
+    LOGGER.info("Binance Vision monthly-first kline downloader")
+    LOGGER.info(f"Market       : {market}")
+    LOGGER.info(f"Symbol       : {symbol}")
+    LOGGER.info(f"Interval     : {interval}")
+    LOGGER.info(f"Scan range   : {start} -> {end} UTC")
+    LOGGER.info(f"Output dir   : {output_dir}")
+    LOGGER.info(f"Monthly cache: {monthly_zip_dir}")
+    LOGGER.info(f"Daily cache  : {daily_zip_dir}")
+    LOGGER.info(f"Info file    : {info_path}")
+    LOGGER.info(f"Output CSV   : {out_path}")
+    LOGGER.info("=" * 80)
 
     all_rows: list[list[str]] = []
-    unresolved_dates: list[date] = []
+    unavailable_dates: list[date] = []
     month_starts = list(iter_month_starts(start, end))
 
     # Inventory file names before opening archives or requesting missing files.
@@ -833,7 +925,7 @@ def download_symbol_interval(
             )
 
     cached_count = sum(has_cache(path) for path in planned_paths)
-    print(
+    LOGGER.info(
         f"Local ZIP inventory: {cached_count} present, "
         f"{len(planned_paths) - cached_count} missing"
     )
@@ -843,7 +935,7 @@ def download_symbol_interval(
     ):
         first_day, last_day = month_bounds(month)
         complete_month = segment_start == first_day and segment_end == last_day
-        print(
+        LOGGER.info(
             f"[{number}/{len(month_starts)}] {month_key(month)}: "
             f"{'monthly preferred' if complete_month else 'partial month, daily preferred'}"
         )
@@ -879,7 +971,7 @@ def download_symbol_interval(
                     item.isoformat() for item in incomplete_dates
                 ]
                 write_download_info(info_path, info)
-                print(
+                LOGGER.warning(
                     f"  monthly ZIP has {len(incomplete_dates)} incomplete date(s); "
                     "recovering those dates from daily ZIPs"
                 )
@@ -889,7 +981,7 @@ def download_symbol_interval(
                         f"Failed to load monthly source {month_key(month)}: {monthly_error}"
                     )
             elif monthly_rows is None:
-                print("  monthly ZIP unavailable; falling back to daily ZIPs")
+                LOGGER.warning(f"[{symbol} {interval}] Monthly ZIP unavailable; falling back to daily ZIPs")
 
         daily_rows: list[list[str]] = []
         missing_days: list[date] = []
@@ -903,7 +995,7 @@ def download_symbol_interval(
             elif error == "missing":
                 missing_days.append(day)
                 if args.show_missing:
-                    print(f"  {day}: daily ZIP missing")
+                    LOGGER.warning(f"[{symbol} {interval}] {day}: daily ZIP missing")
             else:
                 raise RuntimeError(f"Failed to load daily source {day}: {error}")
 
@@ -917,7 +1009,7 @@ def download_symbol_interval(
         if monthly_base_used:
             # The monthly source was already included and known to be incomplete.
             # If its repair daily file is also absent, no further source exists.
-            unresolved_dates.extend(missing_days)
+            unavailable_dates.extend(missing_days)
             continue
 
         # Missing daily objects may still be present in Binance's monthly archive.
@@ -927,7 +1019,7 @@ def download_symbol_interval(
                 raise RuntimeError(
                     f"Failed monthly fallback for {month_key(month)}: {monthly_error}"
                 )
-            unresolved_dates.extend(missing_days)
+            unavailable_dates.extend(missing_days)
             continue
 
         for missing_day in missing_days:
@@ -936,39 +1028,46 @@ def download_symbol_interval(
                 all_rows.extend(replacement)
                 source_key = f"daily:{missing_day.isoformat()}"
                 info["source_files"][source_key]["status"] = "filled_from_monthly"
+                info["source_files"][source_key]["daily_archive_status"] = "missing"
                 info["source_files"][source_key]["fallback_source"] = (
                     f"monthly:{month_key(month)}"
                 )
             else:
-                unresolved_dates.append(missing_day)
+                unavailable_dates.append(missing_day)
         write_download_info(info_path, info)
 
     if counters["failed"]:
         raise RuntimeError(f"Source download/read failures={counters['failed']}")
-    # Binance publishes daily archives with a delay, so when downloading up to
-    # the present, a missing final day is expected and ignored.
-    if end >= datetime.now(timezone.utc).date() - timedelta(days=1):
-        unresolved_dates = [day for day in unresolved_dates if day != end]
-    if unresolved_dates:
-        dates_text = ", ".join(day.isoformat() for day in unresolved_dates[:10])
-        raise RuntimeError(
-            "Refusing to write an incomplete K-line source: daily and monthly "
-            f"archives are both missing for {len(unresolved_dates)} date(s): {dates_text}"
+    unavailable_dates = sorted(set(unavailable_dates))
+    info["unavailable_dates"] = [day.isoformat() for day in unavailable_dates]
+    if unavailable_dates:
+        LOGGER.warning(
+            "[%s %s] Skipping %s date(s): daily archives returned HTTP 404 "
+            "and monthly archives contain no replacement data: %s",
+            symbol,
+            interval,
+            len(unavailable_dates),
+            ", ".join(info["unavailable_dates"]),
         )
-    if not all_rows:
-        raise RuntimeError("No kline rows were found after aggregation.")
 
-    # Fallback sources can overlap. The strict check applies to the merged
-    # candle sequence rather than requiring every daily object to exist.
+    # Fallback sources can overlap; validate the merged available candles.
     merged_rows, duplicate_rows = merge_rows_by_open_time(all_rows)
     filtered_rows = filter_rows_by_dates(merged_rows, start, end)
     if not filtered_rows:
-        raise RuntimeError("No kline rows remain inside the requested date range.")
+        info.update({
+            "final_rows": 0,
+            "last_updated_utc": utc_now_iso(),
+            "summary": {**counters, "unavailable_dates": len(unavailable_dates), "complete": False},
+        })
+        write_download_info(info_path, info)
+        LOGGER.warning("[%s %s] No available data in the requested range; skipping CSV generation", symbol, interval)
+        return None
     validation_df = pd.DataFrame(filtered_rows, columns=OUTPUT_COLUMNS)
     validation = common.validate_kline_source(
         validation_df,
         interval_ms,
         source=str(out_path),
+        allowed_missing_dates=info["unavailable_dates"],
     )
 
     first_candle_ms = int(filtered_rows[0][0])
@@ -1009,43 +1108,45 @@ def download_symbol_interval(
         "summary": {
             **counters,
             "daily_recovered_from_monthly": recovered_daily,
-            "unresolved_dates": len(unresolved_dates),
-            "complete": True,
+            "unavailable_dates": len(unavailable_dates),
+            "allowed_gap_count": validation["allowed_gap_count"],
+            "missing_candle_count": validation["missing_candle_count"],
+            "complete": not unavailable_dates and validation["missing_candle_count"] == 0,
         },
     })
     if earliest_asset_date is not None:
         info["asset_earliest_date"] = earliest_asset_date.isoformat()
     write_download_info(info_path, info)
 
-    print("\n" + "=" * 80)
-    print("Download summary")
-    print(f"Validated candle range : {first_candle_date} -> {last_candle_date} UTC")
-    print(f"Monthly ZIPs cached    : {counters['monthly_cached']}")
-    print(f"Monthly ZIPs downloaded: {counters['monthly_downloaded']}")
-    print(f"Monthly ZIPs incomplete: {counters['monthly_incomplete']}")
-    print(
+    LOGGER.info("\n" + "=" * 80)
+    LOGGER.info("Download summary")
+    LOGGER.info(f"Validated candle range : {first_candle_date} -> {last_candle_date} UTC")
+    LOGGER.info(f"Monthly ZIPs cached    : {counters['monthly_cached']}")
+    LOGGER.info(f"Monthly ZIPs downloaded: {counters['monthly_downloaded']}")
+    LOGGER.info(f"Monthly ZIPs incomplete: {counters['monthly_incomplete']}")
+    LOGGER.info(
         "Monthly gap dates fixed: "
         f"{counters['monthly_gap_dates_recovered_from_daily']}"
         f"/{counters['monthly_gap_dates']}"
     )
-    print(f"Daily ZIPs cached      : {counters['daily_cached']}")
-    print(f"Daily ZIPs downloaded  : {counters['daily_downloaded']}")
-    print(f"Daily ZIPs recovered   : {recovered_daily}")
-    print(f"Raw rows               : {len(all_rows)}")
-    print(f"Duplicate rows         : {duplicate_rows}")
-    print(f"Final rows             : {len(filtered_rows)}")
-    print(f"Missing candles        : {validation['missing_candle_count']}")
-    print(f"Overlapping candles    : {validation['overlap_count']}")
-    print(f"Info file              : {info_path}")
+    LOGGER.info(f"Daily ZIPs cached      : {counters['daily_cached']}")
+    LOGGER.info(f"Daily ZIPs downloaded  : {counters['daily_downloaded']}")
+    LOGGER.info(f"Daily ZIPs recovered   : {recovered_daily}")
+    LOGGER.info(f"Raw rows               : {len(all_rows)}")
+    LOGGER.info(f"Duplicate rows         : {duplicate_rows}")
+    LOGGER.info(f"Final rows             : {len(filtered_rows)}")
+    LOGGER.info(f"Missing candles        : {validation['missing_candle_count']}")
+    LOGGER.info(f"Overlapping candles    : {validation['overlap_count']}")
+    LOGGER.info(f"Info file              : {info_path}")
 
     market_data_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_target = market_data_path.with_suffix(market_data_path.suffix + ".temp")
     shutil.copyfile(out_path, temporary_target)
     os.replace(temporary_target, market_data_path)
     out_path.unlink()
-    print(f"Output CSV             : {market_data_path}")
-    print("=" * 80)
-    print("✅ K-line source validation passed.")
+    LOGGER.info(f"Output CSV             : {market_data_path}")
+    LOGGER.info("=" * 80)
+    LOGGER.info("K-line source validation passed.")
     return market_data_path
 
 
@@ -1066,10 +1167,39 @@ def read_funding_rows_from_zip(zip_bytes: bytes, source_name: str) -> list[list[
     return rows
 
 
+def request_funding_rate_page(
+    session: requests.Session,
+    limiter: FundingApiLimiter,
+    url: str,
+    params: dict[str, Any],
+) -> list[dict[str, Any]]:
+    for attempt in range(HTTP_RETRIES + 1):
+        limiter.wait()
+        rate_limited = False
+        try:
+            response = session.get(url, params=params, timeout=HTTP_TIMEOUT_SECONDS)
+            if response.status_code in {418, 429}:
+                delay = limiter.defer(response.headers.get("Retry-After"))
+                rate_limited = True
+                LOGGER.warning(
+                    f"[{params['symbol']} fundingRate] API returned {response.status_code}; "
+                    f"cooldown: {delay:.1f}s"
+                )
+            response.raise_for_status()
+            return response.json()
+        except Exception:
+            if attempt == HTTP_RETRIES:
+                raise
+            if not rate_limited:
+                time.sleep(RETRY_DELAY_SECONDS)
+    raise RuntimeError("Funding rate API retries exhausted")
+
+
 def download_funding_rate(
     args: argparse.Namespace,
     session: requests.Session,
     symbol: str,
+    limiter: FundingApiLimiter,
 ) -> Optional[Path]:
     """Download monthly fundingRate ZIPs (um/cm only) and write one merged CSV."""
     market = args.market
@@ -1084,19 +1214,13 @@ def download_funding_rate(
         trading_type=market,
     )
     target = Path(common.market_data_path(para)).expanduser().resolve()
+    if target.is_file() and not args.force:
+        LOGGER.info(f"[{symbol} fundingRate] Skipping entire task because final CSV exists: {target}")
+        return target
+
     today = datetime.now(timezone.utc).date()
     end = parse_date(args.end) or (today - timedelta(days=1))
     start = parse_date(args.start) or FALLBACK_START[market]
-    if target.is_file() and not args.force:
-        try:
-            last_ms = int(pd.read_csv(target, usecols=[0]).iloc[-1, 0])
-            last_date = datetime.fromtimestamp(last_ms / 1000, tz=timezone.utc).date()
-        except Exception:
-            last_date = None
-        # Funding settles every 1-8h, so the last row may be a day before `end`.
-        if last_date is not None and last_date >= end - timedelta(days=1):
-            print(f"Skipping existing funding rate CSV: {target}")
-            return target
     zip_dir = Path(args.out_dir).expanduser().resolve() / market / symbol / "fundingRate"
     base = f"{BASE_URL}/{MARKET_ROOTS[market]}/monthly/fundingRate/{symbol}"
 
@@ -1113,6 +1237,7 @@ def download_funding_rate(
             except Exception:
                 content = None
         if content is None:
+            LOGGER.info(f"[{symbol} fundingRate] Downloading monthly ZIP: {name}")
             for attempt in range(HTTP_RETRIES + 1):
                 try:
                     response = session.get(
@@ -1125,6 +1250,7 @@ def download_funding_rate(
                     read_funding_rows_from_zip(response.content, name)
                     content = response.content
                     write_zip_cache(path, content)
+                    LOGGER.info(f"[{symbol} fundingRate] Downloaded monthly ZIP: {name} ({len(content)} bytes)")
                     break
                 except Exception as exc:
                     if attempt == HTTP_RETRIES:
@@ -1152,21 +1278,15 @@ def download_funding_rate(
     )
     api_rows = 0
     while cursor < end_ms:
-        data = None
-        for attempt in range(HTTP_RETRIES + 1):
-            try:
-                response = session.get(
-                    api_url,
-                    params={"symbol": symbol, "startTime": cursor, "endTime": end_ms - 1, "limit": 1000},
-                    timeout=HTTP_TIMEOUT_SECONDS,
-                )
-                response.raise_for_status()
-                data = response.json()
-                break
-            except Exception as exc:
-                if attempt == HTTP_RETRIES:
-                    raise RuntimeError(f"Funding rate API failed for {symbol}: {exc}") from exc
-                time.sleep(RETRY_DELAY_SECONDS)
+        try:
+            data = request_funding_rate_page(
+                session,
+                limiter,
+                api_url,
+                {"symbol": symbol, "startTime": cursor, "endTime": end_ms - 1, "limit": 1000},
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Funding rate API failed for {symbol}: {exc}") from exc
         if not data:
             break
         for item in data:
@@ -1177,7 +1297,7 @@ def download_funding_rate(
         if len(data) < 1000:
             break
     if api_rows:
-        print(f"Funding rate rows from REST API: {api_rows}")
+        LOGGER.info(f"Funding rate rows from REST API: {api_rows}")
 
     if not all_rows:
         raise RuntimeError(f"No funding rate rows found for {symbol} ({market}).")
@@ -1186,7 +1306,7 @@ def download_funding_rate(
     rows = [by_time[k] for k in sorted(by_time)]
     rows = filter_rows_by_dates(rows, start, end)
     if missing:
-        print(f"ℹ️ Funding rate monthly archives not available (tail filled by API): {', '.join(missing)}")
+        LOGGER.warning(f"Funding rate monthly archives not available (tail filled by API): {', '.join(missing)}")
 
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(target.suffix + ".temp")
@@ -1198,7 +1318,7 @@ def download_funding_rate(
         ])
         writer.writerows(rows)
     os.replace(tmp, target)
-    print(f"Funding rate CSV       : {target} ({len(rows)} rows)")
+    LOGGER.info(f"Funding rate CSV       : {target} ({len(rows)} rows)")
     return target
 
 
@@ -1247,7 +1367,7 @@ def main() -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Rebuild the final CSV even if it already exists.",
+        help="Rebuild the final CSV and recheck previously missing archives.",
     )
     parser.add_argument(
         "--no-funding-rate",
@@ -1256,7 +1376,23 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    symbols = list(dict.fromkeys(symbol.upper() for symbol in args.symbols))
+    _, log_file_path = common.setup_session_logger(sub_folder="data_process/binance_download")
+    LOGGER.info("Download log file: %s", log_file_path)
+
+    requested_symbols = list(dict.fromkeys(symbol.upper() for symbol in args.symbols))
+    symbol_aliases = SYMBOL_ALIASES.get(args.market, {})
+    symbols = list(dict.fromkeys(
+        symbol_aliases.get(symbol, symbol) for symbol in requested_symbols
+    ))
+    for requested_symbol in requested_symbols:
+        mapped_symbol = symbol_aliases.get(requested_symbol)
+        if mapped_symbol is not None:
+            LOGGER.info(
+                "Mapping %s %s symbol to Binance contract symbol %s",
+                args.market,
+                requested_symbol,
+                mapped_symbol,
+            )
     intervals = list(dict.fromkeys(args.intervals))
     total_tasks = len(symbols) * len(intervals)
 
@@ -1265,42 +1401,54 @@ def main() -> int:
     funding_succeeded = 0
     funding_failures: list[tuple[str, str]] = []
     with make_session() as session:
+        funding_api_limiter = FundingApiLimiter()
         task_number = 0
         for symbol in symbols:
+            no_kline_archives = False
             for interval in intervals:
                 task_number += 1
-                print(f"\n[Task {task_number}/{total_tasks}] {symbol} {interval}")
+                LOGGER.info(f"\n[Task {task_number}/{total_tasks}] {symbol} {interval}")
+                if no_kline_archives:
+                    reason = "No daily archives found for this market symbol; remaining intervals skipped"
+                    failures.append((symbol, interval, reason))
+                    LOGGER.error(f"Failed {symbol} {interval}: {reason}")
+                    continue
                 try:
-                    destination = download_symbol_interval(args, session, symbol, interval)
+                    download_symbol_interval(args, session, symbol, interval)
                     succeeded += 1
-                    print(f"Completed {symbol} {interval}: {destination}")
                 except Exception as exc:
                     reason = f"{type(exc).__name__}: {exc}"
                     failures.append((symbol, interval, reason))
-                    print(f"Failed {symbol} {interval}: {reason}")
-            if args.market in {"um", "cm"} and not args.no_funding_rate:
+                    LOGGER.error(f"Failed {symbol} {interval}: {reason}")
+                    no_kline_archives = isinstance(exc, NoArchiveError)
+            if no_kline_archives:
+                if args.market in {"um", "cm"} and not args.no_funding_rate:
+                    reason = "No K-line archives found for this market symbol; funding download skipped"
+                    funding_failures.append((symbol, reason))
+                    LOGGER.error(f"Failed {symbol} fundingRate: {reason}")
+            elif args.market in {"um", "cm"} and not args.no_funding_rate:
                 try:
-                    download_funding_rate(args, session, symbol)
+                    download_funding_rate(args, session, symbol, funding_api_limiter)
                     funding_succeeded += 1
                 except Exception as exc:
                     reason = f"{type(exc).__name__}: {exc}"
                     funding_failures.append((symbol, reason))
-                    print(f"Failed {symbol} fundingRate: {reason}")
+                    LOGGER.error(f"Failed {symbol} fundingRate: {reason}")
 
-    print("\n" + "=" * 80)
-    print("All download tasks finished")
-    print(f"K-line tasks: total={total_tasks}, succeeded={succeeded}, failed={len(failures)}")
-    print("Existing output CSVs reused without --force count as succeeded.")
+    LOGGER.info("\n" + "=" * 80)
+    LOGGER.info("All download tasks finished")
+    LOGGER.info(f"K-line tasks: total={total_tasks}, succeeded={succeeded}, failed={len(failures)}")
+    LOGGER.info("Existing output CSVs reused without --force count as succeeded.")
     for symbol, interval, reason in failures:
-        print(f"  Failed {symbol} {interval}: {reason}")
+        LOGGER.error(f"  Failed {symbol} {interval}: {reason}")
     if args.market in {"um", "cm"} and not args.no_funding_rate:
-        print(
+        LOGGER.info(
             f"Funding rate tasks: total={len(symbols)}, "
             f"succeeded={funding_succeeded}, failed={len(funding_failures)}"
         )
         for symbol, reason in funding_failures:
-            print(f"  Failed {symbol} fundingRate: {reason}")
-    print("=" * 80)
+            LOGGER.error(f"  Failed {symbol} fundingRate: {reason}")
+    LOGGER.info("=" * 80)
     return 1 if failures or funding_failures else 0
 
 
@@ -1308,5 +1456,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
+        LOGGER.warning("Interrupted by user.")
         raise SystemExit(130)
