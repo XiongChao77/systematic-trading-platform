@@ -6,6 +6,9 @@ import os,sys
 import random
 import time
 import argparse
+import json
+
+import pandas as pd
 from dataclasses import asdict, dataclass, replace
 
 import numpy as np
@@ -201,6 +204,7 @@ def train_single(
     save_dir: str,
     device: torch.device,
     logger: logging.Logger,
+    evaluate_test: bool = True,
 ) -> SingleRun:
     if task_type in TrainTask.COMBO_TASKS:
         raise ValueError(f"{task_type} is a combo task, not a single-model task")
@@ -211,8 +215,13 @@ def train_single(
     splits = _dataset_splits(task, prepared.splits)
     trainer = build_trainer(model, config, device, logger)
 
-    fit_result = trainer.fit(model, task, splits.train, splits.validation, splits.test)
-    prediction = trainer.predict(model, task, splits.test)
+    fit_result = trainer.fit(
+        model, task, splits.train, splits.validation,
+        splits.test if evaluate_test else None,
+    )
+    prediction = trainer.predict(
+        model, task, splits.test if evaluate_test else splits.validation,
+    )
     metrics = (
         evaluate_regression(prediction, task.labels)
         if task.is_regression
@@ -231,6 +240,7 @@ def train_single(
         label_col=config.data_cfg.label_col,
         seq_len=config.model_cfg.seq_len,
         train_config=asdict(config),
+        evaluation_split="test" if evaluate_test else "validation",
     )
     logger.info(
         "Completed %s: validation_%s=%.4f",
@@ -330,16 +340,230 @@ def train(
     ).report
 
 
+def rolling_windows(start, end, forward_start, config):
+    """Anchor calendar windows to the persisted Forward boundary."""
+    start, end, forward_start = map(pd.Timestamp, (start, end, forward_start))
+    history = config.train_months + config.validation_months
+    offset = 1
+    development = []
+    while True:
+        oos_start = forward_start - pd.DateOffset(months=offset * config.oos_months)
+        if oos_start - pd.DateOffset(months=history) < start:
+            break
+        development.append(oos_start)
+        offset += 1
+    starts = list(reversed(development))
+    offset = 0
+    while forward_start + pd.DateOffset(months=offset * config.oos_months) < end:
+        starts.append(forward_start + pd.DateOffset(months=offset * config.oos_months))
+        offset += 1
+    fixed_train_start = starts[0] - pd.DateOffset(months=history) if starts else None
+    for index, oos_start in enumerate(starts):
+        if oos_start - pd.DateOffset(months=history) < start:
+            raise ValueError("Insufficient history for the first Forward training window")
+        phase = "development" if oos_start < forward_start else "forward"
+        boundary = forward_start if phase == "development" else end
+        yield {
+            "fold_id": f"{index:04d}", "phase": phase,
+            "train_start": (
+                fixed_train_start if config.mode == "expanding"
+                else oos_start - pd.DateOffset(months=history)
+            ).isoformat(),
+            "validation_start": (oos_start - pd.DateOffset(months=config.validation_months)).isoformat(),
+            "oos_start": oos_start.isoformat(),
+            "oos_end": min(
+                starts[index + 1] if index + 1 < len(starts) else end, boundary,
+            ).isoformat(),
+        }
+
+
+def train_rolling(
+    *, configs=None, rolling_config=None,
+    prep_output_dir=common.DATA_OUT_DIR, save_dir=None, logger=None,
+) -> dict:
+    """Retrain fresh heads for each monthly OOS, including the Forward period."""
+    from model.train_config import COMBO_SUB_TASKS, RollingConfig, TriggerModel, DirectionModel
+    from model.artifacts import copy_data_config_meta
+    from model.model_loader import ModelHandler
+
+    logger = logger or logging.getLogger("train")
+    configs = list(configs if configs is not None else (TriggerModel, DirectionModel))
+    rolling_config = rolling_config or RollingConfig()
+    if len(configs) not in (1, 2):
+        raise ValueError("Rolling training requires one model or two fusion heads")
+    tasks = tuple(config.train_task for config in configs)
+    combo = next((name for name, heads in COMBO_SUB_TASKS.items() if tasks == heads), None)
+    if len(configs) == 2 and combo is None:
+        raise ValueError("Rolling fusion heads must be an ordered supported task pair")
+    if any(config.model_cfg.seq_len != configs[0].model_cfg.seq_len or
+           config.feature_conf_list != configs[0].feature_conf_list for config in configs):
+        raise ValueError("Fusion heads must share sequence length and ordered features")
+    save_dir = save_dir or os.path.join(
+        common.TRAIN_OUT_DIR, "rolling" if rolling_config.mode == "sliding" else "expanding",
+    )
+    if os.path.exists(os.path.join(save_dir, "rolling_manifest.json")):
+        raise FileExistsError("Rolling output already exists; select a new save_dir")
+    provenance = common.load_data_manifest_from_dir(prep_output_dir)
+    preparation = common.load_pre_params_from_dir(prep_output_dir)
+    if preparation.label_type == "PURE_BINARY":
+        raise ValueError("Rolling training requires bounded-horizon labels")
+    interval_ms = common.get_interval_ms(preparation.interval)
+    frame = pd.concat([
+        common.load_train_df_from_dir(prep_output_dir),
+        common.load_test_df_from_dir(prep_output_dir),
+    ], ignore_index=True)
+    times = pd.to_datetime(frame["open_time_date_utc"], utc=True)
+    if not times.is_unique or not times.is_monotonic_increasing:
+        raise ValueError("Prepared timestamps must be unique and increasing")
+    forward_start = pd.Timestamp(provenance["split_time"])
+    interval = pd.Timedelta(milliseconds=interval_ms)
+    folds = list(rolling_windows(times.iloc[0], times.iloc[-1] + interval,
+                                 forward_start, rolling_config))
+    if not folds or not any(fold["phase"] == "development" for fold in folds):
+        raise ValueError("Insufficient history for development OOS evaluation")
+    copy_data_config_meta(prep_output_dir, save_dir)
+    manifest = {
+        "status": "running", "data_id": provenance["data_id"],
+        "forward_start": forward_start.isoformat(),
+        "rolling_config": asdict(rolling_config),
+        "configs": [asdict(config) for config in configs],
+        "folds": [], "predictions": "oos_predictions.pkl",
+    }
+
+    def write_manifest():
+        temporary = os.path.join(save_dir, "rolling_manifest.json.tmp")
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2)
+        os.replace(temporary, os.path.join(save_dir, "rolling_manifest.json"))
+
+    with open(os.path.join(save_dir, "train_config.json"), "w", encoding="utf-8") as handle:
+        json.dump(asdict(configs[0]), handle, indent=2)
+    write_manifest()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    predictions = []
+    for fold in folds:
+        logger.info("Rolling fold %s | %s | OOS %s -> %s", fold["fold_id"],
+                    fold["phase"], fold["oos_start"], fold["oos_end"])
+        train_start, valid_start, oos_start, oos_end = (
+            pd.Timestamp(fold[key]) for key in
+            ("train_start", "validation_start", "oos_start", "oos_end")
+        )
+        fold_dir = os.path.join(save_dir, fold["fold_id"])
+        role_dirs = {}
+        fold["sample_counts"] = {}
+        feature_names = None
+        for config in configs:
+            # Only historical rows are materialized; OOS never enters fitting.
+            history_mask = (times >= train_start - interval * config.model_cfg.seq_len) & (times < oos_start)
+            history_frame = frame.loc[history_mask]
+            if config.feature_conf_list is None:
+                factory = common.FeatureFactory(interval_ms)
+                requested = [name for name in dict.fromkeys(
+                    [*factory.base_features, *factory.all_feature_list]
+                ) if name in frame.columns]
+            else:
+                requested = list(config.feature_conf_list)
+            dataset = TimeSeriesWindowDataset(
+                history_frame, interval_ms, requested, config.data_cfg.label_col,
+                config.model_cfg.seq_len, stride=config.stride,
+                show_feature_distribution=False,
+            )
+            sample_times = times.loc[dataset.indices]
+            # Include the full last future candle when deciding label maturity.
+            maturity = sample_times + interval * (preparation.predict_num + 1)
+
+            def select(lower, upper):
+                mask = torch.tensor(
+                    ((sample_times >= lower) & (sample_times < upper) & (maturity <= upper)).to_numpy(),
+                    dtype=torch.bool,
+                )
+                return TensorSplit(dataset.X[mask], dataset.y[mask], dataset.returns[mask])
+
+            train_split = select(train_start, valid_start)
+            valid_split = select(valid_start, oos_start)
+            fold["sample_counts"][config.train_task] = {
+                "train": len(train_split), "validation": len(valid_split),
+            }
+            if feature_names is not None and feature_names != dataset.feature_names:
+                raise ValueError("Fusion feature schemas do not match")
+            feature_names = list(dataset.feature_names)
+            role_dir = os.path.join(fold_dir, config.train_task)
+            prepared = PreparedData(
+                DataSplits(train_split, valid_split, valid_split), feature_names,
+                requested, dataset.feature_count, prep_output_dir,
+            )
+            train_single(task_type=config.train_task, config=config, prepared=prepared,
+                         save_dir=role_dir, device=device, logger=logger, evaluate_test=False)
+            role_dirs[config.train_task.lower()] = role_dir
+            del dataset, prepared, train_split, valid_split
+        model_dir = next(iter(role_dirs.values()))
+        if combo:
+            model_dir = os.path.join(fold_dir, "fusion")
+            save_fusion_run(task_type=combo, role_directories=role_dirs, fusion_dir=model_dir)
+        handler = ModelHandler(model_dir, device)
+        inference_mask = (times >= oos_start - interval * (handler.seq_len + 1)) & (times < oos_end)
+        inference_frame = frame.loc[inference_mask].copy()
+        # Labels and forward-derived returns cannot affect inference eligibility.
+        features_only = inference_frame.drop(columns=[handler.label_col, "trend_strength"], errors="ignore")
+        dataset = TimeSeriesWindowDataset(
+            features_only, interval_ms, handler.feature_cols, None, handler.seq_len,
+            is_live=False, materialize_windows=False, show_feature_distribution=False,
+        )
+        predicted, _, _, sub_predictions = handler.predict_with_ds(
+            dataset, features_only, is_live=False, batch_size=configs[0].batch_size,
+            evaluate_sub_models=False, collect_sub_predictions=True,
+        )
+        columns = ["open_time_date_utc", "pred", "direction_pred", "pred_prob",
+                   "prob_short", "prob_neutral", "prob_long", "net_score"]
+        segment = predicted.loc[(times.loc[predicted.index] >= oos_start), columns].copy()
+        if segment.empty or not segment["pred"].notna().any():
+            raise RuntimeError("Rolling OOS has no valid predictions")
+        if len(sub_predictions.columns):
+            segment = segment.join(sub_predictions)
+        fold_prediction_path = os.path.join(fold_dir, "oos_predictions.pkl")
+        segment.to_pickle(fold_prediction_path)
+        fold["predictions"] = os.path.relpath(fold_prediction_path, save_dir)
+        predictions.append(segment)
+        fold["model_dir"] = os.path.relpath(model_dir, save_dir)
+        fold["prediction_count"] = len(segment)
+        manifest["folds"].append(fold)
+        write_manifest()
+        del handler, dataset
+    stitched = pd.concat(predictions, ignore_index=True)
+    if not stitched["open_time_date_utc"].is_unique:
+        raise RuntimeError("Rolling OOS predictions overlap")
+    stitched.to_pickle(os.path.join(save_dir, manifest["predictions"]))
+    manifest["prediction_columns"] = list(stitched.columns)
+    manifest["status"] = "complete"
+    write_manifest()
+    logger.info("Rolling training complete | folds=%d | OOS rows=%d", len(folds), len(stitched))
+    logger.info("Rolling artifact directory: %s", os.path.abspath(save_dir))
+    logger.info("Rolling summary manifest: %s", os.path.abspath(os.path.join(save_dir, "rolling_manifest.json")))
+    logger.info("Combined OOS predictions: %s", os.path.abspath(os.path.join(save_dir, manifest["predictions"])))
+    return manifest
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train single or rolling models")
+    parser.add_argument("--rolling", action="store_true")
+    parser.add_argument("--mode", choices=("sliding", "expanding"), default="sliding",
+                        help="Training window mode used with --rolling")
+    parser.add_argument("--prep-output-dir", default=common.DATA_OUT_DIR)
+    parser.add_argument("--save-dir")
+    args = parser.parse_args()
     config = SingleModelConfig
     started_at = time.perf_counter()
     session_logger, _ = common.setup_session_logger(sub_folder="train", file_level=logging.DEBUG)
     try:
-        save_dir = os.path.join(common.TRAIN_OUT_DIR, config.train_task)
-        train(config=config, save_dir=save_dir, logger=session_logger)
-        save_dir = os.path.join(common.TRAIN_OUT_DIR, TrainTask.TRIGGER_DIRECTION)
-        fusion_trigger_dir(session_logger, os.path.join(common.TRAIN_OUT_DIR,'TRIGGER'),
-                             os.path.join(common.TRAIN_OUT_DIR,'DIRECTION'), save_dir)
-        # exit()
+        if args.rolling:
+            from model.train_config import RollingConfig
+
+            train_rolling(rolling_config=RollingConfig(mode=args.mode),
+                          prep_output_dir=args.prep_output_dir,
+                          save_dir=args.save_dir, logger=session_logger)
+        else:
+            train(config=config, prep_output_dir=args.prep_output_dir,
+                  save_dir=args.save_dir or os.path.join(common.TRAIN_OUT_DIR, config.train_task),
+                  logger=session_logger)
     finally:
         session_logger.info("Total run time: %.2f s", time.perf_counter() - started_at)

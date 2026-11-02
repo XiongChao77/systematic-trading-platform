@@ -201,14 +201,16 @@ class XGBoostAdapter(SklearnEstimatorAdapter):
         return super().fit(X, y, sample_weight=sample_weight)
 
     def fit_with_validation(
-        self, X, y, validation_X, validation_y, test_X, test_y
+        self, X, y, validation_X, validation_y, test_X=None, test_y=None
     ) -> list[dict[str, float]]:
         X_train = self._flatten(X)
         y_train = self._to_numpy_labels(y)
         X_validation = self._flatten(validation_X)
         y_validation = self._to_numpy_labels(validation_y)
-        X_test = self._flatten(test_X)
-        y_test = self._to_numpy_labels(test_y)
+        has_test = test_X is not None and test_y is not None
+        if has_test:
+            X_test = self._flatten(test_X)
+            y_test = self._to_numpy_labels(test_y)
         sample_weight = self._class_sample_weights(y_train)
 
         estimator = self.pipeline.named_steps["clf"]
@@ -228,17 +230,17 @@ class XGBoostAdapter(SklearnEstimatorAdapter):
             scaler = self.pipeline.named_steps["scaler"]
             X_train = scaler.fit_transform(X_train)
             X_validation = scaler.transform(X_validation)
-            X_test = scaler.transform(X_test)
+            if has_test:
+                X_test = scaler.transform(X_test)
 
+        eval_set = [(X_train, y_train), (X_validation, y_validation)]
+        if has_test:
+            eval_set.append((X_test, y_test))
         estimator.fit(
             X_train,
             y_train,
             sample_weight=sample_weight,
-            eval_set=[
-                (X_train, y_train),
-                (X_validation, y_validation),
-                (X_test, y_test),
-            ],
+            eval_set=eval_set,
             verbose=False,
         )
         self.is_fitted = True
@@ -246,7 +248,6 @@ class XGBoostAdapter(SklearnEstimatorAdapter):
         results = estimator.evals_result()
         train_losses = results["validation_0"][loss_metric]
         validation_losses = results["validation_1"][loss_metric]
-        test_losses = results["validation_2"][loss_metric]
         # Training uses NumPy-backed CPU inputs, so align the fitted booster with
         # those inputs before validation prediction and checkpointing.
         estimator.get_booster().set_param({"device": "cpu"})
@@ -256,21 +257,24 @@ class XGBoostAdapter(SklearnEstimatorAdapter):
         )
         self.best_iteration = best_round
         history = []
-        for round_index, (train_loss, validation_loss, test_loss) in enumerate(
-            zip(train_losses, validation_losses, test_losses)
+        for round_index, (train_loss, validation_loss) in enumerate(
+            zip(train_losses, validation_losses)
         ):
             entry = {
                 "epoch": float(round_index + 1),
                 "train_loss": float(train_loss),
                 "validation_loss": float(validation_loss),
-                "test_loss": float(test_loss),
             }
+            if has_test:
+                entry["test_loss"] = float(results["validation_2"][loss_metric][round_index])
             if self.n_classes > 1:
-                for name, result_key in (
+                precision_sets = [
                     ("train", "validation_0"),
                     ("validation", "validation_1"),
-                    ("test", "validation_2"),
-                ):
+                ]
+                if has_test:
+                    precision_sets.append(("test", "validation_2"))
+                for name, result_key in precision_sets:
                     entry[f"{name}_precision"] = float(
                         results[result_key]["positive_precision"][round_index]
                     )

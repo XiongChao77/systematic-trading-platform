@@ -56,9 +56,13 @@ class TorchTrainer:
         task: TaskStrategy,
         train_split: TensorSplit,
         validation_split: TensorSplit,
-        test_split: TensorSplit,
+        test_split: TensorSplit | None = None,
     ) -> FitResult:
-        if not len(train_split) or not len(validation_split) or not len(test_split):
+        if (
+            not len(train_split)
+            or not len(validation_split)
+            or (test_split is not None and not len(test_split))
+        ):
             raise ValueError("Training, validation and test splits must not be empty")
 
         self.task = task
@@ -103,7 +107,7 @@ class TorchTrainer:
 
             train_loss = total_loss / max(total_samples, 1)
             validation = self.predict(model, task, validation_split)
-            test = self.predict(model, task, test_split)
+            test = self.predict(model, task, test_split) if test_split is not None else None
             validation_f1 = f1_score(
                 validation.y_true,
                 validation.y_pred,
@@ -124,12 +128,13 @@ class TorchTrainer:
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "validation_loss": validation_loss,
-                "test_loss": float(test.loss),
                 "validation_macro_f1": validation_f1,
             }
+            if test is not None:
+                epoch_metrics["test_loss"] = float(test.loss)
             if task.is_regression:
                 epoch_metrics["validation_mae"] = validation_mae
-            else:
+            elif test is not None:
                 # Multiclass tasks need per-class precision; the positive class is
                 # the last configured label for both binary and three-class tasks.
                 class_precisions = precision_score(
@@ -255,7 +260,7 @@ class SklearnTrainer:
         task: TaskStrategy,
         train_split: TensorSplit,
         validation_split: TensorSplit,
-        test_split: TensorSplit,
+        test_split: TensorSplit | None = None,
     ) -> FitResult:
         task.configure(train_split.labels)
         fit_with_validation = getattr(model, "fit_with_validation", None)
@@ -263,7 +268,8 @@ class SklearnTrainer:
             history = fit_with_validation(
                 train_split.X, train_split.y,
                 validation_split.X, validation_split.y,
-                test_split.X, test_split.y,
+                test_split.X if test_split is not None else None,
+                test_split.y if test_split is not None else None,
             )
             # for metrics in history:
             #     self.logger.info(

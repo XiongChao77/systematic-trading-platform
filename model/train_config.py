@@ -24,6 +24,20 @@ class DataConfig:
             raise ValueError("train_ratio + val_ratio must leave a non-empty test split")
 
 
+@dataclass(frozen=True)
+class RollingConfig:
+    train_months: int = 12
+    validation_months: int = 2
+    oos_months: int = 1
+    mode: str = "sliding"
+
+    def __post_init__(self):
+        if self.mode not in ("sliding", "expanding"):
+            raise ValueError("Rolling mode must be sliding or expanding")
+        if min(self.train_months, self.validation_months, self.oos_months) < 1:
+            raise ValueError("Rolling window lengths must be positive calendar months")
+
+
 @dataclass
 class BaseModelConfig:
     seq_len: int = 96

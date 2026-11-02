@@ -58,6 +58,7 @@ def save_single_run(
     label_col: str,
     seq_len: int,
     train_config: dict[str, Any],
+    evaluation_split: str = "test",
 ) -> dict:
     os.makedirs(save_dir, exist_ok=True)
     copy_data_config_meta(prep_output_dir, save_dir)
@@ -103,7 +104,7 @@ def save_single_run(
             "validation_score": fit_result.validation_score,
             "validation_metrics": fit_result.validation_metrics,
         },
-        "test": metrics,
+        evaluation_split: metrics,
     }
     _write_json(metrics_path, metrics_report)
     _write_json(history_path, fit_result.history)

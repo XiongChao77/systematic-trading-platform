@@ -23,7 +23,7 @@ node_modules
 data_process/label_viewer/public
 dow
 .venv/*
-*test*
+test*
 
 # Local experiment sweeps. Keep the tracked example as the default fallback.
 /experiment/task_constructors.py

@@ -228,6 +228,12 @@ def _prediction_artifact_files(train_output_dir: str) -> list[str]:
         if directory in visited:
             return
         visited.add(directory)
+        rolling_path = os.path.join(directory, "rolling_manifest.json")
+        if os.path.isfile(rolling_path):
+            files.add(rolling_path)
+            with open(rolling_path, "r", encoding="utf-8") as handle:
+                rolling_manifest = json.load(handle)
+            files.add(os.path.abspath(os.path.join(directory, rolling_manifest["predictions"])))
         description_path = os.path.join(directory, "task_description.json")
         if os.path.isfile(description_path):
             files.add(description_path)
@@ -458,6 +464,115 @@ def _infer_prediction_payload(
     period: str,
     inference_batch_size: int = 512,
 ) -> dict:
+    rolling_path = os.path.join(train_output_dir, "rolling_manifest.json")
+    if os.path.isfile(rolling_path):
+        with open(rolling_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if manifest.get("status") != "complete":
+            raise ValueError("Rolling predictions require a complete rolling manifest")
+        prep_manifest = common.load_data_manifest_from_dir(data_config.prep_output_dir)
+        if not manifest.get("data_id") or manifest["data_id"] != prep_manifest["data_id"]:
+            raise ValueError("Rolling prediction data_id does not match the preparation manifest")
+
+        saved_predictions = pd.read_pickle(os.path.join(train_output_dir, manifest["predictions"]))
+        time_column = "open_time_date_utc"
+        missing_columns = [column for column in (time_column, *_PREDICTION_COLUMNS) if column not in saved_predictions.columns]
+        if missing_columns:
+            raise ValueError(f"Rolling predictions are missing required columns: {missing_columns}")
+        saved_predictions = saved_predictions.copy()
+        saved_predictions[time_column] = pd.to_datetime(saved_predictions[time_column], utc=True)
+        saved_times = saved_predictions[time_column]
+        if saved_times.isna().any() or not saved_times.is_unique or not saved_times.is_monotonic_increasing:
+            raise ValueError("Rolling prediction timestamps must be unique and chronological")
+        predictions = saved_predictions.set_index(time_column).reindex(pd.to_datetime(frame[time_column], utc=True))
+        predictions.index = frame.index
+        first_valid_idx = predictions["pred"].first_valid_index()
+        if first_valid_idx is None:
+            raise RuntimeError("No valid rolling predictions found in the current dataset")
+
+        time_regions = {name: {} for name in ("train", "valid", "test", "oos")}
+        forward_start = pd.to_datetime(manifest["forward_start"], utc=True)
+        for phase, region_name in (("development", "test"), ("forward", "oos")):
+            folds = [fold for fold in manifest["folds"] if fold["phase"] == phase]
+            if not folds:
+                continue
+            start = min(pd.to_datetime(fold["oos_start"], utc=True) for fold in folds)
+            end = max(pd.to_datetime(fold["oos_end"], utc=True) for fold in folds)
+            phase_mask = saved_times < forward_start if phase == "development" else saved_times >= forward_start
+            region_times = saved_times[(saved_times >= start) & (saved_times <= end) & phase_mask]
+            if region_times.empty:
+                continue
+            time_regions[region_name] = {
+                "start": region_times.iloc[0].isoformat(),
+                "end": region_times.iloc[-1].isoformat(),
+                "sample_count": len(region_times),
+            }
+        handler = model_loader.ModelHandler(
+            tarin_out_path=os.path.join(train_output_dir, manifest["folds"][0]["model_dir"]),
+            device=_resolve_device(data_config.device),
+        )
+        sub_columns = [
+            column for column in predictions.columns
+            if any(
+                column == f"sub_{name}_pred" or column.startswith(f"sub_{name}_prob_")
+                for name in handler.sub_model_task_type
+            )
+        ]
+        sub_predictions = predictions.loc[:, sub_columns]
+        predicted_frame = frame.join(predictions.loc[:, list(_PREDICTION_COLUMNS)])
+        preparation = common.load_pre_params_from_dir(data_config.prep_output_dir)
+        times = pd.to_datetime(predicted_frame[time_column], utc=True)
+        maturity = times + pd.to_timedelta((preparation.predict_num + 1) * interval_ms, unit="ms")
+        labels = predicted_frame[handler.label_col]
+        eligible = (
+            labels.notna()
+            & labels.ne(common.Signal.INVALID)
+            & ((times >= forward_start) | (maturity <= forward_start))
+        )
+        metric_frame = predicted_frame.loc[eligible]
+        fused_rows = metric_frame[[handler.label_col, "pred"]].dropna()
+        model_stats = (
+            handler.evaluate_performance(
+                fused_rows[handler.label_col].astype(int).to_numpy(),
+                fused_rows["pred"].astype(int).to_numpy(),
+            )
+            if not fused_rows.empty else {}
+        )
+        sub_model_stats = {}
+        for name, task_type in handler.sub_model_task_type.items():
+            column = f"sub_{name}_pred"
+            if column not in sub_predictions.columns:
+                continue
+            rows = metric_frame[[handler.label_col]].join(sub_predictions[[column]]).dropna()
+            if rows.empty:
+                sub_model_stats[name] = {}
+                continue
+            mask, targets = handler._binary_task_targets(
+                rows[handler.label_col].astype(int).to_numpy(), task_type
+            )
+            if not mask.any():
+                sub_model_stats[name] = {}
+                continue
+            stats = handler.evaluate_performance(
+                targets[mask], rows[column].astype(int).to_numpy()[mask]
+            )
+            stats.pop("signal", None)
+            sub_model_stats[name] = {"task_type": task_type, **stats}
+        stage_model_stats = handler.stage_performance(
+            metric_frame,
+            time_regions,
+            sub_model_predictions=sub_predictions.loc[eligible],
+        )
+        return {
+            "schema": _PREDICTION_CACHE_SCHEMA,
+            "predictions": predictions,
+            "first_valid_idx": first_valid_idx,
+            "model_stats": model_stats,
+            "sub_model_stats": sub_model_stats,
+            "stage_model_stats": stage_model_stats,
+            "time_regions": time_regions,
+        }
+
     handler = model_loader.ModelHandler(
         tarin_out_path=train_output_dir,
         device=_resolve_device(data_config.device),
@@ -609,10 +724,10 @@ def _load_model_data(
     time_regions = payload["time_regions"]
     logger.info(
         "Model time regions | train=%s | valid=%s | test=%s | OOS=%s",
-        time_regions["train"]["start"],
-        time_regions["valid"]["start"],
-        time_regions["test"]["start"],
-        time_regions["oos"]["start"],
+        time_regions["train"].get("start"),
+        time_regions["valid"].get("start"),
+        time_regions["test"].get("start"),
+        time_regions["oos"].get("start"),
     )
     logger.info(f"Backtest range: {frame['open_time_date_utc'].min()} " f"to {frame['open_time_date_utc'].max()}")
     return (

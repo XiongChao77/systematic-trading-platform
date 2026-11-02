@@ -472,7 +472,7 @@ class ModelHandler(MetaConfig):
         return frame, stats
 
     def predict_with_ds(self, ds, df, is_live=True, batch_size=512, diff_thresh=None,
-                        min_thresh=0.3, evaluate_sub_models=False):
+                        min_thresh=0.3, evaluate_sub_models=False, collect_sub_predictions=False):
         """Return aligned predictions, fused metrics, optional sub-model metrics and
         per-row sub-model predictions.
 
@@ -501,7 +501,9 @@ class ModelHandler(MetaConfig):
         probs_list = []
         direction_preds_list = []
         collected = {name: ([], []) for name in self.loaded_sub_models} if evaluate_sub_models else {}
-        sub_model_probs = {name: [] for name in collected}
+        sub_model_probs = {
+            name: [] for name in self.loaded_sub_models
+        } if evaluate_sub_models or collect_sub_predictions else {}
         self.model.eval()
         with torch.no_grad():
             for xb, labels, returns in self._inference_batches(ds, batch_size):
@@ -509,9 +511,10 @@ class ModelHandler(MetaConfig):
                 if is_regression:
                     probs_list.append(self.model(xb).reshape(-1).cpu().numpy())
                 else:
-                    if collected:
+                    if sub_model_probs:
                         _, fused_probs, outputs = self.model.forward_with_submodel_logits(xb)
-                        self._collect_sub_model_batch(outputs, labels, returns, collected)
+                        if collected:
+                            self._collect_sub_model_batch(outputs, labels, returns, collected)
                         for name, logits in outputs.items():
                             sub_model_probs[name].append(
                                 torch.softmax(logits.detach().float(), dim=1).cpu().numpy()
