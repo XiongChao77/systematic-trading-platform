@@ -14,11 +14,44 @@ class TensorSplit(Dataset):
     X: torch.Tensor
     y: torch.Tensor
     returns: torch.Tensor
+    assets: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         size = len(self.X)
         if len(self.y) != size or len(self.returns) != size:
             raise ValueError("X, y and returns must contain the same number of samples")
+
+        if self.assets is not None:
+            if self.assets.ndim != 1 or len(self.assets) != size:
+                raise ValueError("assets must contain one integer ID per sample")
+            if self.assets.dtype not in {
+                torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
+            }:
+                raise ValueError("assets must use an integer tensor dtype")
+
+    def asset_groups(self) -> list[np.ndarray]:
+        if self.assets is None:
+            return [np.arange(len(self))]
+        assets = self.assets.detach().cpu().numpy()
+        return [np.flatnonzero(assets == asset) for asset in np.unique(assets)]
+
+    def balanced_sample_weights(self, sample_weight=None) -> np.ndarray:
+        """Normalize existing weights to equal asset totals and an overall mean of one."""
+        if sample_weight is None:
+            weights = np.ones(len(self), dtype=np.float64)
+        elif isinstance(sample_weight, torch.Tensor):
+            weights = sample_weight.detach().cpu().numpy().astype(np.float64, copy=True)
+        else:
+            weights = np.array(sample_weight, dtype=np.float64, copy=True)
+        if weights.shape != (len(self),) or not np.isfinite(weights).all() or (weights < 0).any():
+            raise ValueError("Sample weights must be finite, non-negative and match the split")
+        groups = self.asset_groups()
+        for indices in groups:
+            total = weights[indices].sum()
+            if total <= 0:
+                raise ValueError("Each asset must have positive total sample weight")
+            weights[indices] *= len(self) / (len(groups) * total)
+        return weights
 
     @property
     def labels(self) -> np.ndarray:

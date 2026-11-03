@@ -6,15 +6,20 @@ from data_process import common
 from data_process import feature
 
 DOGE_15m_TBM =common.BaseDefine(
-    market_category="Cryptocurrency", data_source="binance_public_data", symbol="DOGEUSDT", interval="15m", 
-    trading_type='um', label_type="TBM", 
+    market_category="Cryptocurrency", data_source="binance_public_data", symbols=("DOGEUSDT",), interval="15m",
+    trading_type='um', label_type="TBM",
     vol_ewma_span=4*24*7,
-    predict_num=4*12, 
+    predict_num=4*12,
     vol_multiplier_long=10,
-    stop_multiplier_rate_long=0.618, 
-    vol_multiplier_short=10, 
+    stop_multiplier_rate_long=0.618,
+    vol_multiplier_short=10,
     stop_multiplier_rate_short=0.618,
     tbm_take_profit_price="close", min_expected_move_pct=0.1, version = 0,
+)
+
+DOGE_AAVE_15m_TBM = replace(
+    DOGE_15m_TBM,
+    symbols=("DOGEUSDT", "AAVEUSDT"),
 )
 
 DOGE_1m_TBM = replace(
@@ -45,7 +50,7 @@ DOGE_5m_TBM = replace(
 )
 
 DOGE_15m_BBM =common.BaseDefine(
-    market_category="Cryptocurrency", data_source="binance_public_data", symbol="DOGEUSDT", interval="15m", 
+    market_category="Cryptocurrency", data_source="binance_public_data", symbols=("DOGEUSDT",), interval="15m",
     trading_type='um', label_type="BBM", vol_ewma_span=20, predict_num=64, vol_multiplier_long=8,
     stop_multiplier_rate_long=0.4, vol_multiplier_short=8, stop_multiplier_rate_short=0.4,
     tbm_take_profit_price="close", min_expected_move_pct=0, version = 0,
@@ -54,7 +59,7 @@ DOGE_15m_BBM =common.BaseDefine(
 DOGE_1m_PURE_BINARY = common.PureBinaryDefine(
     market_category="Cryptocurrency",
     data_source="binance_public_data",
-    symbol="DOGEUSDT",
+    symbols=("DOGEUSDT",),
     interval="1m",
     trading_type="um",
     pure_binary_threshold_pct=0.005,

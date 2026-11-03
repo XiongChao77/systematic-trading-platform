@@ -595,12 +595,23 @@ def plot_equity_curves(
             oos_start = parsed_oos_start.tz_convert(None)
 
     if price_file is None:
-        market_params = safe_get(first_report, ["params", "common"])
+        market_params = safe_get(first_report, ["params", "common"]) or {}
+        data_params = safe_get(first_report, ["params", "data"]) or {}
+        symbol = data_params.get("symbol")
+        if not symbol:
+            symbols = tuple(market_params.get("symbols") or ())
+            if len(symbols) == 1:
+                symbol = symbols[0]
+        if not symbol:
+            raise ValueError(
+                "Cannot resolve the backtest symbol for the equity price plot; "
+                "pass price_file explicitly."
+            )
         price_source = common.MarketDataSourceConfig(
             market_category=market_params["market_category"],
             data_source=market_params["data_source"],
             trading_type=market_params["trading_type"],
-            symbol=market_params["symbol"],
+            symbols=(symbol,),
             interval=market_params["interval"],
         )
         price_file = common.market_data_path(price_source)

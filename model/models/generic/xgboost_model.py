@@ -201,7 +201,8 @@ class XGBoostAdapter(SklearnEstimatorAdapter):
         return super().fit(X, y, sample_weight=sample_weight)
 
     def fit_with_validation(
-        self, X, y, validation_X, validation_y, test_X=None, test_y=None
+        self, X, y, validation_X, validation_y, test_X=None, test_y=None,
+        sample_weight=None,
     ) -> list[dict[str, float]]:
         X_train = self._flatten(X)
         y_train = self._to_numpy_labels(y)
@@ -211,7 +212,13 @@ class XGBoostAdapter(SklearnEstimatorAdapter):
         if has_test:
             X_test = self._flatten(test_X)
             y_test = self._to_numpy_labels(test_y)
-        sample_weight = self._class_sample_weights(y_train)
+        base_weight = self._class_sample_weights(y_train)
+        if sample_weight is not None:
+            sample_weight = np.asarray(sample_weight, dtype=np.float64)
+            if base_weight is not None:
+                sample_weight = sample_weight * base_weight
+        else:
+            sample_weight = base_weight
 
         estimator = self.pipeline.named_steps["clf"]
         loss_metric = self.loss_metric

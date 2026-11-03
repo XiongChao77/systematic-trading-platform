@@ -1933,7 +1933,10 @@ def main():
         for r in records:
             row = extract_row(r, report_file)
             rows.append(row)
-    symbol = rows[0]["forward"]["params"]["common"]["symbol"]
+    common_cfg = rows[0]["forward"]["params"]["common"]
+    symbol = common_cfg.get("symbol") or common_cfg.get("symbols")
+    if isinstance(symbol, (list, tuple)):
+        symbol = symbol[0] if symbol else "unknown"
     interval = rows[0]["forward"]["params"]["common"]["interval"]
     print(f"Total reports loaded: {len(rows)}")
     uin_records = merge_selected(rows)

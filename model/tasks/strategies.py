@@ -97,7 +97,7 @@ class ThreeClassRegressionTask(TaskStrategy):
                 f"Regression task expects Signal labels {self.labels}; "
                 f"found {sorted(unexpected)}"
             )
-        return TensorSplit(split.X, split.y.float(), split.returns)
+        return TensorSplit(split.X, split.y.float(), split.returns, split.assets)
 
     def forward(self, model: torch.nn.Module, inputs: torch.Tensor) -> torch.Tensor:
         return model(inputs).reshape(-1)
@@ -149,7 +149,7 @@ class DirectThreeClassTask(TaskStrategy):
                 "Direct three-class task received labels outside Signal values: "
                 f"{sorted(set(split.labels.tolist()) - set(self.labels))}"
             )
-        return TensorSplit(split.X, targets.long(), split.returns)
+        return TensorSplit(split.X, targets.long(), split.returns, split.assets)
 
     def configure(self, train_labels: np.ndarray) -> None:
         sampling_ratio = self.config.minority_sampling_ratio
@@ -219,21 +219,22 @@ class BinaryTask(TaskStrategy):
     def dataset_split(self, split: TensorSplit) -> TensorSplit:
         y = split.y
         if self.task_type == TrainTask.TRIGGER:
-            return TensorSplit(split.X, (y != int(Signal.NEUTRAL)).long(), split.returns)
+            return TensorSplit(split.X, (y != int(Signal.NEUTRAL)).long(), split.returns, split.assets)
         if self.task_type == TrainTask.DIRECTION:
             mask = y != int(Signal.NEUTRAL)
             return TensorSplit(
                 split.X[mask],
                 (y[mask] == int(Signal.POSITIVE)).long(),
                 split.returns[mask],
+                split.assets[mask] if split.assets is not None else None,
             )
         if self.task_type == TrainTask.LONG_OVR:
             return TensorSplit(
-                split.X, (y == int(Signal.POSITIVE)).long(), split.returns
+                split.X, (y == int(Signal.POSITIVE)).long(), split.returns, split.assets
             )
         if self.task_type == TrainTask.SHORT_OVR:
             return TensorSplit(
-                split.X, (y == int(Signal.NEGATIVE)).long(), split.returns
+                split.X, (y == int(Signal.NEGATIVE)).long(), split.returns, split.assets
             )
         raise ValueError(f"Unsupported binary task: {self.task_type}")
 
@@ -296,7 +297,7 @@ class DualHeadThreeClassTask(TaskStrategy):
                 "Dual-head task received labels outside Signal values: "
                 f"{sorted(set(split.labels.tolist()) - set(self.labels))}"
             )
-        return TensorSplit(split.X, targets.long(), split.returns)
+        return TensorSplit(split.X, targets.long(), split.returns, split.assets)
 
     def configure(self, train_labels: np.ndarray) -> None:
         neutral_index = self.labels.index(int(Signal.NEUTRAL))

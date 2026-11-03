@@ -13,7 +13,7 @@ from sklearn.metrics import (
     mean_squared_error,
     precision_score,
 )
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from model.tasks.strategies import TaskStrategy
@@ -33,7 +33,16 @@ class TorchTrainer:
         self.logger = logger
 
     def _loader(self, split: TensorSplit, *, training: bool) -> DataLoader:
-        sampler = self.task.sampler(split.labels) if training else None
+        sampler = None
+        if training:
+            if split.assets is not None:
+                sampler = WeightedRandomSampler(
+                    split.balanced_sample_weights(),
+                    num_samples=len(split),
+                    replacement=True,
+                )
+            else:
+                sampler = self.task.sampler(split.labels)
         return DataLoader(
             split,
             batch_size=self.config.batch_size,
@@ -263,6 +272,11 @@ class SklearnTrainer:
         test_split: TensorSplit | None = None,
     ) -> FitResult:
         task.configure(train_split.labels)
+        sample_weight = (
+            train_split.balanced_sample_weights()
+            if train_split.assets is not None
+            else None
+        )
         fit_with_validation = getattr(model, "fit_with_validation", None)
         if callable(fit_with_validation):
             history = fit_with_validation(
@@ -270,6 +284,7 @@ class SklearnTrainer:
                 validation_split.X, validation_split.y,
                 test_split.X if test_split is not None else None,
                 test_split.y if test_split is not None else None,
+                sample_weight=sample_weight,
             )
             # for metrics in history:
             #     self.logger.info(
@@ -286,7 +301,10 @@ class SklearnTrainer:
                     best["validation_loss"],
                 )
         else:
-            model.fit(train_split.X, train_split.y)
+            if sample_weight is not None:
+                model.fit(train_split.X, train_split.y, sample_weight=sample_weight)
+            else:
+                model.fit(train_split.X, train_split.y)
             history = []
         validation = self.predict(model, task, validation_split)
         macro_f1 = f1_score(

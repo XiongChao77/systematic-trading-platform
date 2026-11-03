@@ -262,6 +262,32 @@ def _validate_period(period: str) -> str:
     return period
 
 
+def _resolve_target_symbol(
+    data_config: ModelDataConfig,
+    pre_para: "BaseDefine",
+) -> Optional[str]:
+    """Return the backtest target symbol for multiasset prepared data, else None."""
+    symbols = tuple(getattr(pre_para, "symbols", ()) or ())
+    if len(symbols) <= 1:
+        return None
+    if not data_config.symbol:
+        raise ValueError(
+            "Multiasset preparation requires a backtest target symbol "
+            f"(data_config.symbol); prepared symbols={list(symbols)}"
+        )
+    if data_config.symbol not in symbols:
+        raise ValueError(
+            f"Unknown target symbol {data_config.symbol!r}; prepared symbols={list(symbols)}"
+        )
+    return data_config.symbol
+
+
+def _select_symbol_frame(frame: pd.DataFrame, symbol: Optional[str]) -> pd.DataFrame:
+    if symbol is None or "symbol" not in frame.columns:
+        return frame
+    return frame.loc[frame["symbol"] == symbol].copy()
+
+
 def _prediction_cache_path(
     data_config: ModelDataConfig,
     train_output_dir: str,
@@ -285,6 +311,7 @@ def _prediction_cache_path(
     identity = {
         "schema": _PREDICTION_CACHE_SCHEMA,
         "period": period,
+        "symbol": data_config.symbol,
         "prep_output_dir": os.path.abspath(data_config.prep_output_dir),
         "train_output_dir": os.path.abspath(train_output_dir),
         "sources": signatures,
@@ -365,16 +392,17 @@ def combine_model_period_frames(
 def _load_model_period_frame(
     data_config: ModelDataConfig,
     period: str,
+    symbol: Optional[str] = None,
 ) -> pd.DataFrame:
     period = _validate_period(period)
     if period == "long":
-        return common.load_train_df_from_dir(data_config.prep_output_dir)
+        return _select_symbol_frame(common.load_train_df_from_dir(data_config.prep_output_dir), symbol)
     if period == "forward":
-        return common.load_test_df_from_dir(data_config.prep_output_dir)
+        return _select_symbol_frame(common.load_test_df_from_dir(data_config.prep_output_dir), symbol)
     if period == "all":
         return combine_model_period_frames(
-            common.load_train_df_from_dir(data_config.prep_output_dir),
-            common.load_test_df_from_dir(data_config.prep_output_dir),
+            _select_symbol_frame(common.load_train_df_from_dir(data_config.prep_output_dir), symbol),
+            _select_symbol_frame(common.load_test_df_from_dir(data_config.prep_output_dir), symbol),
         )
     raise AssertionError("validated period was not handled")
 
@@ -480,6 +508,11 @@ def _infer_prediction_payload(
         if missing_columns:
             raise ValueError(f"Rolling predictions are missing required columns: {missing_columns}")
         saved_predictions = saved_predictions.copy()
+        if "symbol" in saved_predictions.columns:
+            pre_para = common.load_pre_params_from_dir(data_config.prep_output_dir)
+            target_symbol = _resolve_target_symbol(data_config, pre_para)
+            if target_symbol is not None:
+                saved_predictions = saved_predictions.loc[saved_predictions["symbol"] == target_symbol].copy()
         saved_predictions[time_column] = pd.to_datetime(saved_predictions[time_column], utc=True)
         saved_times = saved_predictions[time_column]
         if saved_times.isna().any() or not saved_times.is_unique or not saved_times.is_monotonic_increasing:
@@ -628,7 +661,8 @@ def _infer_prediction_payload(
 
 def _prediction_inputs(data_config: ModelDataConfig, period: str):
     pre_para: BaseDefine = common.load_pre_params_from_dir(data_config.prep_output_dir)
-    frame = _load_model_period_frame(data_config, period).copy()
+    target_symbol = _resolve_target_symbol(data_config, pre_para)
+    frame = _load_model_period_frame(data_config, period, symbol=target_symbol).copy()
     frame["open_time_date_utc"] = pd.to_datetime(frame["open_time_date_utc"], utc=True)
     train_output_dir = data_config.train_output_dir
     if not os.path.isabs(train_output_dir):
@@ -1104,7 +1138,7 @@ def build_stage_summary(
             ),
             "seq_len": getattr(getattr(train_cfg, "model_cfg", None), "seq_len", None),
             "stride": getattr(train_cfg, "stride", None),
-            "symbol": getattr(pre_para, "symbol", None),
+            "symbol": ",".join(getattr(pre_para, "symbols", ())) or None,
             "interval": getattr(pre_para, "interval", None),
             "horizon_bars": getattr(pre_para, "predict_num", None),
             "sub_models": sorted(
@@ -2593,7 +2627,11 @@ def main(
         preparation_manifest = common.load_data_manifest_from_dir(
             config.data_config.prep_output_dir,
         )
-        data_manifest = preparation_manifest["source"]
+        data_manifest = (
+            preparation_manifest["source"]
+            if "source" in preparation_manifest
+            else preparation_manifest.get("sources")
+        )
         saved_train_config = _load_train_config(config.data_config.train_output_dir)
         (
             frame,
@@ -3408,11 +3446,27 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip the standalone train/valid/test/forward stage backtests.",
     )
+    parser.add_argument(
+        "--symbol",
+        default=None,
+        help="Target symbol required when prepared data contains multiple symbols.",
+    )
     args = parser.parse_args()
     train_output_dir = os.path.join(common.TRAIN_OUT_DIR, train_config.TrainTask.TRIGGER_DIRECTION)
     start_time = time.time()
     pre_para: BaseDefine = common.load_pre_params_from_dir(train_output_dir)
-    exp_dir = common.create_experiment_dir(os.path.join(common.PERSISTENCE_DIR, "simulation"), pre_para.symbol, pre_para.interval)
+    symbols = tuple(getattr(pre_para, "symbols", ()) or ())
+    if len(symbols) > 1:
+        target_symbol = args.symbol
+        if not target_symbol:
+            raise SystemExit(
+                "Multiasset preparation requires --symbol (prepared symbols: "
+                + ", ".join(symbols)
+                + ")"
+            )
+    else:
+        target_symbol = symbols[0] if symbols else None
+    exp_dir = common.create_experiment_dir(os.path.join(common.PERSISTENCE_DIR, "simulation"), target_symbol or "unknown", pre_para.interval)
     logger, _ = common.setup_session_logger(log_file_path=os.path.join(exp_dir, "experiment.log"), console_level=logging.INFO, file_level=logging.INFO)
     strategy_config = BbmStrategyConfig(fixed_hold_bars = pre_para.predict_num)#int(pre_para.predict_num))
     broker_config = BrokerConfig()
@@ -3421,7 +3475,7 @@ if __name__ == "__main__":
         broker_config=broker_config,
         save_dir=exp_dir,
         experiment_context=ExperimentContext(git_commit=common.git_revision()),
-        data_config=ModelDataConfig(prep_output_dir=common.DATA_OUT_DIR, train_output_dir=train_output_dir, device="auto"),
+        data_config=ModelDataConfig(prep_output_dir=common.DATA_OUT_DIR, train_output_dir=train_output_dir, device="auto", symbol=target_symbol),
     )
     result = main(
         logger,

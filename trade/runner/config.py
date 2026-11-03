@@ -46,6 +46,7 @@ class ModelDataConfig:
     prediction_cache_dir: Optional[str] = None
     device: str = "auto"  # 'auto'/'cuda'/'cpu'
     use_prediction_cache: bool = False
+    symbol: Optional[str] = None  # Target symbol for multiasset prepared data
 
 @dataclass(kw_only=True)
 class CsvDataConfig(common.MarketDataSourceConfig):

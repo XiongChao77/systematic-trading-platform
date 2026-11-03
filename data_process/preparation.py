@@ -60,11 +60,80 @@ def _load_tbm_intrabar_data(para, logger):
     return frame, {"interval": source.interval, **_source_descriptor(frame, path)}
 
 
-def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,feature_conf_list=[],para: common.PreparationConfig = common.BaseDefine(), prep_output_dir =common.DATA_OUT_DIR ):
+def _prepare_multiasset(logger, feature_group_list, feature_conf_list, para,
+                        prep_output_dir, split_time, start_time, end_time):
+    sources = {}
+    for symbol in para.symbols:
+        source = replace(para, symbols=(symbol,))
+        path = common.market_data_path(source)
+        frame = pd.read_csv(path, usecols=["open_time_ms_utc"])
+        sources[symbol] = _source_descriptor(frame, path)
+    shared_start = max(pd.Timestamp(source["start"]) for source in sources.values())
+    shared_end = min(pd.Timestamp(source["end"]) for source in sources.values())
+    if start_time is not None:
+        shared_start = max(shared_start, pd.to_datetime(start_time, utc=True))
+    if end_time is not None:
+        shared_end = min(shared_end, pd.to_datetime(end_time, utc=True))
+    if shared_start > shared_end:
+        raise ValueError("Market-data sources have no overlapping time range")
+    manifest_path = common.get_data_manifest_path_in_dir(prep_output_dir)
+    if os.path.isfile(manifest_path):
+        split_time = common.load_data_manifest_from_dir(prep_output_dir)["split_time"]
+    split_ts = (shared_end - pd.DateOffset(months=3) if split_time is None
+                else pd.to_datetime(split_time, utc=True))
+    assets = {}
+    train_frames = []
+    test_frames = []
+    for symbol in para.symbols:
+        child_dir = os.path.join(prep_output_dir, symbol)
+        child_manifest = main(
+            logger, feature_group_list, feature_conf_list,
+            para=replace(para, symbols=(symbol,)), prep_output_dir=child_dir,
+            split_time=split_ts, start_time=shared_start, end_time=shared_end,
+        )
+        assets[symbol] = {"directory": symbol, **child_manifest}
+        train_frames.append(common.load_train_df_from_dir(child_dir))
+        test_frames.append(common.load_test_df_from_dir(child_dir))
+    train_df = pd.concat(train_frames, ignore_index=True)
+    test_df = pd.concat(test_frames, ignore_index=True)
+    common.save_train_df_to_dir(train_df, prep_output_dir)
+    common.save_test_df_to_dir(test_df, prep_output_dir)
+    safe_para = common.json_safe(asdict(para))
+    with open(common.get_data_config_path_in_dir(prep_output_dir), "w", encoding="utf-8") as handle:
+        json.dump(safe_para, handle, indent=4, ensure_ascii=False)
+    manifest_payload = {
+        "schema_version": 3,
+        "symbols": list(para.symbols),
+        "sources": sources,
+        "assets": assets,
+        "configuration_hash": param_hash(safe_para),
+        "features": child_manifest["features"],
+        "time": {
+            "start": shared_start.isoformat(),
+            "end": shared_end.isoformat(),
+            "row_count": int(len(train_df) + len(test_df)),
+        },
+        "split_time": pd.Timestamp(split_ts).isoformat(),
+    }
+    manifest = {**manifest_payload, "data_id": common.data_manifest_id(manifest_payload)}
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, ensure_ascii=False)
+    logger.info("Multiasset preparation completed: symbols=%s | data_id=%s", para.symbols, manifest["data_id"])
+    return manifest
+
+
+def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,feature_conf_list=[],para: common.PreparationConfig = common.BaseDefine(), prep_output_dir =common.DATA_OUT_DIR,
+         split_time=None, start_time=None, end_time=None):
     if isinstance(para, common.BaseDefine):
         # Persist the effective scan interval so downstream artifacts describe
         # the actual labeling source rather than an unresolved automatic value.
         para = replace(para, tbm_intrabar_interval=para.resolve_tbm_intrabar_interval())
+    if len(para.symbols) > 1:
+        return _prepare_multiasset(
+            logger, feature_group_list, feature_conf_list, para,
+            prep_output_dir, split_time, start_time, end_time,
+        )
+    os.makedirs(prep_output_dir, exist_ok=True)
     file = common.market_data_path(para)
     logger.info(f"using file :{file}")
     # 1. Convert interval string to milliseconds
@@ -73,6 +142,16 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
     # 2. Persist metadata for labeling and downstream model usage
     df = pd.read_csv(file)
     source_descriptor = _source_descriptor(df, file)
+    if start_time is not None or end_time is not None:
+        times = pd.to_datetime(df["open_time_ms_utc"], unit="ms", utc=True)
+        selected = pd.Series(True, index=df.index)
+        if start_time is not None:
+            selected &= times >= pd.to_datetime(start_time, utc=True)
+        if end_time is not None:
+            selected &= times <= pd.to_datetime(end_time, utc=True)
+        df = df.loc[selected].reset_index(drop=True)
+        if df.empty:
+            raise ValueError("No market data remains within the shared time bounds")
     if para.market_category == 'Cryptocurrency':
         common.validate_kline_source(
             df,
@@ -82,12 +161,20 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
         )
     df = common.clean_data_quality_auto(df,logger)
     intrabar_df, intrabar_source = _load_tbm_intrabar_data(para, logger)
+    if intrabar_df is not None:
+        intrabar_times = pd.to_datetime(intrabar_df["open_time_ms_utc"], unit="ms", utc=True)
+        if start_time is not None:
+            intrabar_df = intrabar_df.loc[intrabar_times >= pd.to_datetime(start_time, utc=True)]
+        if end_time is not None:
+            intrabar_df = intrabar_df.loc[intrabar_times.loc[intrabar_df.index] <= pd.to_datetime(end_time, utc=True)]
+        intrabar_df = intrabar_df.reset_index(drop=True)
     is_pure_binary = isinstance(para, common.PureBinaryDefine)
     if is_pure_binary:
         df['open_time_date_utc'] = pd.to_datetime(df['open_time_ms_utc'], unit='ms', utc=True)
         latest_time = df['open_time_date_utc'].max()
         start_ts = latest_time - pd.DateOffset(months=6)
-        split_ts = latest_time - pd.DateOffset(months=3)
+        split_ts = (latest_time - pd.DateOffset(months=3) if split_time is None
+                    else pd.to_datetime(split_time, utc=True))
         df = df.loc[df['open_time_date_utc'] >= start_ts].sort_values('open_time_date_utc').reset_index(drop=True)
         logger.info("PURE_BINARY data window: %s -> %s; backtest starts at %s", start_ts, latest_time, split_ts)
     # 3. Pass interval_ms to label logic so it can adapt its volatility window to the real time span.
@@ -155,7 +242,9 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
     # 3. Split and persist datasets
     # ---------------------------------------------------------
     if not is_pure_binary:
-        split_ts = pd.to_datetime(df['open_time_date_utc'].iloc[-1], utc=True) - pd.DateOffset(months=3)
+        split_ts = (pd.to_datetime(df['open_time_date_utc'].iloc[-1], utc=True) - pd.DateOffset(months=3)
+                    if split_time is None else pd.to_datetime(split_time, utc=True))
+    df["symbol"] = para.symbol
     times = pd.to_datetime(df['open_time_date_utc'], utc=True)
     train_df, test_df = df[times < split_ts], df[times >= split_ts]
 
@@ -215,7 +304,7 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
 if __name__ == "__main__":
 #**********column info: open_time_date_utc,open,high,low,close,volume,close_time_ms_utc,quote_asset_volume,number_of_trades,taker_buy_base_volume,taker_buy_quote_volume,ignore
     logger, _ = common.setup_session_logger(sub_folder='data_process')
-    pare_para = config.DOGE_15m_TBM
+    pare_para = config.DOGE_AAVE_15m_TBM
     if pare_para.market_category == 'Forex':
         feature_conf_list = feature.FEATURE_LIST_COMMODITY
     else:

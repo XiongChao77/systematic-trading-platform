@@ -46,3 +46,4 @@ orderbook_output
 .pytest_cache/
 test*
 .vscode/
+experiment/sweep_outputs/

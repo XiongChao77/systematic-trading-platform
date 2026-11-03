@@ -87,6 +87,23 @@ def _required_dict(parent: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
+def _resolve_symbol(common_params: dict[str, Any], data_params: dict[str, Any]) -> str:
+    """Resolve the single backtest symbol from report params."""
+    target = data_params.get("symbol")
+    if target:
+        return str(target)
+    symbols = common_params.get("symbols")
+    if isinstance(symbols, (list, tuple)):
+        if len(symbols) == 1:
+            return str(symbols[0])
+        raise ValueError(
+            "Multiasset report requires params.data.symbol to rerun a backtest"
+        )
+    if symbols:
+        return str(symbols)
+    raise ValueError("Missing both params.common.symbols and params.data.symbol")
+
+
 def build_runner_config(
     period_report: dict[str, Any],
     *,
@@ -116,6 +133,7 @@ def build_runner_config(
         prep_output_dir=str(prep_output_dir),
         train_output_dir=str(train_output_dir),
         device=str(data_params.get("device", "cpu")),
+        symbol=str(data_params["symbol"]) if data_params.get("symbol") else None,
     )
     runner_config = backtest_runner.RunnerConfig(
         strategy_config=strategy_config,
@@ -267,7 +285,8 @@ def main() -> None:
 
     params = _required_dict(period_report, "params")
     common_params = _required_dict(params, "common")
-    symbol = str(common_params["symbol"])
+    data_params = _required_dict(params, "data")
+    symbol = _resolve_symbol(common_params, data_params)
     interval = str(common_params["interval"])
     output_dir = common.create_experiment_dir(
         os.path.join(common.PERSISTENCE_DIR, "simulation"),

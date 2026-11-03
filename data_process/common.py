@@ -55,13 +55,28 @@ os.makedirs(DATA_OUT_DIR, exist_ok=True)
 
 @dataclass
 class MarketDataSourceConfig:
-    """Fields that uniquely locate one raw market-data file."""
+    """Market-data sources sharing a market, interval, and trading type."""
 
     market_category: str = "Cryptocurrency"  # cryptocurrency / Stock / Forex
     data_source: str = "binance_public_data"  # binance / yahoo / dukascopy
-    symbol: str = "DOGEUSDT"  # BTCUSDT ETHUSDT DOGEUSDT XAUUSD
+    symbols: tuple[str, ...] | list[str] = ("DOGEUSDT",)
     interval: str = "30m"
     trading_type: str = "um"  # spot  / um(USDT-M Futures) / cm    (Coin-M Futures)
+
+    def __post_init__(self):
+        if not isinstance(self.symbols, (tuple, list)) or not self.symbols:
+            raise ValueError("symbols must be a nonempty tuple or list")
+        if any(not isinstance(symbol, str) or not symbol.strip() for symbol in self.symbols):
+            raise ValueError("symbols must contain nonempty strings")
+        if len(set(self.symbols)) != len(self.symbols):
+            raise ValueError("symbols must be unique")
+        self.symbols = tuple(self.symbols)
+
+    @property
+    def symbol(self) -> str:
+        if len(self.symbols) != 1:
+            raise ValueError("A single symbol is required for this operation")
+        return self.symbols[0]
 
 
 @dataclass
@@ -82,6 +97,7 @@ class BaseDefine(MarketDataSourceConfig):
     version: float = 0.1
 
     def __post_init__(self):
+        super().__post_init__()
         if self.label_type == "PURE_BINARY":
             raise ValueError("PURE_BINARY requires PureBinaryDefine")
         if self.tbm_intrabar_interval is not None and self.label_type != "TBM":
@@ -105,6 +121,7 @@ class PureBinaryDefine(MarketDataSourceConfig):
     version: float = 0.1
 
     def __post_init__(self):
+        super().__post_init__()
         if self.label_type != "PURE_BINARY":
             raise ValueError("PureBinaryDefine only supports PURE_BINARY")
 
@@ -123,7 +140,7 @@ stop_multiplier_rate = 0.4
 DOGE_1m = BaseDefine(
     market_category="Cryptocurrency",
     data_source="binance_public_data",
-    symbol="DOGEUSDT",
+    symbols=("DOGEUSDT",),
     interval="1m",
     trading_type="um",
     label_type="FTHL",
@@ -150,10 +167,25 @@ DOGE_1h = replace(
     DOGE_1m,
     interval="1h",
 )
+DOGE_AAVE_15m_TBM = BaseDefine(
+    market_category="Cryptocurrency",
+    data_source="binance_public_data",
+    symbols=("DOGEUSDT", "AAVEUSDT"),
+    interval="15m",
+    trading_type="um",
+    label_type="TBM",
+    predict_num=32,
+    vol_ewma_span=20,
+    vol_multiplier_long=1.7,
+    stop_multiplier_rate_long=None,
+    vol_multiplier_short=1.7,
+    stop_multiplier_rate_short=None,
+)
+
 XLM_30m = BaseDefine(
     market_category="Cryptocurrency",
     data_source="binance_public_data",
-    symbol="XLMUSDT",
+    symbols=("XLMUSDT",),
     interval="30m",
     trading_type="um",
     label_type="FTHL",
@@ -167,7 +199,7 @@ XLM_30m = BaseDefine(
 XAU_15m = BaseDefine(
     market_category="Forex",
     data_source="dukascopy",
-    symbol="XAUUSD",
+    symbols=("XAUUSD",),
     interval="15m",
     trading_type="spot",
     label_type="FTHL",
@@ -187,6 +219,8 @@ PROJECT_DATA_DIR = os.path.join(os.path.dirname(PROJECT_DIR), "QuantData")
 def market_data_path(
     source: MarketDataSourceConfig,
     root_dir: Optional[str] = None,
+    *,
+    symbol: Optional[str] = None,
 ) -> str:
     """Resolve the canonical raw CSV path for a market data source."""
     root_dir = PROJECT_DATA_DIR if root_dir is None else root_dir
@@ -195,7 +229,7 @@ def market_data_path(
         source.market_category,
         source.data_source,
         source.trading_type,
-        f"{source.symbol}_{source.interval}.csv",
+        f"{source.symbol if symbol is None else symbol}_{source.interval}.csv",
     )
 
 

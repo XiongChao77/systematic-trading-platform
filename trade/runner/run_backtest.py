@@ -11,7 +11,7 @@ from trade.runner.analyze_backtest_report import plot_equity_curves
 from trade.runner.config import BrokerConfig, ExperimentContext, ModelDataConfig, RunnerConfig
 from trade.strategy.strategy_bbm import BbmStrategyConfig
 
-model_dir = "output/train/expanding"
+model_dir = "output/train/rolling_doge_aave"
 preparation = common.load_pre_params_from_dir(model_dir)
 
 config = RunnerConfig(
@@ -25,6 +25,7 @@ config = RunnerConfig(
         prep_output_dir=common.DATA_OUT_DIR,
         train_output_dir=model_dir,
         device="auto",
+        symbol= "DOGEUSDT" ,
     ),
 )
 

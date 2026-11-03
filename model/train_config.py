@@ -29,7 +29,7 @@ class RollingConfig:
     train_months: int = 12
     validation_months: int = 2
     oos_months: int = 1
-    mode: str = "sliding"
+    mode: str = "expanding"
 
     def __post_init__(self):
         if self.mode not in ("sliding", "expanding"):

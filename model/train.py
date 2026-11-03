@@ -377,6 +377,215 @@ def rolling_windows(start, end, forward_start, config):
         }
 
 
+def _train_rolling_multiasset(
+    *, configs, rolling_config, save_dir, provenance, preparation, interval_ms,
+    prep_output_dir, symbols, frame, manifest, write_manifest, device, logger,
+) -> dict:
+    """Rolling joint training over multiple symbols sharing one calendar.
+
+    Windows are generated independently per symbol (no cross-symbol sequences)
+    and concatenated with a per-sample asset id. Equal asset totals are enforced
+    through TensorSplit.balanced_sample_weights. OOS inference runs per symbol and
+    predictions are keyed by (symbol, timestamp).
+    """
+    from model.train_config import COMBO_SUB_TASKS
+    from model.model_loader import ModelHandler
+
+    tasks = tuple(config.train_task for config in configs)
+    combo = next((name for name, heads in COMBO_SUB_TASKS.items() if tasks == heads), None)
+    if "symbol" not in frame.columns:
+        raise ValueError("Multiasset preparation must persist a 'symbol' column")
+    interval = pd.Timedelta(milliseconds=interval_ms)
+    horizon = int(preparation.predict_num)
+
+    # Snapshot the available feature columns so the full merged frame can be
+    # released once the per-symbol frames are built (memory saving).
+    available_features = set(frame.columns)
+
+    symbol_frames = {}
+    symbol_times = {}
+    for symbol in symbols:
+        sub = frame.loc[frame["symbol"] == symbol]
+        if sub.empty:
+            raise ValueError(f"No prepared rows for symbol {symbol}")
+        sub = sub.sort_values("open_time_date_utc").reset_index(drop=True)
+        times = pd.to_datetime(sub["open_time_date_utc"], utc=True)
+        if not times.is_unique or not times.is_monotonic_increasing:
+            raise ValueError(f"Symbol {symbol} timestamps must be unique and increasing")
+        symbol_frames[symbol] = sub
+        symbol_times[symbol] = times
+    asset_ids = {symbol: index for index, symbol in enumerate(symbols)}
+    del frame
+
+    start = pd.Timestamp(min(t.iloc[0] for t in symbol_times.values()))
+    end = pd.Timestamp(max(t.iloc[-1] for t in symbol_times.values())) + interval
+    folds = list(rolling_windows(start, end, pd.Timestamp(provenance["split_time"]), rolling_config))
+    if not folds or not any(fold["phase"] == "development" for fold in folds):
+        raise ValueError("Insufficient history for development OOS evaluation")
+
+    predictions = []
+    for fold in folds:
+        logger.info("Rolling fold %s | %s | OOS %s -> %s", fold["fold_id"],
+                    fold["phase"], fold["oos_start"], fold["oos_end"])
+        train_start, valid_start, oos_start, oos_end = (
+            pd.Timestamp(fold[key]) for key in
+            ("train_start", "validation_start", "oos_start", "oos_end")
+        )
+        fold_dir = os.path.join(save_dir, fold["fold_id"])
+        role_dirs = {}
+        fold["sample_counts"] = {}
+        feature_names = None
+        for config in configs:
+            if config.feature_conf_list is None:
+                factory = common.FeatureFactory(interval_ms)
+                requested = [name for name in dict.fromkeys(
+                    [*factory.base_features, *factory.all_feature_list]
+                ) if name in available_features]
+            else:
+                requested = list(config.feature_conf_list)
+            seq_len = config.model_cfg.seq_len
+
+            def _history_frame(symbol):
+                sub = symbol_frames[symbol]
+                times = symbol_times[symbol]
+                history_mask = (
+                    (times >= train_start - interval * seq_len)
+                    & (times < oos_start)
+                )
+                return sub.loc[history_mask], times
+
+            # Pass 1 (light): count per-symbol windows and resolve the feature
+            # schema without materializing the full window tensor.
+            total = 0
+            for symbol in symbols:
+                history_frame, _ = _history_frame(symbol)
+                if history_frame.empty:
+                    continue
+                dataset = TimeSeriesWindowDataset(
+                    history_frame, interval_ms, requested, config.data_cfg.label_col,
+                    seq_len, stride=config.stride,
+                    materialize_windows=False, show_feature_distribution=False,
+                )
+                if len(dataset) == 0:
+                    continue
+                if feature_names is None:
+                    feature_names = list(dataset.feature_names)
+                elif feature_names != list(dataset.feature_names):
+                    raise ValueError("Fusion feature schemas do not match")
+                total += len(dataset)
+            if feature_names is None:
+                raise ValueError(f"No samples materialized for task {config.train_task}")
+            feature_count = len(feature_names)
+
+            # Pass 2 (fill): materialize each symbol's windows into one shared
+            # buffer, releasing each symbol's tensor as soon as it is copied.
+            ys, rets, ts, assets = [], [], [], []
+            X = torch.empty((total, seq_len, feature_count), dtype=torch.float32)
+            cursor = 0
+            for symbol in symbols:
+                history_frame, times = _history_frame(symbol)
+                if history_frame.empty:
+                    continue
+                dataset = TimeSeriesWindowDataset(
+                    history_frame, interval_ms, requested, config.data_cfg.label_col,
+                    seq_len, stride=config.stride,
+                    show_feature_distribution=False,
+                )
+                if len(dataset) == 0:
+                    continue
+                count = len(dataset)
+                X[cursor:cursor + count] = dataset.X
+                ys.append(dataset.y)
+                rets.append(dataset.returns)
+                ts.append(times.loc[dataset.indices].to_numpy(dtype="datetime64[ns]"))
+                assets.append(np.full(count, asset_ids[symbol], dtype=np.int64))
+                cursor += count
+                del dataset
+            y = torch.cat(ys, dim=0)
+            returns = torch.cat(rets, dim=0)
+            times_all = np.concatenate(ts)
+            assets_all = torch.from_numpy(np.concatenate(assets))
+            maturity = times_all + np.timedelta64(interval_ms * (horizon + 1), "ms")
+
+            def select(lower, upper):
+                lower64 = pd.Timestamp(lower).to_datetime64()
+                upper64 = pd.Timestamp(upper).to_datetime64()
+                mask = torch.from_numpy(
+                    (times_all >= lower64) & (times_all < upper64) & (maturity <= upper64)
+                )
+                return TensorSplit(X[mask], y[mask], returns[mask], assets_all[mask])
+
+            train_split = select(train_start, valid_start)
+            valid_split = select(valid_start, oos_start)
+            if not len(train_split) or not len(valid_split):
+                raise ValueError(f"Empty train/validation split for task {config.train_task}")
+            fold["sample_counts"][config.train_task] = {
+                "train": len(train_split), "validation": len(valid_split),
+            }
+            role_dir = os.path.join(fold_dir, config.train_task)
+            prepared = PreparedData(
+                DataSplits(train_split, valid_split, valid_split), feature_names,
+                requested, len(feature_names), prep_output_dir,
+            )
+            train_single(task_type=config.train_task, config=config, prepared=prepared,
+                         save_dir=role_dir, device=device, logger=logger, evaluate_test=False)
+            role_dirs[config.train_task.lower()] = role_dir
+        model_dir = next(iter(role_dirs.values()))
+        if combo:
+            model_dir = os.path.join(fold_dir, "fusion")
+            save_fusion_run(task_type=combo, role_directories=role_dirs, fusion_dir=model_dir)
+        handler = ModelHandler(model_dir, device)
+        segment_parts = []
+        columns = ["open_time_date_utc", "pred", "direction_pred", "pred_prob",
+                   "prob_short", "prob_neutral", "prob_long", "net_score"]
+        for symbol in symbols:
+            sub = symbol_frames[symbol]
+            times = symbol_times[symbol]
+            inference_mask = (
+                (times >= oos_start - interval * (handler.seq_len + 1))
+                & (times < oos_end)
+            )
+            inference_frame = sub.loc[inference_mask].copy()
+            features_only = inference_frame.drop(columns=[handler.label_col, "trend_strength"], errors="ignore")
+            dataset = TimeSeriesWindowDataset(
+                features_only, interval_ms, handler.feature_cols, None, handler.seq_len,
+                is_live=False, materialize_windows=False, show_feature_distribution=False,
+            )
+            predicted, _, _, sub_predictions = handler.predict_with_ds(
+                dataset, features_only, is_live=False, batch_size=configs[0].batch_size,
+                evaluate_sub_models=False, collect_sub_predictions=True,
+            )
+            segment = predicted.loc[(times.loc[predicted.index] >= oos_start), columns].copy()
+            if segment.empty or not segment["pred"].notna().any():
+                continue
+            if len(sub_predictions.columns):
+                segment = segment.join(sub_predictions)
+            segment["symbol"] = symbol
+            segment_parts.append(segment)
+        if not segment_parts:
+            raise RuntimeError("Rolling OOS has no valid predictions")
+        segment = pd.concat(segment_parts, ignore_index=True)
+        fold_prediction_path = os.path.join(fold_dir, "oos_predictions.pkl")
+        segment.to_pickle(fold_prediction_path)
+        fold["predictions"] = os.path.relpath(fold_prediction_path, save_dir)
+        predictions.append(segment)
+        fold["model_dir"] = os.path.relpath(model_dir, save_dir)
+        fold["prediction_count"] = len(segment)
+        manifest["folds"].append(fold)
+        write_manifest()
+        del handler
+    stitched = pd.concat(predictions, ignore_index=True)
+    if stitched.duplicated(subset=["symbol", "open_time_date_utc"]).any():
+        raise RuntimeError("Rolling OOS predictions overlap")
+    stitched.to_pickle(os.path.join(save_dir, manifest["predictions"]))
+    manifest["prediction_columns"] = list(stitched.columns)
+    manifest["status"] = "complete"
+    write_manifest()
+    logger.info("Rolling training complete | folds=%d | OOS rows=%d", len(folds), len(stitched))
+    logger.info("Rolling artifact directory: %s", os.path.abspath(save_dir))
+    return manifest
+
+
 def train_rolling(
     *, configs=None, rolling_config=None,
     prep_output_dir=common.DATA_OUT_DIR, save_dir=None, logger=None,
@@ -412,15 +621,21 @@ def train_rolling(
         common.load_train_df_from_dir(prep_output_dir),
         common.load_test_df_from_dir(prep_output_dir),
     ], ignore_index=True)
-    times = pd.to_datetime(frame["open_time_date_utc"], utc=True)
-    if not times.is_unique or not times.is_monotonic_increasing:
-        raise ValueError("Prepared timestamps must be unique and increasing")
+    symbols = tuple(preparation.symbols)
+    multiasset = len(symbols) > 1
     forward_start = pd.Timestamp(provenance["split_time"])
     interval = pd.Timedelta(milliseconds=interval_ms)
-    folds = list(rolling_windows(times.iloc[0], times.iloc[-1] + interval,
-                                 forward_start, rolling_config))
-    if not folds or not any(fold["phase"] == "development" for fold in folds):
-        raise ValueError("Insufficient history for development OOS evaluation")
+    if not multiasset:
+        times = pd.to_datetime(frame["open_time_date_utc"], utc=True)
+        if not times.is_unique or not times.is_monotonic_increasing:
+            raise ValueError("Prepared timestamps must be unique and increasing")
+        folds = list(rolling_windows(times.iloc[0], times.iloc[-1] + interval,
+                                     forward_start, rolling_config))
+        if not folds or not any(fold["phase"] == "development" for fold in folds):
+            raise ValueError("Insufficient history for development OOS evaluation")
+    else:
+        folds = []
+
     copy_data_config_meta(prep_output_dir, save_dir)
     manifest = {
         "status": "running", "data_id": provenance["data_id"],
@@ -440,6 +655,14 @@ def train_rolling(
         json.dump(asdict(configs[0]), handle, indent=2)
     write_manifest()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if multiasset:
+        return _train_rolling_multiasset(
+            configs=configs, rolling_config=rolling_config, save_dir=save_dir,
+            provenance=provenance, preparation=preparation, interval_ms=interval_ms,
+            prep_output_dir=prep_output_dir, symbols=symbols,
+            frame=frame, manifest=manifest, write_manifest=write_manifest,
+            device=device, logger=logger,
+        )
     predictions = []
     for fold in folds:
         logger.info("Rolling fold %s | %s | OOS %s -> %s", fold["fold_id"],
@@ -546,7 +769,7 @@ def train_rolling(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train single or rolling models")
     parser.add_argument("--rolling", action="store_true")
-    parser.add_argument("--mode", choices=("sliding", "expanding"), default="sliding",
+    parser.add_argument("--mode", choices=("sliding", "expanding"), default="expanding",
                         help="Training window mode used with --rolling")
     parser.add_argument("--prep-output-dir", default=common.DATA_OUT_DIR)
     parser.add_argument("--save-dir")

@@ -717,7 +717,7 @@ def download_symbol_interval(
     para = common.MarketDataSourceConfig(
         market_category="Cryptocurrency",
         data_source="binance_public_data",
-        symbol=symbol,
+        symbols=(symbol,),
         interval=interval,
         trading_type=market,
     )
@@ -1209,7 +1209,7 @@ def download_funding_rate(
     para = common.MarketDataSourceConfig(
         market_category="Cryptocurrency",
         data_source="binance_public_data",
-        symbol=symbol,
+        symbols=(symbol,),
         interval="fundingRate",
         trading_type=market,
     )
