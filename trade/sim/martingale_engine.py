@@ -23,6 +23,10 @@ backtest-level capital rule; the engine only records realized grid breaks,
 liquidations and mark-to-market extrema. Intrabar equity and margin extrema are
 tracked on the selected path rather than only at the bar close.
 
+When the caller supplies finer bars for the same period, the two paths are
+only used where they disagree: the finer sequence then replays the true order
+and replaces the pessimistic guess.
+
 Within one leg the price moves monotonically, so events fire in strict price
 order: liquidation, then full-grid break, then the next safety order on the way
 down; the take profit on the way up.  Every event re-prices the ones after it.
@@ -215,6 +219,9 @@ class AccountState:
     # No base order on or before this bar: set when a cycle closes at a loss.
     cooldown_until_bar: int = -1
     cooldown_blocked_bars: int = 0
+    # Bars where the base order was allowed by the cooldown but refused by the
+    # caller's volatility gate.
+    volatility_blocked_bars: int = 0
     next_side: int = LONG        # side the next base order will take
     reversals: int = 0
 
@@ -243,6 +250,7 @@ class AccountState:
             failure_price=self.failure_price,
             cooldown_until_bar=self.cooldown_until_bar,
             cooldown_blocked_bars=self.cooldown_blocked_bars,
+            volatility_blocked_bars=self.volatility_blocked_bars,
             next_side=self.next_side,
             reversals=self.reversals,
         )
@@ -1309,6 +1317,61 @@ class MartingaleSimulator:
         return state
 
     # ---------- path choice ----------
+    @staticmethod
+    def _outcome_signature(state: AccountState):
+        """Everything a path can change; equal signatures mean no ambiguity."""
+        return (
+            state.failed,
+            state.bankrupt,
+            state.ruin_threshold_hit,
+            round(state.equity, 9),
+            round(state.cycle.qty, 12),
+            state.cycle.layers,
+            len(state.trades),
+        )
+
+    def _paths_disagree(self, first: AccountState, second: AccountState) -> bool:
+        return self._outcome_signature(first) != self._outcome_signature(second)
+
+    def _replay_intrabar(
+        self, state: AccountState, intrabar: Sequence[Sequence[float]]
+    ) -> Optional[AccountState]:
+        """Replay the finer bars in their real order to settle a bar ambiguity.
+
+        Returns ``None`` when a row is unusable, so the caller keeps the
+        pessimistic two-path result.  A cycle closed inside the bar does not
+        reopen before the next bar, matching the bar-level restart rule.
+        """
+        for row in intrabar:
+            open_, high, low, close = (float(value) for value in row)
+            # NaN compares unequal to itself; unusable rows fall back.
+            if not all(value > 0.0 and value == value for value in (open_, high, low, close)):
+                return None
+            if high < max(open_, low, close) or low > min(open_, high, close):
+                return None
+            if state.failed or state.cycle.qty <= 0.0:
+                break
+            self._settle_open_position(state, open_)
+            if state.failed or state.cycle.qty <= 0.0:
+                break
+            baseline_events = state.events
+            down_first = self._replay(state.clone(), open_, (low, high, close))
+            up_first = self._replay(state.clone(), open_, (high, low, close))
+            if (
+                down_first.events == baseline_events
+                and up_first.events == baseline_events
+                and not down_first.failed
+                and not up_first.failed
+            ):
+                state = down_first
+                continue
+            if self._path_key(up_first, close) < self._path_key(down_first, close):
+                up_first.up_first_worse_bars += 1
+                state = up_first
+            else:
+                state = down_first
+        return state
+
     def _path_key(self, state: AccountState, close: float):
         """Ascending order = worse first."""
         close_equity = (
@@ -1332,8 +1395,22 @@ class MartingaleSimulator:
         high: float,
         low: float,
         close: float,
+        intrabar: Optional[Sequence[Sequence[float]]] = None,
+        allow_open: bool = True,
     ) -> AccountState:
-        """Replay one completed bar and return the pessimistic valid path."""
+        """Replay one completed bar and return the pessimistic valid path.
+
+        ``intrabar`` optionally supplies the finer bars that compose this bar
+        (rows of ``open, high, low, close`` in chronological order).  The
+        pessimistic two-path choice is exact only when the bar's internals are
+        unknown; when the two candidates disagree and the finer series is
+        available, the actual order resolves them instead of the worse guess.
+
+        ``allow_open`` gates only the base order of a flat account.  An open
+        cycle is always managed: a caller-supplied filter must never strand a
+        position without its take profit or stop.  The caller is responsible
+        for making that flag causal (no data from this bar or later).
+        """
         if state.failed:
             return state
         if min(open_, high, low, close) <= 0.0:
@@ -1348,11 +1425,14 @@ class MartingaleSimulator:
         # What the open alone settles is identical on both candidate paths.
         if state.cycle.qty > 0.0:
             self._settle_open_position(state, open_)
-        elif index > state.cooldown_until_bar:
+        elif index > state.cooldown_until_bar and allow_open:
             self._open_base(state, open_)
             self._observe(state, open_)
         else:
-            state.cooldown_blocked_bars += 1
+            if index > state.cooldown_until_bar:
+                state.volatility_blocked_bars += 1
+            else:
+                state.cooldown_blocked_bars += 1
             self._observe(state, open_)
 
         # A cycle closed at the open cannot restart inside this bar.
@@ -1372,6 +1452,12 @@ class MartingaleSimulator:
         up_first = self._close_if_cycle_timeout(up_first, close)
 
         dual_count = state.dual_path_bars + 1
+        if intrabar is not None and self._paths_disagree(down_first, up_first):
+            resolved = self._replay_intrabar(state.clone(), intrabar)
+            if resolved is not None:
+                resolved = self._close_if_cycle_timeout(resolved, close)
+                resolved.dual_path_bars = dual_count
+                return resolved
         if self._path_key(up_first, close) < self._path_key(down_first, close):
             up_first.up_first_worse_bars = state.up_first_worse_bars + 1
             up_first.dual_path_bars = dual_count

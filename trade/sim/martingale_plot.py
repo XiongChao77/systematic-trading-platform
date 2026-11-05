@@ -26,6 +26,8 @@ slot instead of a third, lighter red that no one could tell apart.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 import re
@@ -37,6 +39,7 @@ matplotlib.use("Agg")   # headless: this module only ever writes files
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap, Normalize
@@ -1229,5 +1232,1422 @@ def plot_cluster_scales(
     logger.info(
         f"Cluster-scale chart saved to {path} "
         f"(m from {scales[0]} to {scales[-1]} bars, largest cluster {largest})"
+    )
+    return path
+
+
+# ============================================================
+# Realized grid breaks against the volatility that produced them
+# ============================================================
+BREACH_COLOR = "#d03b3b"
+VOLATILITY_COLOR = "#4a3aa7"
+
+
+def _bars_per_hour(periods_per_year: float) -> float:
+    if periods_per_year <= 0.0 or not np.isfinite(periods_per_year):
+        return 0.0
+    return float(periods_per_year) / (365.25 * 24.0)
+
+
+def _rank_correlation(left: pd.Series, right: pd.Series) -> float:
+    """Spearman rho without scipy: ranks, then Pearson."""
+    joined = pd.DataFrame({"left": left, "right": right}).dropna()
+    if len(joined) < 3:
+        return float("nan")
+    left_rank = joined["left"].rank().to_numpy()
+    right_rank = joined["right"].rank().to_numpy()
+    if np.std(left_rank) <= 0.0 or np.std(right_rank) <= 0.0:
+        return float("nan")
+    return float(np.corrcoef(left_rank, right_rank)[0, 1])
+
+
+def rolling_annualized_volatility(bars, *, window_hours: float = 4.0):
+    """Re-exported from the backtest module so charts and gates cannot drift."""
+    from trade.sim.martingale_backtest import rolling_annualized_volatility as impl
+
+    return impl(bars, window_hours=window_hours)
+
+
+def _traded_window(trades, total_bars: int) -> Optional[tuple]:
+    """First entry and last exit across the supplied trades, in bar indices.
+
+    Monte Carlo paths start at random bars, so bars before the first entry
+    cannot contain a break and must not be counted as calm observations: they
+    would inflate the low-volatility buckets. One continuous full-history pass
+    makes this span the whole series.
+    """
+    entries = []
+    exits = []
+    for trade in trades:
+        entry = trade.get("entry_bar")
+        exit_ = trade.get("exit_bar")
+        if entry is not None and np.isfinite(float(entry)):
+            entries.append(int(entry))
+        if exit_ is not None and np.isfinite(float(exit_)):
+            exits.append(int(exit_))
+    if not entries or not exits:
+        return None
+    start = max(0, min(entries))
+    end = min(total_bars - 1, max(exits))
+    if end <= start:
+        return None
+    return start, end
+
+
+def _breach_points(trades, times) -> pd.DataFrame:
+    """Every realized full-grid break, one row per bar, ascending in time.
+
+    Monte Carlo paths overlap, so the same ladder breaking inside the same
+    bar is one event; the first record for that bar wins. That keeps the
+    timeline honest without one run drawing the same point twice.
+    """
+    rows = []
+    seen_bars = set()
+    for trade in trades:
+        if trade.get("reason") != "grid_break":
+            continue
+        bar = int(trade.get("exit_bar", -1))
+        if bar < 0 or bar >= len(times) or bar in seen_bars:
+            continue
+        seen_bars.add(bar)
+        rows.append({
+            "bar": bar,
+            "time": pd.Timestamp(times[bar]),
+            "exit_price": float(trade.get("exit_price", np.nan)),
+            "layers": int(trade.get("layers", 0)),
+            "net_pnl": float(trade.get("net_pnl", 0.0)),
+        })
+    columns = ["bar", "time", "exit_price", "layers", "net_pnl"]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns).sort_values("bar").reset_index(drop=True)
+
+
+def breach_volatility_analysis(
+    bars,
+    trades,
+    *,
+    window_hours: float = 4.0,
+    horizons_hours: Sequence[float] = (1.0, 4.0, 24.0),
+    buckets: int = 10,
+) -> dict:
+    """Conditional grid-break probability per trailing-volatility bucket.
+
+    For every bar the trailing volatility is measured on data that precedes
+    it, then the bar is placed in one of ``buckets`` equal-count bins. The
+    statistic is P(a grid break happens within the next N bars | this
+    bucket). Buckets by rank instead of fixed cutoffs, because volatility is
+    right-skewed and a quantile grid would leave empty cells.
+
+    This is the per-bar counterpart of a monthly average: it removes the
+    smoothing that makes a calm month with one spike look identical to a
+    volatile month with one spike.
+    """
+    times = pd.to_datetime(bars.time)
+    volatility, window_bars = rolling_annualized_volatility(
+        bars, window_hours=window_hours
+    )
+    breaches = _breach_points(trades, times)
+
+    mask = np.zeros(len(times), dtype=bool)
+    if len(breaches):
+        mask[breaches["bar"].to_numpy()] = True
+    cumulative = np.concatenate(([0], np.cumsum(mask)))
+    positions = np.arange(len(times))
+    traded = np.zeros(len(times), dtype=bool)
+    window = _traded_window(trades, len(times))
+    if window is not None:
+        traded[window[0]:window[1] + 1] = True
+    bars_per_hour = _bars_per_hour(bars.periods_per_year)
+    bucket_count = max(2, int(buckets))
+
+    rows = []
+    baseline_rows = []
+    for hours in horizons_hours:
+        horizon = max(1, int(round(hours * bars_per_hour))) if bars_per_hour else 1
+        future = cumulative[np.minimum(positions + horizon, len(times))] - cumulative[positions]
+        valid = (
+            np.isfinite(volatility)
+            & traded
+            & (positions + horizon <= len(times))
+        )
+        valid_positions = np.flatnonzero(valid)
+        if not len(valid_positions):
+            continue
+        indicator = (future[valid_positions] > 0).astype(float)
+        baseline = float(indicator.mean())
+        values = volatility[valid_positions]
+        order = np.argsort(values, kind="stable")
+        bucket_ids = np.empty(len(values), dtype=int)
+        bucket_ids[order] = np.minimum(
+            np.arange(len(values)) * bucket_count // len(values), bucket_count - 1
+        )
+        for bucket in range(bucket_count):
+            selected = bucket_ids == bucket
+            probability = float(indicator[selected].mean())
+            rows.append({
+                "horizon_hours": float(hours),
+                "horizon_bars": horizon,
+                "bucket": bucket + 1,
+                "samples": int(selected.sum()),
+                "vol_low_pct": float(values[selected].min() * 100.0),
+                "vol_high_pct": float(values[selected].max() * 100.0),
+                "mean_vol_pct": float(values[selected].mean() * 100.0),
+                "breach_probability": probability,
+                "baseline_probability": baseline,
+                "lift": probability / baseline if baseline > 0.0 else float("nan"),
+            })
+        baseline_rows.append({
+            "horizon_hours": float(hours),
+            "horizon_bars": horizon,
+            "samples": int(len(valid_positions)),
+            "baseline_probability": baseline,
+        })
+
+    conditional = pd.DataFrame(rows)
+    baselines = pd.DataFrame(baseline_rows)
+
+    # Months are calendar buckets, not instants, so the timezone is dropped
+    # explicitly instead of letting to_period() warn about it.
+    month_times = times.tz_convert(None) if times.tz is not None else times
+    month_index = month_times.to_period("M")
+    monthly = pd.DataFrame({
+        "bars": pd.Series(traded.astype(int), index=month_index).groupby(level=0).sum(),
+        "breaches": pd.Series(mask.astype(int), index=month_index).groupby(level=0).sum(),
+        "mean_vol_pct": pd.Series(
+            np.where(traded, volatility, np.nan), index=month_index
+        ).groupby(level=0).mean() * 100.0,
+    })
+    # Months fully outside the traded window would read as zero breaks at zero
+    # volatility and drag the correlation to meaninglessness.
+    monthly = monthly[monthly["bars"] > 0]
+    monthly.index.name = "month"
+    monthly = monthly.reset_index()
+    monthly["month"] = monthly["month"].astype(str)
+    monthly["breaches_per_1000_bars"] = (
+        monthly["breaches"] / monthly["bars"].clip(lower=1) * 1000.0
+    )
+    monthly_rho = _rank_correlation(monthly["mean_vol_pct"], monthly["breaches"])
+
+    breach_frame = breaches.copy()
+    if len(breach_frame):
+        finite = np.sort(volatility[np.isfinite(volatility)])
+        breach_vol = volatility[breach_frame["bar"].to_numpy()]
+        breach_frame["volatility_pct"] = breach_vol * 100.0
+        breach_frame["volatility_percentile"] = (
+            np.searchsorted(finite, breach_vol, side="right") / max(len(finite), 1)
+        )
+
+    return {
+        "times": times,
+        "volatility": volatility,
+        "window_bars": window_bars,
+        "window_hours": float(window_hours),
+        "breaches": breach_frame,
+        "conditional": conditional,
+        "baselines": baselines,
+        "monthly": monthly,
+        "monthly_rho": monthly_rho,
+    }
+
+
+def plot_breach_timeline(
+    logger: logging.Logger,
+    bars,
+    analysis: dict,
+    path: str,
+    *,
+    title: Optional[str] = None,
+    max_points: int = 3_000,
+) -> Optional[str]:
+    """Price, volatility and monthly break count on one shared time axis."""
+    breaches = analysis["breaches"]
+    if not len(breaches):
+        logger.warning(f"No grid breaks to plot, skipping {path}")
+        return None
+
+    times = np.asarray(analysis["times"])
+    price_times, price_low, price_high, price_close = _decimate(
+        times,
+        np.asarray(bars.low, dtype=float),
+        np.asarray(bars.high, dtype=float),
+        np.asarray(bars.close, dtype=float),
+        max_points=max_points,
+    )
+    volatility = np.asarray(analysis["volatility"], dtype=float)
+    stride = max(1, int(np.ceil(len(times) / max_points)))
+    vol_times = times[::stride]
+    vol_values = volatility[::stride]
+    breach_times = times[breaches["bar"].to_numpy()]
+    breach_vol = volatility[breaches["bar"].to_numpy()]
+    finite = np.isfinite(breach_vol)
+    # Deep ladders break a few hundred times and read as individual events;
+    # a 2-layer ladder breaks often enough to paint a band, so its markers
+    # shrink and go translucent while the price line stays on top.
+    crowded = len(breaches) > 5_000
+    marker_size = 4 if crowded else 9
+    marker_alpha = 0.45 if crowded else 0.75
+
+    figure, (price_axis, vol_axis, count_axis) = plt.subplots(
+        3, 1, figsize=(14, 10), sharex=True,
+        gridspec_kw={"height_ratios": (2.2, 1.2, 0.9)}, constrained_layout=True,
+    )
+    figure.patch.set_facecolor(SURFACE)
+
+    _style_axis(price_axis, "Market price")
+    price_axis.fill_between(
+        price_times, price_low, price_high,
+        color=PRICE_BAND, linewidth=0, alpha=0.85, zorder=1,
+    )
+    price_axis.plot(
+        price_times, price_close, color=PRICE_LINE, linewidth=1.0, zorder=5,
+    )
+    price_axis.scatter(
+        breach_times, breaches["exit_price"], s=marker_size, marker="X",
+        color=BREACH_COLOR, linewidths=0.0, alpha=marker_alpha, zorder=4,
+        label=f"Grid break ({len(breaches)})",
+    )
+    price_axis.legend(loc="upper left", frameon=False, fontsize=9, labelcolor=INK_MUTED)
+    price_axis.set_title(
+        title or "Every realized grid break against trailing volatility",
+        color=INK, fontsize=12, loc="left", pad=8,
+    )
+    percentile = float(breaches["volatility_percentile"].mean() * 100.0)
+    price_axis.text(
+        0.995, 0.02,
+        f"{len(breaches)} breaks · mean breach volatility percentile {percentile:.1f}%",
+        transform=price_axis.transAxes, ha="right", va="bottom",
+        color=INK_MUTED, fontsize=9,
+    )
+
+    _style_axis(vol_axis, "Annualized volatility")
+    vol_axis.plot(
+        vol_times, vol_values * 100.0,
+        color=VOLATILITY_COLOR, linewidth=0.9,
+    )
+    if finite.any():
+        vol_axis.scatter(
+            breach_times[finite], breach_vol[finite] * 100.0,
+            s=marker_size, marker="X", color=BREACH_COLOR, linewidths=0.0,
+            alpha=marker_alpha, zorder=4,
+        )
+    vol_axis.text(
+        0.995, 0.90,
+        f"trailing {analysis['window_bars']}-bar "
+        f"({analysis['window_hours']:g}h) window",
+        transform=vol_axis.transAxes, ha="right", va="top",
+        color=INK_MUTED, fontsize=8,
+    )
+
+    _style_axis(count_axis, "Grid breaks / month")
+    monthly = analysis["monthly"]
+    if len(monthly):
+        month_times = pd.to_datetime(monthly["month"])
+        count_axis.bar(
+            month_times, monthly["breaches"], width=20,
+            color=BREACH_COLOR, alpha=0.85, linewidth=0,
+        )
+    count_axis.set_xlabel("Time", color=INK_MUTED, fontsize=9)
+    locator = mdates.AutoDateLocator()
+    count_axis.xaxis.set_major_locator(locator)
+    count_axis.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    figure.savefig(path, dpi=140, facecolor=SURFACE)
+    plt.close(figure)
+    logger.info(f"Breach timeline saved to {path} ({len(breaches)} grid breaks)")
+    return path
+
+
+def plot_breach_volatility(
+    logger: logging.Logger,
+    analysis: dict,
+    path: str,
+    *,
+    title: Optional[str] = None,
+) -> Optional[str]:
+    """Conditional break probability vs volatility, and monthly correlation."""
+    conditional = analysis["conditional"]
+    if conditional.empty:
+        logger.warning(f"No volatility buckets to plot, skipping {path}")
+        return None
+
+    figure, (curve_axis, scatter_axis) = plt.subplots(
+        1, 2, figsize=(14, 5.6), constrained_layout=True,
+    )
+    figure.patch.set_facecolor(SURFACE)
+
+    _style_axis(curve_axis, "P(grid break within horizon) (%)")
+    horizons = sorted(conditional["horizon_hours"].unique())
+    for colour, hours in zip(ORDINAL, horizons):
+        subset = conditional[conditional["horizon_hours"] == hours].sort_values("mean_vol_pct")
+        curve_axis.plot(
+            subset["mean_vol_pct"], subset["breach_probability"] * 100.0,
+            color=colour, marker="o", markersize=4, linewidth=1.8,
+            label=f"next {hours:g}h ({int(subset['horizon_bars'].iloc[0])} bars)",
+        )
+        baseline = float(subset["baseline_probability"].iloc[0]) * 100.0
+        curve_axis.axhline(
+            baseline, color=colour, linestyle="--", linewidth=1.0, alpha=0.55,
+        )
+    curve_axis.set_xlabel(
+        "Trailing annualized volatility (%)", color=INK_MUTED, fontsize=9
+    )
+    curve_axis.legend(loc="upper left", frameon=False, fontsize=9, labelcolor=INK_MUTED)
+    curve_axis.set_title(
+        title or "Breaks cluster in high-volatility bars",
+        color=INK, fontsize=12, loc="left", pad=8,
+    )
+    curve_axis.text(
+        0.995, 0.02,
+        "dashed = unconditional rate · decile buckets",
+        transform=curve_axis.transAxes, ha="right", va="bottom",
+        color=INK_MUTED, fontsize=8,
+    )
+
+    _style_axis(scatter_axis, "Grid breaks per month")
+    monthly = analysis["monthly"]
+    if len(monthly):
+        scatter_axis.scatter(
+            monthly["mean_vol_pct"], monthly["breaches"],
+            s=26, color=VOLATILITY_COLOR, alpha=0.75, edgecolors=SURFACE,
+            linewidths=0.5,
+        )
+        rho = analysis.get("monthly_rho", float("nan"))
+        scatter_axis.text(
+            0.03, 0.96,
+            f"Spearman rho = {rho:.3f}\n{len(monthly)} months",
+            transform=scatter_axis.transAxes, ha="left", va="top",
+            color=INK_MUTED, fontsize=9,
+        )
+    scatter_axis.set_xlabel("Monthly mean volatility (%)", color=INK_MUTED, fontsize=9)
+
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    figure.savefig(path, dpi=140, facecolor=SURFACE)
+    plt.close(figure)
+    logger.info(f"Breach-volatility chart saved to {path}")
+    return path
+
+
+def plot_breach_analysis(
+    logger: logging.Logger,
+    bars,
+    trades,
+    directory: str,
+    *,
+    title: Optional[str] = None,
+    window_hours: float = 4.0,
+    horizons_hours: Sequence[float] = (1.0, 4.0, 24.0),
+    buckets: int = 10,
+) -> Optional[str]:
+    """Write both charts and their underlying tables for every grid break."""
+    analysis = breach_volatility_analysis(
+        bars, trades,
+        window_hours=window_hours,
+        horizons_hours=horizons_hours,
+        buckets=buckets,
+    )
+    if not len(analysis["breaches"]):
+        logger.warning(f"No grid breaks found, skipping breach analysis in {directory}")
+        return None
+    os.makedirs(directory, exist_ok=True)
+    plot_breach_timeline(
+        logger, bars, analysis,
+        os.path.join(directory, "breach_timeline_vs_volatility.png"),
+        title=title,
+    )
+    plot_breach_volatility(
+        logger, analysis,
+        os.path.join(directory, "breach_vs_volatility.png"),
+        title=title,
+    )
+    analysis["breaches"].to_csv(
+        os.path.join(directory, "breach_points_volatility.csv"), index=False
+    )
+    analysis["conditional"].to_csv(
+        os.path.join(directory, "breach_volatility_buckets.csv"), index=False
+    )
+    analysis["monthly"].to_csv(
+        os.path.join(directory, "monthly_breaches_vs_volatility.csv"), index=False
+    )
+    logger.info(
+        f"Breach analysis saved to {directory} "
+        f"({len(analysis['breaches'])} breaks, "
+        f"monthly Spearman rho {analysis['monthly_rho']:.3f})"
+    )
+    return directory
+
+
+# ============================================================
+# What each annualized volatility level looks like on the chart
+# ============================================================
+# The bins are the annualized percentages the entry gate sweeps, so a band
+# read here is a threshold actually used in a sweep.
+REGIME_THRESHOLDS = (0.40, 0.60, 0.80, 1.10, 1.40)
+REGIME_LABELS = ("< 40%", "40-60%", "60-80%", "80-110%", "110-140%", ">= 140%")
+# The quantity is risk, so the ramp escalates from cool to warm instead of
+# cycling through categorical hues.
+REGIME_COLORS = ("#8fb4cf", "#4f86b5", "#1f5e8f", "#d9a441", "#cf6a3a", "#b03a2e")
+
+
+def _exemplar_windows(
+    volatility: np.ndarray,
+    periods_per_year: float,
+    exemplar_days: float,
+    targets: Sequence[float],
+) -> list[tuple[int, int, float]]:
+    """Pick non-overlapping windows whose mean volatility is nearest a target."""
+    bars_per_day = periods_per_year / 365.25
+    length = max(2, int(round(exemplar_days * bars_per_day)))
+    means = pd.Series(volatility).rolling(length, min_periods=length).mean()
+    occupied = np.zeros(len(volatility), dtype=bool)
+    selected: list[tuple[int, int, float]] = []
+    for target in targets:
+        score = np.array((means - target).abs().to_numpy(), dtype=float, copy=True)
+        score[~np.isfinite(score)] = np.inf
+        score[occupied] = np.inf
+        if not np.isfinite(score).any():
+            break
+        end = int(np.argmin(score))
+        begin = max(0, end - length + 1)
+        half = length // 4
+        occupied[max(0, begin - half):min(len(volatility), end + half)] = True
+        selected.append((begin, end, float(means.iloc[end])))
+    return selected
+
+
+def plot_volatility_regimes(
+    logger: logging.Logger,
+    bars,
+    path: str,
+    *,
+    window_hours: float = 4.0,
+    exemplar_days: float = 3.0,
+    max_points: int = 5_000,
+    exemplar_targets: Sequence[float] = (0.35, 0.90, 2.20),
+) -> Optional[str]:
+    """Price coloured by trailing volatility, with one window per regime.
+
+    The top panel answers "which market produced that volatility": every
+    stretch of the price is drawn in the colour of the trailing window's
+    annualized volatility. The middle panel is that volatility itself with the
+    sweep thresholds marked, on a log axis so the ordinary 20-80% range is not
+    flattened by the occasional spike. The bottom row is three three-day
+    windows whose mean volatility is closest to a calm, a normal and a
+    stressed target, so the bars inside a regime can be compared in detail.
+
+    Both panels use log scales: DOGE spans three orders of magnitude in price
+    and its volatility ranges from a few percent to several hundred percent
+    annualized, so a linear axis would hide everything except the extremes.
+    """
+    from trade.sim.martingale_backtest import rolling_annualized_volatility
+
+    times = pd.to_datetime(bars.time)
+    volatility, window_bars = rolling_annualized_volatility(
+        bars, window_hours=window_hours
+    )
+    if not np.isfinite(volatility).any():
+        logger.warning(f"No volatility values to plot, skipping {path}")
+        return None
+
+    close = np.asarray(bars.close, dtype=float)
+    low = np.asarray(bars.low, dtype=float)
+    high = np.asarray(bars.high, dtype=float)
+    count = len(close)
+
+    edges = np.unique(np.linspace(0, count, max_points + 1).astype(int))
+    starts, stops = edges[:-1], edges[1:]
+    keep = stops > starts
+    starts, stops = starts[keep], stops[keep]
+    sample_times = times[starts]
+    sample_low = np.minimum.reduceat(low, starts)
+    sample_high = np.maximum.reduceat(high, starts)
+    sample_close = close[stops - 1]
+    # One colour per drawn segment: the mean of the trailing volatility over
+    # the bucket, not its last value, so a single spike cannot recolour a day.
+    sample_vol = np.full(len(starts), np.nan)
+    for index, (begin, end) in enumerate(zip(starts, stops)):
+        window = volatility[begin:end]
+        window = window[np.isfinite(window)]
+        if window.size:
+            sample_vol[index] = float(window.mean())
+    sample_bins = np.where(
+        np.isfinite(sample_vol),
+        np.digitize(np.nan_to_num(sample_vol), REGIME_THRESHOLDS),
+        -1,
+    )
+
+    figure = plt.figure(figsize=(14, 11.6), constrained_layout=True)
+    grid = figure.add_gridspec(3, 3, height_ratios=(3.2, 1.4, 2.0))
+    price_axis = figure.add_subplot(grid[0, :])
+    vol_axis = figure.add_subplot(grid[1, :], sharex=price_axis)
+    figure.patch.set_facecolor(SURFACE)
+
+    _style_axis(price_axis, "Market price (log)")
+    price_axis.set_yscale("log")
+    price_axis.yaxis.set_major_locator(
+        mticker.LogLocator(base=10.0, subs=(1.0, 2.0, 5.0))
+    )
+    price_axis.yaxis.set_major_formatter(mticker.ScalarFormatter())
+    price_axis.yaxis.set_minor_formatter(mticker.NullFormatter())
+    price_axis.fill_between(
+        sample_times, sample_low, sample_high,
+        color=PRICE_BAND, linewidth=0, alpha=0.35, zorder=1,
+    )
+
+    # One line per contiguous regime run; a new run starts whenever the bucket
+    # changes. Joining with one extra point keeps the path continuous.
+    boundaries = np.concatenate(
+        ([0], np.flatnonzero(np.diff(sample_bins) != 0) + 1, [len(sample_bins)])
+    )
+    for run in range(len(boundaries) - 1):
+        begin, end = boundaries[run], boundaries[run + 1]
+        bucket = int(sample_bins[begin])
+        colour = PRICE_BAND if bucket < 0 else REGIME_COLORS[bucket]
+        price_axis.plot(
+            sample_times[begin:end + 1], sample_close[begin:end + 1],
+            color=colour, linewidth=1.3, zorder=2,
+        )
+
+    present = sorted({int(bucket) for bucket in sample_bins if bucket >= 0})
+    handles = [
+        Line2D([0], [0], color=REGIME_COLORS[bucket], linewidth=2,
+               label=REGIME_LABELS[bucket])
+        for bucket in present
+    ]
+    price_axis.legend(
+        handles=handles, loc="upper left", ncol=len(handles), frameon=False,
+        fontsize=8, labelcolor=INK_MUTED, handlelength=1.6, columnspacing=1.2,
+        borderaxespad=0.15,
+    )
+    price_axis.set_title(
+        "Market price coloured by trailing annualized volatility",
+        color=INK, fontsize=12, loc="left", pad=10,
+    )
+
+    _style_axis(vol_axis, "Annualized volatility (log)")
+    vol_axis.set_yscale("log")
+    # A fixed window around the sweep thresholds: the extremes reach four
+    # digits but would squash the 40-140% bands that decide entries into a
+    # few pixels.
+    vol_axis.set_ylim(5.0, 300.0)
+    edges_pct = [0.0] + [threshold * 100.0 for threshold in REGIME_THRESHOLDS] + [300.0]
+    for index, colour in enumerate(REGIME_COLORS):
+        vol_axis.axhspan(
+            edges_pct[index], edges_pct[index + 1],
+            color=colour, alpha=0.07, linewidth=0, zorder=0,
+        )
+    # The drawn line is the same daily mean the price is coloured by, not the
+    # raw 4h series: at 662k bars a raw trace is an unreadable solid band.
+    vol_axis.plot(
+        sample_times, np.where(np.isfinite(sample_vol), sample_vol * 100.0, np.nan),
+        color=VOLATILITY_COLOR, linewidth=1.1, zorder=2,
+    )
+    for threshold in REGIME_THRESHOLDS:
+        vol_axis.axhline(
+            threshold * 100.0, color=INK_MUTED, linestyle="--",
+            linewidth=0.8, alpha=0.55,
+        )
+    vol_axis.yaxis.set_major_locator(
+        mticker.FixedLocator([threshold * 100.0 for threshold in REGIME_THRESHOLDS])
+    )
+    vol_axis.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:g}%"))
+    vol_axis.yaxis.set_minor_locator(mticker.NullLocator())
+    vol_axis.set_xlabel("Time", color=INK_MUTED, fontsize=9)
+    vol_axis.text(
+        0.995, 0.94,
+        f"trailing {window_bars}-bar ({window_hours:g}h) window",
+        transform=vol_axis.transAxes, ha="right", va="top",
+        color=INK_MUTED, fontsize=8,
+    )
+    locator = mdates.AutoDateLocator()
+    vol_axis.xaxis.set_major_locator(locator)
+    vol_axis.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+
+    # Calm / normal / stressed windows, picked by mean volatility. Occupied
+    # spans are excluded so the three examples never overlap.
+    selected = _exemplar_windows(
+        volatility, bars.periods_per_year, exemplar_days, exemplar_targets
+    )
+
+    for column, (begin, end, mean_vol) in enumerate(selected):
+        panel = figure.add_subplot(grid[2, column])
+        panel.set_facecolor(SURFACE)
+        span = slice(begin, end + 1)
+        panel.fill_between(
+            times[span], low[span], high[span],
+            color=PRICE_BAND, linewidth=0, alpha=0.35,
+        )
+        panel.plot(times[span], close[span], color=PRICE_LINE, linewidth=1.0)
+        panel.set_title(
+            f"{column + 1} · {pd.Timestamp(times[begin]):%Y-%m-%d}"
+            f" · {mean_vol * 100.0:.0f}% annualized",
+            color=INK, fontsize=10, loc="left",
+        )
+        panel.grid(True, color=GRID, linewidth=0.6, alpha=0.9)
+        panel.tick_params(colors=INK_MUTED, labelsize=8)
+        for side in ("top", "right"):
+            panel.spines[side].set_visible(False)
+        panel.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+
+        # Three days are a hairline at a six-year zoom, so the window is marked
+        # by its centre only; the detail lives in the panel below.
+        centre = times[begin] + (times[end] - times[begin]) / 2
+        price_axis.axvline(
+            centre, color=INK_MUTED, linestyle=":", linewidth=0.9,
+            alpha=0.7, zorder=0,
+        )
+        price_axis.annotate(
+            str(column + 1),
+            xy=(centre, 0.04),
+            xycoords=("data", "axes fraction"),
+            color=INK_MUTED, fontsize=9, ha="center", va="bottom",
+        )
+
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    figure.savefig(path, dpi=130, facecolor=SURFACE)
+    plt.close(figure)
+    logger.info(
+        f"Volatility regime chart saved to {path} "
+        f"(bins {list(REGIME_LABELS)}, windows {[start for start, _, _ in selected]})"
+    )
+    return path
+
+
+# ============================================================
+# Interactive HTML version: 5-minute bars, coloured by volatility
+# ============================================================
+# 662k bars cannot be inspected at 5-minute resolution in a static PNG, so the
+# HTML embeds the whole series and draws only the visible range. Each bar is
+# packed as uint32 time offset, four uint32 prices (scale 1e-6) and one uint16
+# volatility (0.1% units, 65535 = not yet available): 22 bytes per bar.
+REGIME_HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root {
+  --surface: #fcfcfb;
+  --panel: #ffffff;
+  --ink: #0b0b0b;
+  --muted: #52514e;
+  --line: #e3e2df;
+  --accent: #4a3aa7;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--surface);
+  color: var(--ink);
+  font: 13px/1.45 ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  display: flex;
+  flex-direction: column;
+}
+header { padding: 14px 18px 0; }
+h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .01em; }
+#subtitle { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+main { flex: 1; display: flex; flex-direction: column; min-height: 0; padding: 10px 18px 14px; gap: 9px; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+.group { display: flex; gap: 4px; align-items: center; }
+.group .tag { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .07em; margin-right: 2px; }
+button {
+  font: inherit; font-size: 12px; padding: 4px 9px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+  border-radius: 6px; cursor: pointer;
+}
+button:hover { border-color: #bcbab4; }
+button[aria-pressed="true"] { border-color: var(--ink); font-weight: 600; }
+.chart-shell {
+  position: relative; flex: 1; min-height: 320px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+}
+canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+.readout { font-size: 12px; color: var(--muted); min-height: 18px; font-variant-numeric: tabular-nums; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px; font-size: 11px; color: var(--muted); }
+.chip { display: flex; gap: 6px; align-items: center; padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; }
+.swatch { width: 10px; height: 10px; border-radius: 2px; }
+.share { color: var(--ink); font-variant-numeric: tabular-nums; }
+.note { color: var(--muted); font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>__TITLE__</h1>
+  <p id="subtitle"></p>
+</header>
+<main>
+  <div class="toolbar" id="toolbar"></div>
+  <div class="chart-shell"><canvas id="chart"></canvas></div>
+  <div class="readout" id="readout">Wheel to zoom, drag to pan, double-click to reset.</div>
+  <div class="legend" id="legend"></div>
+  <p class="note">
+    Bar colour is the trailing annualized volatility of the 4h window ending at that bar
+    (causal: it only uses bars up to the close). Bands are the entry-gate sweep thresholds.
+    Filled body = up bar, hollow = down bar.
+  </p>
+</main>
+<script type="text/plain" id="payload">__DATA__</script>
+<script>
+const META = __META__;
+const $ = (id) => document.getElementById(id);
+const TH = META.thresholds, LBL = META.labels, CLR = META.colors;
+const T0 = META.start_sec, SCALE = META.price_scale, BANDS = CLR.length;
+
+let N, TA, OA, HA, LA, CA, VA;
+(function decodePayload() {
+  const text = $('payload').textContent.trim();
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  const buffer = bytes.buffer;
+  N = META.count;
+  TA = new Uint32Array(buffer, 0, N);
+  OA = new Uint32Array(buffer, 4 * N, N);
+  HA = new Uint32Array(buffer, 8 * N, N);
+  LA = new Uint32Array(buffer, 12 * N, N);
+  CA = new Uint32Array(buffer, 16 * N, N);
+  VA = new Uint16Array(buffer, 20 * N, N);
+})();
+
+const openAt = (i) => OA[i] / SCALE;
+const highAt = (i) => HA[i] / SCALE;
+const lowAt = (i) => LA[i] / SCALE;
+const closeAt = (i) => CA[i] / SCALE;
+const secAt = (i) => T0 + TA[i];
+const volAt = (i) => (VA[i] === 65535 ? NaN : VA[i] / 10);
+
+function binOf(pct) {
+  if (!isFinite(pct)) return -1;
+  const value = pct / 100;
+  let band = 0;
+  while (band < TH.length && value >= TH[band]) band += 1;
+  return band;
+}
+
+const canvas = $('chart');
+const ctx = canvas.getContext('2d');
+const PAD = { l: 68, r: 18, t: 14, b: 26 };
+const GAP = 30;
+let CW = 0, CH = 0, cache = null, hover = null, dragState = null;
+const totalFrom = T0, totalTo = secAt(N - 1) + 300;
+let view = { from: totalFrom, to: totalTo };
+
+function layout() {
+  const plotW = CW - PAD.l - PAD.r;
+  const plotH = CH - PAD.t - PAD.b - GAP;
+  const priceH = Math.max(120, Math.round(plotH * 0.70));
+  return {
+    x0: PAD.l, plotW,
+    priceTop: PAD.t, priceBottom: PAD.t + priceH, priceH,
+    volTop: PAD.t + priceH + GAP, volBottom: CH - PAD.b,
+    volH: Math.max(48, CH - PAD.b - (PAD.t + priceH + GAP)),
+  };
+}
+
+function pad2(value) { return String(value).padStart(2, '0'); }
+
+function isoDate(sec) {
+  const date = new Date(sec * 1000);
+  return `${date.getUTCFullYear()}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())}`;
+}
+
+function isoTime(sec) {
+  const date = new Date(sec * 1000);
+  return `${isoDate(sec)} ${pad2(date.getUTCHours())}:${pad2(date.getUTCMinutes())}`;
+}
+
+function fmtPrice(value) {
+  if (value >= 1) return value.toFixed(2);
+  if (value >= 0.1) return value.toFixed(3);
+  if (value >= 0.01) return value.toFixed(4);
+  return value.toFixed(5);
+}
+
+function fmtPct(value) {
+  return `${value >= 100 ? value.toFixed(0) : value.toFixed(1)}%`;
+}
+
+function indexAtSec(sec) {
+  let lo = 0, hi = N - 1;
+  if (sec <= T0) return 0;
+  if (sec >= secAt(N - 1)) return N - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (secAt(mid) < sec) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+function timeTicks(from, to) {
+  const ladder = [300, 900, 3600, 4 * 3600, 6 * 3600, 12 * 3600, 86400,
+                  3 * 86400, 7 * 86400, 14 * 86400, 30 * 86400, 90 * 86400,
+                  180 * 86400, 365 * 86400];
+  const span = to - from;
+  let step = ladder[ladder.length - 1];
+  for (const candidate of ladder) {
+    if (span / candidate <= 7) { step = candidate; break; }
+  }
+  const ticks = [];
+  for (let t = Math.ceil(from / step) * step; t <= to; t += step) ticks.push(t);
+  return { step, ticks };
+}
+
+function rebuild() {
+  const L = layout();
+  const cols = Math.max(1, Math.floor(L.plotW));
+  const span = view.to - view.from;
+  const first = Math.max(0, indexAtSec(view.from) - 1);
+  const last = Math.min(N, indexAtSec(view.to) + 2);
+  const open = new Float64Array(cols);
+  const high = new Float64Array(cols);
+  const low = new Float64Array(cols);
+  const close = new Float64Array(cols);
+  const count = new Uint32Array(cols);
+  const volSum = new Float64Array(cols);
+  const volCount = new Uint32Array(cols);
+  const shares = new Uint32Array(BANDS);
+  let priced = 0, totalVol = 0, pmin = Infinity, pmax = -Infinity;
+
+  for (let i = first; i < last; i += 1) {
+    const t = secAt(i);
+    if (t < view.from || t > view.to) continue;
+    const col = Math.min(cols - 1, Math.max(0, Math.floor((t - view.from) / span * cols)));
+    const o = openAt(i), h = highAt(i), l = lowAt(i), c = closeAt(i);
+    if (!(o > 0) || !(c > 0)) continue;
+    if (count[col] === 0) { open[col] = o; high[col] = h; low[col] = l; }
+    else {
+      if (h > high[col]) high[col] = h;
+      if (l < low[col]) low[col] = l;
+    }
+    close[col] = c;
+    count[col] += 1;
+    if (h > pmax) pmax = h;
+    if (l < pmin) pmin = l;
+    priced += 1;
+    const vol = volAt(i);
+    if (isFinite(vol)) { volSum[col] += vol; volCount[col] += 1; }
+    const band = binOf(vol);
+    if (band >= 0) { shares[band] += 1; totalVol += 1; }
+  }
+
+  if (!isFinite(pmin) || !isFinite(pmax)) { pmin = 1; pmax = 1; }
+  cache = {
+    cols, open, high, low, close, count, volSum, volCount,
+    shares, totalVol, priced,
+    pmin: pmin * 0.985, pmax: pmax * 1.015,
+  };
+  const bars = document.querySelectorAll('.share');
+  bars.forEach((element) => {
+    const band = Number(element.dataset.band);
+    element.textContent = totalVol ? `${(shares[band] / totalVol * 100).toFixed(1)}%` : '—';
+  });
+}
+
+function paintAxes(L) {
+  ctx.font = '11px ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif';
+  ctx.fillStyle = '#52514e';
+  ctx.strokeStyle = '#e3e2df';
+  ctx.lineWidth = 1;
+  const { step, ticks } = timeTicks(view.from, view.to);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  for (const t of ticks) {
+    const x = L.x0 + (t - view.from) / (view.to - view.from) * L.plotW;
+    if (x < L.x0 - 1 || x > L.x0 + L.plotW + 1) continue;
+    ctx.beginPath();
+    ctx.moveTo(x, L.priceTop);
+    ctx.lineTo(x, L.volBottom);
+    ctx.stroke();
+    const label = step < 86400
+      ? `${isoTime(t).slice(5, 10)} ${isoTime(t).slice(11)}`
+      : (step < 90 * 86400 ? isoDate(t).slice(5) : isoDate(t).slice(0, 7));
+    ctx.fillText(label, x, L.volBottom + 7);
+  }
+}
+
+function paintPrice(L) {
+  const { cols, open, high, low, close, count, volSum, volCount, pmin, pmax } = cache;
+  const lo = Math.log(pmin), hi = Math.log(pmax);
+  const yOf = (price) => L.priceBottom - (Math.log(price) - lo) / (hi - lo) * L.priceH;
+
+  const decade = Math.floor(Math.log10(pmin));
+  const ticks = [];
+  for (let d = decade - 1; d <= Math.ceil(Math.log10(pmax)); d += 1) {
+    for (const mult of [1, 1.5, 2, 3, 4, 5, 6, 8, 9, 10]) {
+      const value = mult * Math.pow(10, d);
+      if (value >= pmin && value <= pmax) ticks.push(value);
+    }
+  }
+  if (ticks.length < 2) {
+    // A narrow range can miss every round number; fall back to equal steps in
+    // log space so the axis is never unlabelled.
+    ticks.length = 0;
+    for (let step = 0; step <= 3; step += 1) {
+      ticks.push(Math.exp(lo + (hi - lo) * step / 3));
+    }
+  } else if (ticks.length > 7) {
+    const stride = Math.ceil(ticks.length / 6);
+    const thinned = ticks.filter((_, index) => index % stride === 0);
+    ticks.length = 0;
+    thinned.forEach((value) => ticks.push(value));
+  }
+  ctx.font = '11px ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#52514e';
+  ctx.strokeStyle = '#e3e2df';
+  for (const value of ticks) {
+    const y = yOf(value);
+    ctx.beginPath();
+    ctx.moveTo(L.x0, y);
+    ctx.lineTo(L.x0 + L.plotW, y);
+    ctx.stroke();
+    ctx.fillText(fmtPrice(value), L.x0 - 6, y);
+  }
+
+  const colW = L.plotW / cols;
+  for (let col = 0; col < cols; col += 1) {
+    if (!count[col]) continue;
+    const x = L.x0 + (col + 0.5) * colW;
+    const yHigh = yOf(high[col]), yLow = yOf(low[col]);
+    const yOpen = yOf(open[col]), yClose = yOf(close[col]);
+    const band = binOf(volCount[col] ? volSum[col] / volCount[col] : NaN);
+    const colour = band < 0 ? META.neutral : CLR[band];
+    const bodyWidth = Math.max(1, Math.min(9, colW - 1));
+    ctx.strokeStyle = colour;
+    ctx.globalAlpha = 0.9;
+    ctx.lineWidth = Math.max(0.7, Math.min(1.3, colW / 3));
+    ctx.beginPath();
+    ctx.moveTo(x, yHigh);
+    ctx.lineTo(x, yLow);
+    ctx.stroke();
+    const top = Math.min(yOpen, yClose);
+    const height = Math.max(1, Math.abs(yClose - yOpen));
+    ctx.globalAlpha = 1;
+    if (colW >= 3 && close[col] < open[col]) {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(x - bodyWidth / 2, top, bodyWidth, height);
+      ctx.strokeStyle = colour;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x - bodyWidth / 2, top, bodyWidth, height);
+    } else {
+      ctx.fillStyle = colour;
+      ctx.fillRect(x - bodyWidth / 2, top, bodyWidth, height);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function paintVolatility(L) {
+  const { cols, volSum, volCount } = cache;
+  const floor = Math.log(META.vol_floor), ceiling = Math.log(META.vol_ceiling);
+  const yOf = (pct) => {
+    const clamped = Math.min(META.vol_ceiling, Math.max(META.vol_floor, pct));
+    const ratio = (Math.log(clamped) - floor) / (ceiling - floor);
+    return L.volBottom - ratio * L.volH;
+  };
+
+  const boundaries = [0].concat(TH.map((value) => value * 100), [META.vol_ceiling]);
+  for (let band = 0; band < BANDS; band += 1) {
+    const top = yOf(Math.min(boundaries[band + 1], META.vol_ceiling));
+    const bottom = yOf(boundaries[band]);
+    ctx.fillStyle = CLR[band];
+    ctx.globalAlpha = 0.07;
+    ctx.fillRect(L.x0, top, L.plotW, Math.max(0, bottom - top));
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.strokeStyle = '#52514e';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.font = '11px ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  for (const threshold of TH) {
+    const y = yOf(threshold * 100);
+    ctx.beginPath();
+    ctx.moveTo(L.x0, y);
+    ctx.lineTo(L.x0 + L.plotW, y);
+    ctx.stroke();
+    ctx.fillStyle = '#52514e';
+    ctx.fillText(fmtPct(threshold * 100), L.x0 - 6, y);
+    ctx.strokeStyle = '#52514e';
+  }
+  ctx.setLineDash([]);
+
+  const colW = L.plotW / cols;
+  ctx.strokeStyle = '#4a3aa7';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  let drawing = false;
+  let lastCol = -1;
+  for (let col = 0; col < cols; col += 1) {
+    if (!volCount[col]) continue;
+    const x = L.x0 + (col + 0.5) * colW;
+    const y = yOf(volSum[col] / volCount[col]);
+    // When zoomed in there is only one bar per pixel column, so adjacent
+    // columns are a pixel apart. Bridging empty columns keeps the strip a
+    // line instead of a scatter of isolated dots; a wide gap restarts it.
+    if (!drawing || col - lastCol > 12) { ctx.moveTo(x, y); drawing = true; }
+    else { ctx.lineTo(x, y); }
+    lastCol = col;
+  }
+  ctx.stroke();
+
+  ctx.fillStyle = '#52514e';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillText('4h annualized volatility (log)', L.x0 + 4, L.volTop - 14);
+}
+
+function paintExemplars(L) {
+  const span = view.to - view.from;
+  ctx.font = '600 11px ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif';
+  META.exemplars.forEach((example, index) => {
+    const centre = (example.start_sec + example.end_sec) / 2;
+    const x = L.x0 + (centre - view.from) / span * L.plotW;
+    if (x < L.x0 || x > L.x0 + L.plotW) return;
+    ctx.strokeStyle = '#52514e';
+    ctx.setLineDash([2, 3]);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, L.priceTop);
+    ctx.lineTo(x, L.volBottom);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#52514e';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(String(index + 1), x, L.priceBottom - 2);
+  });
+}
+
+function paint() {
+  if (!CW || !CH) return;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, CW, CH);
+  if (!cache) rebuild();
+  const L = layout();
+  if (!cache.priced) {
+    ctx.fillStyle = '#52514e';
+    ctx.font = '12px ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('No bars in this range', CW / 2, CH / 2);
+    return;
+  }
+  paintAxes(L);
+  paintPrice(L);
+  paintVolatility(L);
+  paintExemplars(L);
+  paintHover(L);
+}
+
+function paintHover(L) {
+  if (!hover) return;
+  const x = L.x0 + (hover.sec - view.from) / (view.to - view.from) * L.plotW;
+  if (x < L.x0 || x > L.x0 + L.plotW) return;
+  ctx.strokeStyle = '#0b0b0b';
+  ctx.globalAlpha = 0.35;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x, L.priceTop);
+  ctx.lineTo(x, L.volBottom);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function updateReadout() {
+  if (!hover) {
+    $('readout').textContent = 'Wheel to zoom, drag to pan, double-click to reset.';
+    return;
+  }
+  const i = hover.index;
+  const vol = volAt(i);
+  const band = binOf(vol);
+  const bandText = band < 0 ? 'volatility not available yet' : `band ${LBL[band]}`;
+  $('readout').textContent =
+    `${isoTime(secAt(i))} UTC  ·  close ${fmtPrice(closeAt(i))}  ·  ` +
+    `4h vol ${isFinite(vol) ? fmtPct(vol) : 'n/a'}  ·  ${bandText}`;
+}
+
+function setView(from, to, pressed) {
+  const span = Math.max(300 * 60, to - from);
+  const limit = totalTo - totalFrom;
+  let start = Math.max(totalFrom, from);
+  if (start + span > totalTo) start = Math.max(totalFrom, totalTo - span);
+  const clampedSpan = Math.min(span, limit);
+  view = { from: start, to: start + clampedSpan };
+  cache = null;
+  hover = null;
+  toolbarButtons.forEach((button) => {
+    button.setAttribute('aria-pressed', button.dataset.key === pressed ? 'true' : 'false');
+  });
+  paint();
+}
+
+function zoomAt(anchorSec, factor) {
+  const span = Math.min(totalTo - totalFrom, Math.max(300 * 60, (view.to - view.from) * factor));
+  const ratio = (anchorSec - view.from) / (view.to - view.from);
+  const from = anchorSec - ratio * span;
+  setView(from, from + span, null);
+}
+
+function canvasPoint(event) {
+  const rect = canvas.getBoundingClientRect();
+  return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+}
+
+const toolbarButtons = [];
+function addButtons(group, items) {
+  items.forEach((item) => {
+    const button = document.createElement('button');
+    button.textContent = item.text;
+    button.dataset.key = item.key;
+    button.title = item.title || '';
+    button.setAttribute('aria-pressed', item.key === 'all' ? 'true' : 'false');
+    button.addEventListener('click', item.action);
+    group.appendChild(button);
+    toolbarButtons.push(button);
+  });
+}
+
+function buildToolbar() {
+  const toolbar = $('toolbar');
+  const ranges = document.createElement('div');
+  ranges.className = 'group';
+  const rangeTag = document.createElement('span');
+  rangeTag.className = 'tag';
+  rangeTag.textContent = 'range';
+  ranges.appendChild(rangeTag);
+  const presets = [
+    { text: 'All', key: 'all', days: null },
+    { text: '1y', key: '1y', days: 365 },
+    { text: '90d', key: '90d', days: 90 },
+    { text: '30d', key: '30d', days: 30 },
+    { text: '7d', key: '7d', days: 7 },
+    { text: '1d', key: '1d', days: 1 },
+  ];
+  addButtons(ranges, presets.map((preset) => ({
+    text: preset.text,
+    key: preset.key,
+    action: () => {
+      if (!preset.days) { setView(totalFrom, totalTo, preset.key); return; }
+      const to = totalTo;
+      setView(to - preset.days * 86400, to, preset.key);
+    },
+  })));
+  toolbar.appendChild(ranges);
+
+  const jumps = document.createElement('div');
+  jumps.className = 'group';
+  const jumpTag = document.createElement('span');
+  jumpTag.className = 'tag';
+  jumpTag.textContent = '3-day windows';
+  jumps.appendChild(jumpTag);
+  addButtons(jumps, META.exemplars.map((example, index) => ({
+    text: String(index + 1),
+    key: `example-${index}`,
+    title: `${isoDate(example.start_sec)} · mean ${fmtPct(example.mean_pct)}`,
+    action: () => {
+      const span = example.end_sec - example.start_sec;
+      const pad = span * 0.35;
+      setView(example.start_sec - pad, example.end_sec + pad, `example-${index}`);
+    },
+  })));
+  toolbar.appendChild(jumps);
+}
+
+function buildLegend() {
+  const legend = $('legend');
+  for (let band = 0; band < BANDS; band += 1) {
+    const chip = document.createElement('span');
+    chip.className = 'chip';
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = CLR[band];
+    const label = document.createElement('span');
+    label.textContent = LBL[band];
+    const share = document.createElement('span');
+    share.className = 'share';
+    share.dataset.band = String(band);
+    share.textContent = '—';
+    chip.append(swatch, label, share);
+    legend.appendChild(chip);
+  }
+}
+
+function resizeCanvas() {
+  DPR = window.devicePixelRatio || 1;
+  const box = canvas.parentElement.getBoundingClientRect();
+  CW = Math.max(320, box.width);
+  CH = Math.max(240, box.height);
+  canvas.width = Math.round(CW * DPR);
+  canvas.height = Math.round(CH * DPR);
+  cache = null;
+  paint();
+}
+
+canvas.addEventListener('wheel', (event) => {
+  event.preventDefault();
+  const point = canvasPoint(event);
+  const L = layout();
+  const ratio = (point.x - L.x0) / L.plotW;
+  if (ratio < 0 || ratio > 1) return;
+  const anchor = view.from + ratio * (view.to - view.from);
+  zoomAt(anchor, event.deltaY > 0 ? 1.25 : 0.8);
+}, { passive: false });
+
+canvas.addEventListener('pointerdown', (event) => {
+  dragState = { x: event.clientX, from: view.from, to: view.to };
+  canvas.setPointerCapture(event.pointerId);
+  canvas.style.cursor = 'grabbing';
+});
+
+canvas.addEventListener('pointerup', () => {
+  dragState = null;
+  canvas.style.cursor = 'crosshair';
+});
+
+canvas.addEventListener('pointermove', (event) => {
+  const L = layout();
+  if (dragState) {
+    const shift = (event.clientX - dragState.x) / L.plotW * (dragState.to - dragState.from);
+    setView(dragState.from - shift, dragState.to - shift, null);
+    return;
+  }
+  const point = canvasPoint(event);
+  if (point.x < L.x0 || point.x > L.x0 + L.plotW || point.y > L.volBottom) {
+    hover = null;
+  } else {
+    const sec = view.from + (point.x - L.x0) / L.plotW * (view.to - view.from);
+    const index = indexAtSec(sec);
+    hover = { sec, index };
+  }
+  updateReadout();
+  paint();
+});
+
+canvas.addEventListener('pointerleave', () => { hover = null; updateReadout(); paint(); });
+canvas.addEventListener('dblclick', () => setView(totalFrom, totalTo, 'all'));
+
+new ResizeObserver(() => resizeCanvas()).observe(canvas.parentElement);
+
+$('subtitle').textContent =
+  `${META.label} · ${META.count.toLocaleString('en-US')} bars · ` +
+  `${isoDate(T0)} → ${isoDate(totalTo)} · trailing ${META.window_bars}-bar ` +
+  `(${META.window_hours}h) annualized volatility`;
+
+buildToolbar();
+buildLegend();
+resizeCanvas();
+</script>
+</body>
+</html>
+"""
+
+
+def write_volatility_regimes_html(
+    logger: logging.Logger,
+    bars,
+    path: str,
+    *,
+    label: str = "DOGEUSDT 5m",
+    window_hours: float = 4.0,
+    exemplar_days: float = 3.0,
+    exemplar_targets: Sequence[float] = (0.35, 0.90, 2.20),
+) -> str:
+    """Write a self-contained HTML chart of every bar, coloured by regime.
+
+    The PNG version has to decimate 662k bars down to a few thousand points,
+    which hides the 5-minute structure. Here the whole series travels with the
+    file and the browser draws only the visible range, so zooming in reaches
+    individual candles. The payload costs 22 bytes per bar.
+    """
+    from trade.sim.martingale_backtest import rolling_annualized_volatility
+
+    volatility, window_bars = rolling_annualized_volatility(
+        bars, window_hours=window_hours
+    )
+    times = pd.DatetimeIndex(pd.to_datetime(bars.time))
+    if times.tz is None:
+        times = times.tz_localize("UTC")
+    seconds = np.asarray(
+        (times - pd.Timestamp("1970-01-01", tz="UTC")).total_seconds(),
+        dtype=np.int64,
+    )
+    offsets = (seconds - seconds[0]).astype(np.uint32)
+
+    def prices(values) -> np.ndarray:
+        return np.rint(np.asarray(values, dtype=float) * 1_000_000.0).astype(np.uint32)
+
+    percentage = volatility * 100.0
+    units = np.where(
+        np.isfinite(percentage),
+        np.clip(np.rint(percentage * 10.0), 0, 65534),
+        65535,
+    ).astype(np.uint16)
+
+    payload = np.concatenate(
+        [offsets, prices(bars.open), prices(bars.high), prices(bars.low),
+         prices(bars.close)]
+    ).astype(np.uint32, copy=False).tobytes() + units.tobytes()
+    blob = base64.b64encode(payload).decode("ascii")
+
+    step = int(np.median(np.diff(seconds))) if len(seconds) > 1 else 300
+    selected = _exemplar_windows(
+        volatility, bars.periods_per_year, exemplar_days, exemplar_targets
+    )
+    exemplars = [
+        {
+            "start_sec": int(seconds[begin]),
+            "end_sec": int(seconds[min(end + 1, len(seconds) - 1)]) + step,
+            "mean_pct": round(float(mean_vol) * 100.0, 1),
+        }
+        for begin, end, mean_vol in selected
+    ]
+
+    meta = {
+        "label": label,
+        "count": int(len(offsets)),
+        "start_sec": int(seconds[0]),
+        "price_scale": 1_000_000,
+        "thresholds": list(REGIME_THRESHOLDS),
+        "labels": list(REGIME_LABELS),
+        "colors": list(REGIME_COLORS),
+        "neutral": PRICE_BAND,
+        "vol_floor": 5.0,
+        "vol_ceiling": 300.0,
+        "window_hours": window_hours,
+        "window_bars": int(window_bars),
+        "exemplars": exemplars,
+    }
+
+    title = f"{label} · price by annualized volatility"
+    html = (
+        REGIME_HTML_TEMPLATE
+        .replace("__TITLE__", title)
+        .replace("__META__", json.dumps(meta))
+        .replace("__DATA__", blob)
+    )
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(html)
+    logger.info(
+        f"Volatility regime HTML saved to {path} "
+        f"({meta['count']} bars, {len(html) / 1e6:.1f} MB, {len(exemplars)} windows)"
     )
     return path

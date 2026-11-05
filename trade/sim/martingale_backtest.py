@@ -96,6 +96,42 @@ class CapitalParams:
 
 
 @dataclass(frozen=True)
+class VolatilityFilterParams:
+    """Causal gate on new base orders, expressed in trailing annualized vol.
+
+    The gate is evaluated at each bar's open using the volatility that was
+    already closed on the previous bar, so the filter never reads the bar it
+    decides on. Thresholds are absolute percentages: deriving them from
+    quantiles of the full sample would leak the future even though the
+    comparison itself is trailing.
+
+    ``None`` on either bound means "no constraint on that side". An open cycle
+    is never filtered: the gate only decides whether a flat account may start
+    a new ladder.
+    """
+
+    window_hours: float = 4.0
+    min_annualized_pct: Optional[float] = None
+    max_annualized_pct: Optional[float] = None
+
+    def __post_init__(self):
+        if self.window_hours <= 0.0:
+            raise ValueError("window_hours must be positive")
+        if self.min_annualized_pct is None and self.max_annualized_pct is None:
+            raise ValueError("at least one volatility bound must be set")
+        if self.min_annualized_pct is not None and self.min_annualized_pct < 0.0:
+            raise ValueError("min_annualized_pct must be >= 0")
+        if self.max_annualized_pct is not None and self.max_annualized_pct <= 0.0:
+            raise ValueError("max_annualized_pct must be > 0")
+        if (
+            self.min_annualized_pct is not None
+            and self.max_annualized_pct is not None
+            and self.min_annualized_pct >= self.max_annualized_pct
+        ):
+            raise ValueError("min_annualized_pct must be below max_annualized_pct")
+
+
+@dataclass(frozen=True)
 class BacktestConfig:
     strategy: MartingaleParams = field(default_factory=MartingaleParams)
     account: AccountParams = field(default_factory=AccountParams)
@@ -103,6 +139,10 @@ class BacktestConfig:
     monte_carlo: MonteCarloParams = field(default_factory=MonteCarloParams)
     capital: CapitalParams = field(default_factory=CapitalParams)
     gap_analysis: "GapAnalysisParams" = field(default_factory=lambda: GapAnalysisParams())
+    # Finer interval used to settle ambiguous bars of the primary series.
+    intrabar_interval: Optional[str] = "1m"
+    # None: every bar may start a new ladder (the original behaviour).
+    volatility_filter: Optional[VolatilityFilterParams] = None
     max_cycle_days: Optional[float] = None
     save_path: Optional[str] = None
     trades_path: Optional[str] = None   # one row per closed trade
@@ -121,6 +161,12 @@ class BacktestConfig:
     cluster_min_scale: int = 1
     cluster_max_scale: int = 5_000
     cluster_scale_count: int = 40
+    # Every grid break on the price/volatility timeline plus the conditional
+    # break probability per trailing-volatility bucket.
+    breach_analysis_dir: Optional[str] = None
+    breach_vol_window_hours: float = 4.0
+    breach_horizons_hours: Sequence[float] = (1.0, 4.0, 24.0)
+    breach_buckets: int = 10
 
     def __post_init__(self):
         if self.equity_curves_per_plot < 1:
@@ -129,6 +175,14 @@ class BacktestConfig:
             raise ValueError("grid_break_context_bars must be >= 0")
         if self.max_cycle_days is not None and self.max_cycle_days <= 0.0:
             raise ValueError("max_cycle_days must be positive or None")
+        if self.breach_vol_window_hours <= 0.0:
+            raise ValueError("breach_vol_window_hours must be positive")
+        if not self.breach_horizons_hours or any(
+            hours <= 0.0 for hours in self.breach_horizons_hours
+        ):
+            raise ValueError("breach_horizons_hours must be a non-empty list of positive hours")
+        if self.breach_buckets < 2:
+            raise ValueError("breach_buckets must be >= 2")
 
 
 # ============================================================
@@ -147,6 +201,9 @@ class BarSeries:
     # once in load_bars instead of re-derived from the whole time column on
     # every Monte Carlo run.
     periods_per_year: float = 0.0
+    # Optional finer bars per bar, shape (bars, steps, 4): open/high/low/close.
+    # Missing rows are NaN and fall back to the pessimistic two-path choice.
+    intrabar: Optional[np.ndarray] = None
 
     def __len__(self) -> int:
         return len(self.open)
@@ -156,7 +213,9 @@ def _periods_per_year(times: np.ndarray) -> float:
     """Annualization factor from the median positive bar spacing."""
     if len(times) < 2:
         return 0.0
-    deltas = np.diff(pd.to_datetime(times).astype("int64")) / 1e9
+    # ``.dt.total_seconds()`` is unit aware; pandas may store timestamps in
+    # microseconds rather than nanoseconds, so int64 arithmetic is not safe.
+    deltas = pd.to_datetime(times).to_series().diff().dt.total_seconds().to_numpy()
     positive = deltas[deltas > 0]
     if not len(positive):
         return 0.0
@@ -164,6 +223,54 @@ def _periods_per_year(times: np.ndarray) -> float:
     if median_seconds <= 0.0:
         return 0.0
     return 365.25 * 24.0 * 3600.0 / median_seconds
+
+
+def rolling_annualized_volatility(
+    bars: BarSeries,
+    *,
+    window_hours: float = 4.0,
+) -> tuple[np.ndarray, int]:
+    """Trailing annualized close-to-close volatility of the primary bars.
+
+    The lookback is given in hours, so the same setting means the same window
+    on 1m, 5m or 1h series. A value at index ``i`` uses closes up to and
+    including bar ``i``; callers that decide on bar ``i``'s open must shift it
+    by one bar (see ``build_open_gate``).
+    """
+    bars_per_hour = (
+        bars.periods_per_year / (365.25 * 24.0)
+        if bars.periods_per_year > 0.0
+        else 0.0
+    )
+    window_bars = max(2, int(round(window_hours * bars_per_hour))) if bars_per_hour else 8
+    close = np.asarray(bars.close, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        returns = np.diff(np.log(close), prepend=np.nan)
+    series = pd.Series(returns, dtype=float).rolling(
+        window_bars, min_periods=window_bars
+    ).std(ddof=1)
+    return series.to_numpy() * np.sqrt(bars.periods_per_year), window_bars
+
+
+def build_open_gate(
+    bars: BarSeries,
+    params: "VolatilityFilterParams",
+) -> np.ndarray:
+    """Bars where a flat account may open a base order, strictly causal.
+
+    Bar ``i`` opens at its own open, before that bar's close is known, so the
+    gate uses volatility from bar ``i-1``. Warm-up bars (no trailing window
+    yet) stay flat rather than guess.
+    """
+    volatility, _ = rolling_annualized_volatility(bars, window_hours=params.window_hours)
+    shifted = np.concatenate(([np.nan], volatility[:-1]))
+    percentage = shifted * 100.0
+    allowed = np.isfinite(percentage)
+    if params.min_annualized_pct is not None:
+        allowed &= percentage >= params.min_annualized_pct
+    if params.max_annualized_pct is not None:
+        allowed &= percentage <= params.max_annualized_pct
+    return allowed
 
 
 def _days_to_bars(days: Optional[float], periods_per_year: float) -> Optional[int]:
@@ -190,7 +297,75 @@ def _parse_ymd_date(value: Optional[str], name: str) -> Optional[pd.Timestamp]:
     return pd.Timestamp(parsed, tz="UTC")
 
 
-def load_bars(logger: logging.Logger, data: DataParams) -> BarSeries:
+def _interval_seconds(interval: str) -> int:
+    """Seconds per bar for intervals such as 1m, 5m, 1h."""
+    unit = interval[-1].lower()
+    value = int(interval[:-1])
+    factor = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(unit)
+    if factor is None or value <= 0:
+        raise ValueError(f"unsupported interval: {interval!r}")
+    return value * factor
+
+
+def _load_intrabar(
+    logger: logging.Logger,
+    data: DataParams,
+    times: np.ndarray,
+    intrabar_interval: str,
+) -> Optional[np.ndarray]:
+    """Align a finer interval onto the primary bars as (bars, steps, 4)."""
+    sub_data = replace(data, interval=intrabar_interval)
+    path = common.market_data_path(sub_data, root_dir=data.root_dir)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Intrabar file not found: {path}")
+
+    frame = pd.read_csv(path, encoding="utf-8", usecols=[
+        "open_time_date_utc", "open", "high", "low", "close",
+    ])
+    frame["open_time_date_utc"] = pd.to_datetime(frame["open_time_date_utc"], utc=True)
+    frame = frame.sort_values("open_time_date_utc")
+    ohlc = frame[["open", "high", "low", "close"]].astype(float)
+    valid = (
+        ohlc.notna().all(axis=1)
+        & (ohlc > 0.0).all(axis=1)
+        & (ohlc["high"] >= ohlc[["open", "low", "close"]].max(axis=1))
+        & (ohlc["low"] <= ohlc[["open", "high", "close"]].min(axis=1))
+    )
+    frame = frame[valid]
+    sub_times = frame["open_time_date_utc"].to_numpy()
+
+    main_seconds = int(round(np.median(np.diff(times)) / np.timedelta64(1, "s")))
+    sub_seconds = _interval_seconds(intrabar_interval)
+    steps = int(round(main_seconds / sub_seconds))
+    if steps < 2:
+        raise ValueError(
+            f"intrabar interval {intrabar_interval!r} is not finer than the primary bars"
+        )
+
+    lower = times[0]
+    upper = times[-1] + np.timedelta64(main_seconds, "s")
+    inside = (sub_times >= lower) & (sub_times < upper)
+    sub_times = sub_times[inside]
+    sub_ohlc = frame.loc[inside, ["open", "high", "low", "close"]].to_numpy(dtype=float)
+
+    bars = np.full((len(times), steps, 4), np.nan)
+    slot = np.searchsorted(times, sub_times, side="right") - 1
+    offset = ((sub_times - times[slot]) / np.timedelta64(sub_seconds, "s")).astype(int)
+    keep = (slot >= 0) & (offset >= 0) & (offset < steps)
+    bars[slot[keep], offset[keep]] = sub_ohlc[keep]
+    coverage = float(np.isfinite(bars).all(axis=(1, 2)).mean())
+    logger.info(
+        f"Loaded {len(sub_times)} {intrabar_interval} rows into {steps} steps/bar | "
+        f"complete bars {coverage * 100:.1f}%"
+    )
+    return bars
+
+
+def load_bars(
+    logger: logging.Logger,
+    data: DataParams,
+    intrabar_interval: Optional[str] = None,
+) -> BarSeries:
     """Read the canonical raw CSV and drop rows that are not valid candles."""
     path = common.market_data_path(data, root_dir=data.root_dir)
     if not os.path.exists(path):
@@ -241,6 +416,10 @@ def load_bars(logger: logging.Logger, data: DataParams) -> BarSeries:
         f"{frame['open_time_date_utc'].iloc[0]} -> {frame['open_time_date_utc'].iloc[-1]} "
         f"| {periods_per_year:.0f} bars/year"
     )
+    intrabar = (
+        None if intrabar_interval is None
+        else _load_intrabar(logger, data, times, intrabar_interval)
+    )
     return BarSeries(
         time=times,
         open=frame["open"].to_numpy(dtype=float),
@@ -248,6 +427,7 @@ def load_bars(logger: logging.Logger, data: DataParams) -> BarSeries:
         low=frame["low"].to_numpy(dtype=float),
         close=frame["close"].to_numpy(dtype=float),
         periods_per_year=periods_per_year,
+        intrabar=intrabar,
     )
 
 
@@ -340,6 +520,12 @@ def run_once(
     initial_equity = account.initial_equity
     end_index = total_bars if max_bars is None else min(total_bars, start_index + max_bars)
     periods_per_year = bars.periods_per_year
+    # Built once per run, already shifted so each bar decides on the previous
+    # bar's closed volatility. None means the original always-open behaviour.
+    open_gate = (
+        None if config.volatility_filter is None
+        else build_open_gate(bars, config.volatility_filter)
+    )
 
     peak_equity = initial_equity
     peak_index = start_index
@@ -533,6 +719,7 @@ def run_once(
             "open_layers_at_end": account_state.cycle.layers,
             "unfilled_layers": account_state.unfilled_layers,
             "cooldown_blocked_bars": account_state.cooldown_blocked_bars,
+            "volatility_blocked_bars": account_state.volatility_blocked_bars,
             "reversals": account_state.reversals,
             "final_direction": SIDE_NAME[account_state.next_side],
             "dual_path_bars": account_state.dual_path_bars,
@@ -550,6 +737,8 @@ def run_once(
             high=bars.high[index],
             low=bars.low[index],
             close=bars.close[index],
+            intrabar=None if bars.intrabar is None else bars.intrabar[index],
+            allow_open=True if open_gate is None else bool(open_gate[index]),
         )
 
         new_trades = state.trades[processed_trades:]
@@ -921,6 +1110,7 @@ def run_once(
         "open_layers_at_end": state.cycle.layers,
         "unfilled_layers": sum(item.unfilled_layers for item in states),
         "cooldown_blocked_bars": sum(item.cooldown_blocked_bars for item in states),
+        "volatility_blocked_bars": sum(item.volatility_blocked_bars for item in states),
         "reversals": sum(item.reversals for item in states),
         "final_direction": SIDE_NAME[state.next_side],
         "dual_path_bars": sum(item.dual_path_bars for item in states),
@@ -1735,6 +1925,9 @@ def run_monte_carlo(
         "max_layers_seen": max((s["max_layers_seen"] for s in summaries), default=0),
         "unfilled_layers": sum(s["unfilled_layers"] for s in summaries),
         "cooldown_blocked_bars": sum(s["cooldown_blocked_bars"] for s in summaries),
+        "volatility_blocked_bars": sum(
+            s.get("volatility_blocked_bars", 0) for s in summaries
+        ),
         "reversals": sum(s["reversals"] for s in summaries),
         "dual_path_bars": sum(s["dual_path_bars"] for s in summaries),
         "up_first_worse_bars": sum(s["up_first_worse_bars"] for s in summaries),
@@ -2508,7 +2701,7 @@ def main(
     *,
     grid_validation_only: bool = False,
 ) -> dict:
-    bars = load_bars(logger, config.data)
+    bars = load_bars(logger, config.data, intrabar_interval=config.intrabar_interval)
     if config.max_cycle_days is not None:
         max_cycle_bars = _days_to_bars(config.max_cycle_days, bars.periods_per_year)
         config = replace(
@@ -2715,12 +2908,37 @@ def main(
             ),
         )
 
+    if config.breach_analysis_dir:
+        # Imported here so matplotlib is only imported when a chart is wanted.
+        from trade.sim.martingale_plot import plot_breach_analysis
+
+        plot_breach_analysis(
+            logger,
+            bars,
+            result.get("trades", []),
+            config.breach_analysis_dir,
+            title=(
+                f"{config.data.symbol} {config.data.interval} | "
+                f"grid {list(config.strategy.grid_deviation_pcts)} "
+                f"tp {config.strategy.take_profit_pct:.2%} "
+                f"dir {config.strategy.initial_direction}"
+            ),
+            window_hours=config.breach_vol_window_hours,
+            horizons_hours=config.breach_horizons_hours,
+            buckets=config.breach_buckets,
+        )
+
     result["params"] = {
         "strategy": asdict(config.strategy),
         "account": asdict(config.account),
         "data": asdict(config.data),
         "monte_carlo": asdict(config.monte_carlo),
         "capital": asdict(config.capital),
+        "intrabar_interval": config.intrabar_interval,
+        "volatility_filter": (
+            None if config.volatility_filter is None
+            else asdict(config.volatility_filter)
+        ),
         "max_cycle_days": config.max_cycle_days,
         "plots": {
             "equity_plot_path": config.equity_plot_path,
@@ -2728,6 +2946,7 @@ def main(
             "adverse_plot_path": config.adverse_plot_path,
             "grid_break_plot_dir": config.grid_break_plot_dir,
             "grid_break_context_bars": config.grid_break_context_bars,
+            "breach_analysis_dir": config.breach_analysis_dir,
         },
         "grid_validation_only": grid_validation_only,
     }
@@ -2762,6 +2981,11 @@ class Args:
     trading_type: str = common.DOGE_5m.trading_type
     market_category: str = common.DOGE_5m.market_category
     data_source: str = common.DOGE_5m.data_source
+    # Finer bars used only where the two candidate paths of one bar disagree.
+    # None keeps the pessimistic worst-of-two-path model.
+    intrabar_interval: Optional[str] = None
+    # Causally gate new base orders on trailing volatility. None disables it.
+    volatility_filter: Optional[VolatilityFilterParams] = None
     test_start_date: Optional[str] = None  # YYYY-MM-DD, inclusive
     test_end_date: Optional[str] = None    # YYYY-MM-DD, inclusive
     from_date: Optional[str] = None        # legacy alias for test_start_date
@@ -2819,6 +3043,12 @@ class Args:
     grid_break_context_bars: int = 200       # bars shown before open / after break
     pressure_path: Optional[str] = None   # .png time x window-scale pressure map
     cluster_path: Optional[str] = None    # .png cluster size vs gap allowance
+    # Directory for the grid-break timeline, the volatility curves and their
+    # CSV tables. None skips the analysis.
+    breach_analysis_dir: Optional[str] = None
+    breach_vol_window_hours: float = 4.0
+    breach_horizons_hours: List[float] = field(default_factory=lambda: [1.0, 4.0, 24.0])
+    breach_buckets: int = 10
     # Window-scale ladders for those two charts, in bars.
     pressure_min_scale: int = 8
     pressure_max_scale: Optional[int] = None   # None: total_bars // 8
@@ -2860,7 +3090,7 @@ def config_from_args(args: Args) -> BacktestConfig:
         data=DataParams(
             market_category=args.market_category,
             data_source=args.data_source,
-            symbol=args.symbol,
+            symbols=(args.symbol,),
             interval=args.interval,
             trading_type=args.trading_type,
             test_start_date=args.test_start_date,
@@ -2883,6 +3113,8 @@ def config_from_args(args: Args) -> BacktestConfig:
             seed=args.gap_seed,
         ),
         max_cycle_days=args.max_cycle_days,
+        intrabar_interval=args.intrabar_interval,
+        volatility_filter=args.volatility_filter,
         save_path=args.save_path,
         trades_path=None if args.no_export else args.trades_path,
         fills_path=None if args.no_export else args.fills_path,
@@ -2894,6 +3126,10 @@ def config_from_args(args: Args) -> BacktestConfig:
         grid_break_context_bars=args.grid_break_context_bars,
         pressure_path=None if args.no_plot else args.pressure_path,
         cluster_path=None if args.no_plot else args.cluster_path,
+        breach_analysis_dir=None if args.no_plot else args.breach_analysis_dir,
+        breach_vol_window_hours=args.breach_vol_window_hours,
+        breach_horizons_hours=args.breach_horizons_hours,
+        breach_buckets=args.breach_buckets,
         pressure_min_scale=args.pressure_min_scale,
         pressure_max_scale=args.pressure_max_scale,
         pressure_scale_count=args.pressure_scale_count,
@@ -2940,6 +3176,8 @@ def run(args: Optional[Args] = None) -> dict:
             defaults["pressure_path"] = os.path.join(exp_dir, "pressure.png")
         if config.cluster_path is None:
             defaults["cluster_path"] = os.path.join(exp_dir, "clusters.png")
+        if config.breach_analysis_dir is None:
+            defaults["breach_analysis_dir"] = os.path.join(exp_dir, "breach-analysis")
     config = replace(config, **defaults)
     started = time.time()
     result = main(logger, config, grid_validation_only=args.grid_validation_only)
