@@ -316,7 +316,7 @@ def build_task_spec(
       pre_hash -> {params, train: train_hash -> {params, sim_tasks:[{hash, params}, ...]}}
     NOTE: prep_output_dir/save_dir are NOT written to spec; they are derived from hash layout.
     """
-    from trade.runner import backtest_runner
+    from trade.runner import backtest_entry
 
     spec: Dict[str, Any] = {}
     for pre in preparation_task:
@@ -326,7 +326,7 @@ def build_task_spec(
         _assert_hash_roundtrip("prep", pre_d, common.preparation_config_from_dict(pre_d), pre_h)
 
         node_pre = spec.setdefault(pre_h, {"params": json_safe(pre_d), "train": {}})
-        pre_strategy_configs = [backtest_runner.strategy_config_for_preparation(strategy_config, pre) for strategy_config in simulation_task]
+        pre_strategy_configs = [backtest_entry.strategy_config_for_preparation(strategy_config, pre) for strategy_config in simulation_task]
 
         for tr in training_task:
             tr_d = asdict(tr)
@@ -344,7 +344,7 @@ def build_task_spec(
                 sim_h = identity.sim_hash
                 _assert_sim_hash_roundtrip(
                     sim_d,
-                    strategy_config=backtest_runner.strategy_config_from_dict(
+                    strategy_config=backtest_entry.strategy_config_from_dict(
                         sim_d["strategy_config"],
                     ),
                     expected_hash=sim_h,
@@ -415,11 +415,11 @@ def _assert_hash_roundtrip(kind: str, original: Dict[str, Any], restored_obj: An
 
 
 def _simulation_params(strategy_config: Any) -> Dict[str, Any]:
-    from trade.runner import backtest_runner
+    from trade.runner import backtest_entry
 
     return {
-        "strategy_config": backtest_runner.strategy_config_to_dict(strategy_config),
-        "broker_config": asdict(backtest_runner.BrokerConfig()),
+        "strategy_config": backtest_entry.strategy_config_to_dict(strategy_config),
+        "broker_config": asdict(backtest_entry.BrokerConfig()),
     }
 
 
@@ -455,7 +455,7 @@ def filter_pending_from_spec(task_spec: Dict[str, Any], done_set: set[str]) -> D
     """
     Filter sim leaf tasks that are already present in reports.jsonl.
     """
-    from trade.runner import backtest_runner
+    from trade.runner import backtest_entry
 
     pending: Dict[str, Any] = {}
     for pre_h, pre_node in task_spec.items():
@@ -692,17 +692,17 @@ def _precompute_backtest_predictions(
     train_cfg: Any,
     device: str,
 ) -> None:
-    from trade.runner import backtest_runner
+    from trade.runner import backtest_entry
 
     for period in ("long", "forward"):
-        data_config = backtest_runner.ModelDataConfig(
+        data_config = backtest_entry.ModelDataConfig(
             prep_output_dir=prep_output_dir,
             train_output_dir=train_output_dir,
             prediction_cache_dir=prediction_cache_dir,
             device=device,
             use_prediction_cache=True,
         )
-        cache_path = backtest_runner.precompute_prediction_cache(
+        cache_path = backtest_entry.precompute_prediction_cache(
             logger,
             data_config,
             train_cfg,
@@ -867,7 +867,7 @@ def _worker_sim(
 ):
     logger = _worker_logger(worker_log_file)
 
-    from trade.runner import backtest_runner
+    from trade.runner import backtest_entry
 
     while True:
         try:
@@ -893,10 +893,10 @@ def _worker_sim(
         ) = msg
         sim_h = sim["hash"]
         sim_params = sim["params"]
-        strategy_config = backtest_runner.strategy_config_from_dict(
+        strategy_config = backtest_entry.strategy_config_from_dict(
             sim_params["strategy_config"],
         )
-        broker_config = backtest_runner.BrokerConfig(
+        broker_config = backtest_entry.BrokerConfig(
             **sim_params["broker_config"],
         )
         prep_dir = _prep_output_dir(prep_exp_dir or exp_dir, pre_h)
@@ -916,14 +916,14 @@ def _worker_sim(
             report_stat = None
 
             def run_period(period):
-                runner_config = backtest_runner.RunnerConfig(
+                runner_config = backtest_entry.RunnerConfig(
                     strategy_config=strategy_config,
                     broker_config=broker_config,
                     save_dir=os.path.join(
                         _sim_output_dir(exp_dir, identity.full_hash),
                         period,
                     ),
-                    data_config=backtest_runner.ModelDataConfig(
+                    data_config=backtest_entry.ModelDataConfig(
                         prep_output_dir=prep_dir,
                         train_output_dir=train_output_dir,
                         prediction_cache_dir=prediction_cache_dir,
@@ -932,7 +932,7 @@ def _worker_sim(
                     ),
                     experiment_context=experiment_context,
                 )
-                return backtest_runner.main(logger, runner_config, period)
+                return backtest_entry.main(logger, runner_config, period)
 
             period_results = {}
             period_details = {}
@@ -1305,9 +1305,10 @@ def run_combo_fusion_and_backtest(
        task_description.json, then runs the long/forward backtests through simulation_task and
        writes to reports_path. In the backtest report, model_metrics (overall 3-class metrics after fusion) and
        sub_model_metrics (metrics of both sub-models on the backtest data) are attached automatically by
-       backtest_runner.main -> ModelHandler.evaluate_sub_models, nothing has to be computed here.
+       backtest_entry.main -> ModelHandler.evaluate_sub_models, nothing has to be computed here.
     """
     import model.train as train
+    from trade.runner import backtest_entry
 
     role_1, role_2 = train_config.COMBO_SUB_TASKS[TRAIN_MODE]
 
@@ -1400,7 +1401,7 @@ def run_combo_fusion_and_backtest(
         )
 
         # The backtest stage is identical to the single model mode (a fused directory is just an ordinary
-        # train_output_dir as far as backtest_runner.main is concerned), so instead of calling backtest_runner.main
+        # train_output_dir as far as backtest_entry.main is concerned), so instead of calling backtest_entry.main
         # sequentially here, every sim_task is pushed into the same sim_task_queue the single model mode uses and
         # handled in parallel by the MAX_SIM _worker_sim processes already running -- in combo mode those worker
         # processes are idle anyway (the sub-model tasks attach no sim_tasks), so they are put to goos use.
@@ -1412,7 +1413,7 @@ def run_combo_fusion_and_backtest(
         }
         for strategy_config in simulation_task:
             pre_para = common.preparation_config_from_dict(r1["pre_params"])
-            effective_strategy_config = backtest_runner.strategy_config_for_preparation(
+            effective_strategy_config = backtest_entry.strategy_config_for_preparation(
                 strategy_config,
                 pre_para,
             )
@@ -1525,7 +1526,7 @@ def main():
     elif args.load:
         selected_configs = os.path.join(common.PERSISTENCE_DIR, "batch_experiments", "selected_configs", SELECTED_FILE)
         records = common.load_selected_configs(selected_configs)  # just to validate file and format
-        from trade.runner import backtest_runner
+        from trade.runner import backtest_entry
         import model.train as train
 
         exp_dir = os.path.join(common.PERSISTENCE_DIR, "batch_experiments", "load_configs")
@@ -1539,10 +1540,10 @@ def main():
         results = []
         for r in records:
             params = r["params"]
-            strategy_config = backtest_runner.strategy_config_from_dict(
+            strategy_config = backtest_entry.strategy_config_from_dict(
                 params["strategy"],
             )
-            broker_config = backtest_runner.BrokerConfig(
+            broker_config = backtest_entry.BrokerConfig(
                 **params["broker"],
             )
             pre_para = common.preparation_config_from_dict(params["common"])
@@ -1554,14 +1555,14 @@ def main():
             if not os.path.exists(train_save_dir):
                 raise FileNotFoundError(f"Training artifact not found for {strategy_hash}: {train_save_dir}")
             preparation.main(logger, para=pre_para, prep_output_dir=load_prep_output_dir)
-            data_config = backtest_runner.ModelDataConfig(
+            data_config = backtest_entry.ModelDataConfig(
                 prep_output_dir=load_prep_output_dir,
                 train_output_dir=train_save_dir,
                 device="cpu",
                 use_prediction_cache=True,
             )
             for period in ("long", "forward"):
-                backtest_runner.precompute_prediction_cache(
+                backtest_entry.precompute_prediction_cache(
                     logger,
                     data_config,
                     train_cfg,
@@ -1575,7 +1576,7 @@ def main():
                 result[strategy_hash] = {risk_per_trade_pct: {"cagr": {}}}
 
                 def run_selected_period(period):
-                    runner_config = backtest_runner.RunnerConfig(
+                    runner_config = backtest_entry.RunnerConfig(
                         strategy_config=strategy_config,
                         broker_config=broker_config,
                         save_dir=os.path.join(
@@ -1588,7 +1589,7 @@ def main():
                         data_config=data_config,
                         experiment_context=experiment_context,
                     )
-                    output = backtest_runner.main(logger, runner_config, period)
+                    output = backtest_entry.main(logger, runner_config, period)
                     return output["report"]["results"][period]
 
                 long_result = run_selected_period("long")
