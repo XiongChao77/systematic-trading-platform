@@ -361,7 +361,7 @@ function normalizeBacktestPayload(payload) {
   const results = reportEnvelope.results || {};
   const detailResults = detailEnvelope.results || {};
   const period = body.source?.period
-    || ["all", "long", "forward"].find((name) => results[name]);
+    || ["all", "development", "forward"].find((name) => results[name]);
   const periodResult = period ? results[period] || {} : {};
   const periodDetails = period ? detailResults[period] || {} : {};
   const report = {

@@ -19,7 +19,7 @@ Outputs (under experiment/sweep_outputs/<tag>_3class/):
 Usage:
     python experiment/doge_3class_rolling.py [--symbol DOGEUSDT]
                                              [--mode expanding|sliding]
-                                             [--period long|oos|forward]
+                                             [--period development|forward|all]
                                              [--seq-len 32] [--stride 4]
 """
 
@@ -166,7 +166,7 @@ def run(symbol: str, *, mode: str, period: str, split_time: str,
             backtest_dir,
             file_name="equity_curve.png",
             normalize_equity=False,
-            include_oos=False,
+            include_oos=True,
             logger=logger,
         )
         record["equity_path"] = equity_path
@@ -254,7 +254,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--symbol", default="DOGEUSDT")
     parser.add_argument("--mode", choices=("expanding", "sliding"), default="expanding")
-    parser.add_argument("--period", default="long")
+    parser.add_argument("--period", default="development")
     parser.add_argument("--seq-len", type=int, default=32)
     parser.add_argument("--stride", type=int, default=4)
     parser.add_argument("--stop-on-error", action="store_true")

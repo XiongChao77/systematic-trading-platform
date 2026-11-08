@@ -47,7 +47,7 @@ def latest() -> FileResponse:
 def experiment_detail(
     dataset_id: str,
     record_id: str,
-    period: Literal["long", "forward"] = "long",
+    period: Literal["development", "forward"] = "development",
 ) -> dict[str, Any]:
     try:
         return service.load_experiment_backtest(dataset_id, record_id, period)

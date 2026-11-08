@@ -257,8 +257,8 @@ def _prediction_artifact_files(train_output_dir: str) -> list[str]:
 
 
 def _validate_period(period: str) -> str:
-    if period not in {"long", "forward", "all"}:
-        raise ValueError("period must be one of: 'long', 'forward', 'all'")
+    if period not in {"development", "long", "forward", "all"}:
+        raise ValueError("period must be one of: 'development', 'long', 'forward', 'all'")
     return period
 
 
@@ -295,6 +295,7 @@ def _prediction_cache_path(
 ) -> str:
     period = _validate_period(period)
     data_filenames = {
+        "development": ["train_data.csv" if common.CONF_DF == "to_csv" else "train_data.feather"],
         "long": ["train_data.csv" if common.CONF_DF == "to_csv" else "train_data.feather"],
         "forward": ["test_data.csv" if common.CONF_DF == "to_csv" else "test_data.feather"],
         "all": [
@@ -395,7 +396,7 @@ def _load_model_period_frame(
     symbol: Optional[str] = None,
 ) -> pd.DataFrame:
     period = _validate_period(period)
-    if period == "long":
+    if period in {"development", "long"}:
         return _select_symbol_frame(common.load_train_df_from_dir(data_config.prep_output_dir), symbol)
     if period == "forward":
         return _select_symbol_frame(common.load_test_df_from_dir(data_config.prep_output_dir), symbol)
@@ -430,7 +431,7 @@ def _model_time_regions(
     if cached is not None:
         return cached
 
-    train_frame = current_frame if period == "long" else common.load_train_df_from_dir(data_config.prep_output_dir)
+    train_frame = current_frame if period in {"development", "long"} else common.load_train_df_from_dir(data_config.prep_output_dir)
     oos_frame = current_frame if period == "forward" else common.load_test_df_from_dir(data_config.prep_output_dir)
     valid_indices = data_loader.valid_window_end_indices(
         train_frame,
@@ -502,7 +503,13 @@ def _infer_prediction_payload(
         if not manifest.get("data_id") or manifest["data_id"] != prep_manifest["data_id"]:
             raise ValueError("Rolling prediction data_id does not match the preparation manifest")
 
-        saved_predictions = pd.read_pickle(os.path.join(train_output_dir, manifest["predictions"]))
+        prediction_key = "development_predictions" if period == "development" else "predictions"
+        prediction_file = manifest.get(prediction_key)
+        if not prediction_file:
+            raise ValueError(
+                f"Rolling manifest has no {prediction_key!r}; retrain to export it"
+            )
+        saved_predictions = pd.read_pickle(os.path.join(train_output_dir, prediction_file))
         time_column = "open_time_date_utc"
         missing_columns = [column for column in (time_column, *_PREDICTION_COLUMNS) if column not in saved_predictions.columns]
         if missing_columns:
@@ -525,21 +532,38 @@ def _infer_prediction_payload(
 
         time_regions = {name: {} for name in ("train", "valid", "test", "oos")}
         forward_start = pd.to_datetime(manifest["forward_start"], utc=True)
-        for phase, region_name in (("development", "test"), ("forward", "oos")):
-            folds = [fold for fold in manifest["folds"] if fold["phase"] == phase]
-            if not folds:
-                continue
-            start = min(pd.to_datetime(fold["oos_start"], utc=True) for fold in folds)
-            end = max(pd.to_datetime(fold["oos_end"], utc=True) for fold in folds)
-            phase_mask = saved_times < forward_start if phase == "development" else saved_times >= forward_start
-            region_times = saved_times[(saved_times >= start) & (saved_times <= end) & phase_mask]
-            if region_times.empty:
-                continue
-            time_regions[region_name] = {
-                "start": region_times.iloc[0].isoformat(),
-                "end": region_times.iloc[-1].isoformat(),
-                "sample_count": len(region_times),
+        development_folds = [fold for fold in manifest["folds"] if fold["phase"] == "development"]
+        if period == "development":
+            if not development_folds:
+                raise ValueError("Rolling manifest has no development folds")
+            first_fold = development_folds[0]
+            time_regions["train"] = {
+                "start": pd.Timestamp(first_fold["train_start"]).isoformat(),
+                "end": pd.Timestamp(first_fold["oos_start"]).isoformat(),
+                "exclusive_end": True,
             }
+            time_regions["test"] = {
+                "start": pd.Timestamp(first_fold["oos_start"]).isoformat(),
+                "end": max(
+                    pd.Timestamp(fold["oos_end"]) for fold in development_folds
+                ).isoformat(),
+            }
+        else:
+            for phase, region_name in (("development", "test"), ("forward", "oos")):
+                folds = [fold for fold in manifest["folds"] if fold["phase"] == phase]
+                if not folds:
+                    continue
+                start = min(pd.to_datetime(fold["oos_start"], utc=True) for fold in folds)
+                end = max(pd.to_datetime(fold["oos_end"], utc=True) for fold in folds)
+                phase_mask = saved_times < forward_start if phase == "development" else saved_times >= forward_start
+                region_times = saved_times[(saved_times >= start) & (saved_times <= end) & phase_mask]
+                if region_times.empty:
+                    continue
+                time_regions[region_name] = {
+                    "start": region_times.iloc[0].isoformat(),
+                    "end": region_times.iloc[-1].isoformat(),
+                    "sample_count": len(region_times),
+                }
         handler = model_loader.ModelHandler(
             tarin_out_path=os.path.join(train_output_dir, manifest["folds"][0]["model_dir"]),
             device=_resolve_device(data_config.device),
@@ -557,11 +581,9 @@ def _infer_prediction_payload(
         times = pd.to_datetime(predicted_frame[time_column], utc=True)
         maturity = times + pd.to_timedelta((preparation.predict_num + 1) * interval_ms, unit="ms")
         labels = predicted_frame[handler.label_col]
-        eligible = (
-            labels.notna()
-            & labels.ne(common.Signal.INVALID)
-            & ((times >= forward_start) | (maturity <= forward_start))
-        )
+        eligible = labels.notna() & labels.ne(common.Signal.INVALID)
+        if period != "development":
+            eligible = eligible & ((times >= forward_start) | (maturity <= forward_start))
         metric_frame = predicted_frame.loc[eligible]
         fused_rows = metric_frame[[handler.label_col, "pred"]].dropna()
         model_stats = (
@@ -756,6 +778,19 @@ def _load_model_data(
     sub_model_stats = payload["sub_model_stats"]
     stage_model_stats = payload.get("stage_model_stats") or {}
     time_regions = payload["time_regions"]
+    if period == "development" and time_regions.get("test"):
+        # A single-fold run exposes the in-sample span as Train and the
+        # untouched last slice as OOS, so both stages report separately.
+        time_regions = {
+            "train": {
+                "start": time_regions["train"]["start"],
+                "end": time_regions["test"]["start"],
+                "exclusive_end": True,
+            },
+            "valid": {},
+            "test": {},
+            "oos": time_regions["test"],
+        }
     logger.info(
         "Model time regions | train=%s | valid=%s | test=%s | OOS=%s",
         time_regions["train"].get("start"),
@@ -834,6 +869,8 @@ def slice_stage_frame(frame: pd.DataFrame, region: dict) -> pd.DataFrame:
     times = pd.to_datetime(frame["open_time_date_utc"], utc=True)
     start = pd.Timestamp(region["start"])
     end = pd.Timestamp(region["end"])
+    if region.get("exclusive_end"):
+        return frame.loc[(times >= start) & (times < end)].copy()
     return frame.loc[(times >= start) & (times <= end)].copy()
 
 
@@ -2486,6 +2523,7 @@ def _evaluate_stages(
     data_manifest,
     time_regions: dict,
     stage_model_stats: dict,
+    stage_regions: Optional[list[tuple[str, str]]] = None,
 ) -> tuple[dict, dict, dict]:
     """Run one independent backtest per model stage and collect its results.
 
@@ -2496,7 +2534,7 @@ def _evaluate_stages(
     stage_details = {}
     stage_prediction_files = {}
 
-    for stage, region_key in model_loader.ModelHandler.STAGE_REGIONS:
+    for stage, region_key in (stage_regions or model_loader.ModelHandler.STAGE_REGIONS):
         region = time_regions.get(region_key)
         if not region:
             logger.info("Stage %s has no model time region; skipping", stage)
@@ -2614,7 +2652,7 @@ def _evaluate_stages(
 def main(
     logger: logging.Logger,
     config: RunnerConfig,
-    period: str,
+    period: str = "development",
     analysis_mode: str = "none",
     *,
     evaluate_stages: bool = False,
@@ -2699,6 +2737,13 @@ def main(
     stage_results = {}
     stage_details = {}
     stage_prediction_files = {}
+    stage_regions = [("train", "train"), ("oos", "oos")] if period == "development" else None
+    if stage_regions and isinstance(config.data_config, ModelDataConfig):
+        evaluate_stages = True
+        stage_model_stats = {
+            "train": (stage_model_stats or {}).get("train", {}),
+            "oos": (stage_model_stats or {}).get("test", {}),
+        }
     if evaluate_stages and isinstance(config.data_config, ModelDataConfig):
         if not time_regions:
             logger.info("Stage analysis requires model time regions; skipping")
@@ -2716,6 +2761,7 @@ def main(
                 data_manifest=data_manifest,
                 time_regions=time_regions,
                 stage_model_stats=stage_model_stats or {},
+                stage_regions=stage_regions,
             )
             report["stage_results"] = stage_results
             report_details["stage_results"] = stage_details

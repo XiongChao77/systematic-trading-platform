@@ -241,8 +241,8 @@ def simulate_ftmo_challenges(
 
     equity_frame = _daily_equity_frame(report)
     period = str(period).lower()
-    if period not in {"long", "forward", "all"}:
-        raise ValueError("period must be one of: 'long', 'forward', 'all'")
+    if period not in {"development", "long", "forward", "all"}:
+        raise ValueError("period must be one of: 'development', 'long', 'forward', 'all'")
     segments = {}
     split_at = None
 
@@ -255,7 +255,7 @@ def simulate_ftmo_challenges(
             )
         split_at = split_at.tz_convert(None).normalize()
         segments = {
-            "long": equity_frame[equity_frame.index < split_at],
+            "development": equity_frame[equity_frame.index < split_at],
             "forward": equity_frame[equity_frame.index >= split_at],
         }
     else:
@@ -527,7 +527,7 @@ def plot_equity_curves(
     if not results:
         return None
 
-    period_order = ("long", "short", "forward", "all")
+    period_order = ("development", "forward", "all")
 
     def period_reports(result: dict, *, include_forward=include_oos):
         if not isinstance(result, dict):

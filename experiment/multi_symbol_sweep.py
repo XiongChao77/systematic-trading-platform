@@ -10,9 +10,13 @@ Each combo keeps its own prep/train/backtest directories under
 
 Usage:
     python experiment/multi_symbol_sweep.py [--mode expanding|sliding]
-                                            [--period long|oos|forward]
+                                            [--period development|forward|all]
+                                            [--combo doge|all]
                                             [--split-time <iso>]
                                             [--stop-on-error]
+
+Defaults to the DOGE-only combo; pass ``--combo all`` to run every cumulative
+symbol set.
 """
 
 import argparse
@@ -187,7 +191,7 @@ def run_combo(symbols, *, mode: str, period: str, split_time: str, stop_on_error
             backtest_dir,
             file_name="equity_curve.png",
             normalize_equity=False,
-            include_oos=False,
+            include_oos=True,
             logger=logger,
         )
         record["equity_path"] = equity_path
@@ -247,16 +251,19 @@ def write_summary(records: list[dict]) -> tuple[str, str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("expanding", "sliding"), default="expanding")
-    parser.add_argument("--period", default="long")
+    parser.add_argument("--period", default="development")
+    parser.add_argument("--combo", choices=("doge", "all"), default="doge",
+                        help="'doge' runs only the DOGE-only combo; 'all' runs every cumulative set")
     parser.add_argument("--split-time", default=None, help="ISO split time; defaults to DOGE end minus 3 months")
     parser.add_argument("--stop-on-error", action="store_true")
     args = parser.parse_args()
 
     split_time = args.split_time or reference_split_time()
-    print(f"Sweep split_time={split_time} mode={args.mode} period={args.period}")
+    print(f"Sweep split_time={split_time} mode={args.mode} period={args.period} combo={args.combo}")
 
+    selected_combos = COMBOS[:1] if args.combo == "doge" else COMBOS
     records = []
-    for symbols in COMBOS:
+    for symbols in selected_combos:
         started = time.perf_counter()
         record = run_combo(
             symbols,

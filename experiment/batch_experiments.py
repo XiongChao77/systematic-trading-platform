@@ -694,7 +694,7 @@ def _precompute_backtest_predictions(
 ) -> None:
     from trade.runner import backtest_entry
 
-    for period in ("long", "forward"):
+    for period in ("development",):
         data_config = backtest_entry.ModelDataConfig(
             prep_output_dir=prep_output_dir,
             train_output_dir=train_output_dir,
@@ -937,7 +937,7 @@ def _worker_sim(
             period_results = {}
             period_details = {}
             shared_params = None
-            for period in ("long", "forward"):
+            for period in ("development",):
                 period_output = run_period(period)
                 period_report = period_output["report"]
                 period_detail = period_output["report_details"]
@@ -1096,7 +1096,7 @@ def compare_old_new_reports(
     logger.info("\n" + "=" * 40)
     logger.info("📊 Starting Multi-Period Comparison...")
 
-    periods = ["long", "forward"]
+    periods = ["development"]
 
     # --- 1. Define internal loader to avoid redundant I/O ---
     def load_records_by_hash(path: str, is_selected_config: bool = False) -> Dict[str, Dict[str, Any]]:
@@ -1561,7 +1561,7 @@ def main():
                 device="cpu",
                 use_prediction_cache=True,
             )
-            for period in ("long", "forward"):
+            for period in ("development",):
                 backtest_entry.precompute_prediction_cache(
                     logger,
                     data_config,
@@ -1592,12 +1592,9 @@ def main():
                     output = backtest_entry.main(logger, runner_config, period)
                     return output["report"]["results"][period]
 
-                long_result = run_selected_period("long")
-                forward_result = run_selected_period("forward")
-                result[strategy_hash][risk_per_trade_pct]["cagr"]["long"] = long_result["performance"]["cagr"]
-                result[strategy_hash][risk_per_trade_pct]["cagr"]["forward"] = forward_result["performance"]["cagr"]
-                result[strategy_hash][risk_per_trade_pct]["long"] = long_result
-                result[strategy_hash][risk_per_trade_pct]["forward"] = forward_result
+                long_result = run_selected_period("development")
+                result[strategy_hash][risk_per_trade_pct]["cagr"]["development"] = long_result["performance"]["cagr"]
+                result[strategy_hash][risk_per_trade_pct]["development"] = long_result
                 results.append(result)
                 if long_result["performance"]["cagr"] < last_cagr:
                     break

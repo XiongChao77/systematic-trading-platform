@@ -98,7 +98,7 @@ def run_cell(combo_symbols, target, *, period: str, stop_on_error: bool) -> dict
             out_dir,
             file_name="equity_curve.png",
             normalize_equity=False,
-            include_oos=False,
+            include_oos=True,
             logger=logger,
         )
         record["equity_path"] = equity_path

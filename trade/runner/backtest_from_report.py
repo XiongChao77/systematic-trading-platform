@@ -31,7 +31,7 @@ REPORT_PATH = (
     "selected_configs.jsonl"
 )
 REPORT_LINE_INDEX = 0  # Zero-based index of the non-empty JSONL record.
-PERIOD = "long"  # short | forward | long | all
+PERIOD = "development"  # development | forward | all
 
 
 def load_jsonl_record(path: str, record_index: int) -> dict[str, Any]:
@@ -70,10 +70,10 @@ def load_jsonl_record(path: str, record_index: int) -> dict[str, Any]:
 
 def select_period_report(record: dict[str, Any], period: str) -> dict[str, Any]:
     """Materialize one period from a canonical summary report."""
-    if period not in {"short", "forward", "long", "all"}:
+    if period not in {"development", "forward", "all"}:
         raise ValueError(f"Unsupported PERIOD: {period!r}")
 
-    source_period = "long" if period == "all" else period
+    source_period = "development" if period == "all" else period
     params = _required_dict(record, "params")
     results = _required_dict(record, "results")
     period_result = _required_dict(results, source_period)

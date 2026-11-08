@@ -39,7 +39,7 @@ def validate_frontend_report(payload: Any) -> None:
     results = report.get("results")
     if not isinstance(results, Mapping):
         raise ValueError("The report must contain a results object")
-    period_keys = {"long", "forward", "all"}.intersection(results)
+    period_keys = {"development", "long", "forward", "all"}.intersection(results)
     if len(period_keys) != 1:
         raise ValueError(
             "The frontend report must contain exactly one period result"

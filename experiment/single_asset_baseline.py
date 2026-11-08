@@ -135,7 +135,7 @@ def run_solo(symbol: str, *, mode: str, period: str, split_time: str, stop_on_er
             backtest_dir,
             file_name="equity_curve.png",
             normalize_equity=False,
-            include_oos=False,
+            include_oos=True,
             logger=logger,
         )
         record["equity_path"] = equity_path

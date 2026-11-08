@@ -41,7 +41,6 @@ try:
     result = main(
         logger,
         config,
-        period="long",
         evaluate_stages=False,
     )
     equity_path = plot_equity_curves(

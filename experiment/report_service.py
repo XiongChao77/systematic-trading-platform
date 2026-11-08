@@ -16,7 +16,7 @@ from statistics import mean, median, pstdev
 from typing import Any, Iterable, Mapping, Sequence
 
 
-PERIODS = ("long", "forward")
+PERIODS = ("development", "forward")
 DEFAULT_COLUMNS = (
     "params.hash",
     "params.train.model_cfg.model_type",

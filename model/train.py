@@ -424,6 +424,7 @@ def _train_rolling_multiasset(
         raise ValueError("Insufficient history for development OOS evaluation")
 
     predictions = []
+    development_predictions = []
     for fold in folds:
         logger.info("Rolling fold %s | %s | OOS %s -> %s", fold["fold_id"],
                     fold["phase"], fold["oos_start"], fold["oos_end"])
@@ -535,6 +536,10 @@ def _train_rolling_multiasset(
             model_dir = os.path.join(fold_dir, "fusion")
             save_fusion_run(task_type=combo, role_directories=role_dirs, fusion_dir=model_dir)
         handler = ModelHandler(model_dir, device)
+        # The first fold also predicts its own train/validation span so the
+        # development backtest can compare in-sample against OOS behaviour.
+        first_fold = fold["fold_id"] == folds[0]["fold_id"]
+        window_start = train_start if first_fold else oos_start
         segment_parts = []
         columns = ["open_time_date_utc", "pred", "direction_pred", "pred_prob",
                    "prob_short", "prob_neutral", "prob_long", "net_score"]
@@ -542,7 +547,7 @@ def _train_rolling_multiasset(
             sub = symbol_frames[symbol]
             times = symbol_times[symbol]
             inference_mask = (
-                (times >= oos_start - interval * (handler.seq_len + 1))
+                (times >= window_start - interval * (handler.seq_len + 1))
                 & (times < oos_end)
             )
             inference_frame = sub.loc[inference_mask].copy()
@@ -555,7 +560,7 @@ def _train_rolling_multiasset(
                 dataset, features_only, is_live=False, batch_size=configs[0].batch_size,
                 evaluate_sub_models=False, collect_sub_predictions=True,
             )
-            segment = predicted.loc[(times.loc[predicted.index] >= oos_start), columns].copy()
+            segment = predicted.loc[(times.loc[predicted.index] >= window_start), columns].copy()
             if segment.empty or not segment["pred"].notna().any():
                 continue
             if len(sub_predictions.columns):
@@ -563,8 +568,17 @@ def _train_rolling_multiasset(
             segment["symbol"] = symbol
             segment_parts.append(segment)
         if not segment_parts:
+            raise RuntimeError("Rolling window has no valid predictions")
+        window = pd.concat(segment_parts, ignore_index=True)
+        window_path = os.path.join(fold_dir, "window_predictions.pkl")
+        window.to_pickle(window_path)
+        fold["window_predictions"] = os.path.relpath(window_path, save_dir)
+        if fold["phase"] == "development":
+            development_predictions.append(window)
+        segment_times = pd.to_datetime(window["open_time_date_utc"], utc=True)
+        segment = window.loc[segment_times >= oos_start]
+        if segment.empty:
             raise RuntimeError("Rolling OOS has no valid predictions")
-        segment = pd.concat(segment_parts, ignore_index=True)
         fold_prediction_path = os.path.join(fold_dir, "oos_predictions.pkl")
         segment.to_pickle(fold_prediction_path)
         fold["predictions"] = os.path.relpath(fold_prediction_path, save_dir)
@@ -578,6 +592,11 @@ def _train_rolling_multiasset(
     if stitched.duplicated(subset=["symbol", "open_time_date_utc"]).any():
         raise RuntimeError("Rolling OOS predictions overlap")
     stitched.to_pickle(os.path.join(save_dir, manifest["predictions"]))
+    development = pd.concat(development_predictions, ignore_index=True)
+    if development.duplicated(subset=["symbol", "open_time_date_utc"]).any():
+        raise RuntimeError("Rolling development predictions overlap")
+    development.to_pickle(os.path.join(save_dir, "development_predictions.pkl"))
+    manifest["development_predictions"] = "development_predictions.pkl"
     manifest["prediction_columns"] = list(stitched.columns)
     manifest["status"] = "complete"
     write_manifest()
@@ -664,6 +683,7 @@ def train_rolling(
             device=device, logger=logger,
         )
     predictions = []
+    development_predictions = []
     for fold in folds:
         logger.info("Rolling fold %s | %s | OOS %s -> %s", fold["fold_id"],
                     fold["phase"], fold["oos_start"], fold["oos_end"])
@@ -724,7 +744,13 @@ def train_rolling(
             model_dir = os.path.join(fold_dir, "fusion")
             save_fusion_run(task_type=combo, role_directories=role_dirs, fusion_dir=model_dir)
         handler = ModelHandler(model_dir, device)
-        inference_mask = (times >= oos_start - interval * (handler.seq_len + 1)) & (times < oos_end)
+        # The first fold also predicts its own train/validation span so the
+        # development backtest can compare in-sample against OOS behaviour.
+        first_fold = fold["fold_id"] == folds[0]["fold_id"]
+        window_start = train_start if first_fold else oos_start
+        inference_mask = (
+            (times >= window_start - interval * (handler.seq_len + 1)) & (times < oos_end)
+        )
         inference_frame = frame.loc[inference_mask].copy()
         # Labels and forward-derived returns cannot affect inference eligibility.
         features_only = inference_frame.drop(columns=[handler.label_col, "trend_strength"], errors="ignore")
@@ -738,11 +764,19 @@ def train_rolling(
         )
         columns = ["open_time_date_utc", "pred", "direction_pred", "pred_prob",
                    "prob_short", "prob_neutral", "prob_long", "net_score"]
-        segment = predicted.loc[(times.loc[predicted.index] >= oos_start), columns].copy()
-        if segment.empty or not segment["pred"].notna().any():
-            raise RuntimeError("Rolling OOS has no valid predictions")
+        window = predicted.loc[(times.loc[predicted.index] >= window_start), columns].copy()
+        if window.empty or not window["pred"].notna().any():
+            raise RuntimeError("Rolling window has no valid predictions")
         if len(sub_predictions.columns):
-            segment = segment.join(sub_predictions)
+            window = window.join(sub_predictions)
+        window_path = os.path.join(fold_dir, "window_predictions.pkl")
+        window.to_pickle(window_path)
+        fold["window_predictions"] = os.path.relpath(window_path, save_dir)
+        if fold["phase"] == "development":
+            development_predictions.append(window)
+        segment = window.loc[times.loc[window.index] >= oos_start]
+        if segment.empty:
+            raise RuntimeError("Rolling OOS has no valid predictions")
         fold_prediction_path = os.path.join(fold_dir, "oos_predictions.pkl")
         segment.to_pickle(fold_prediction_path)
         fold["predictions"] = os.path.relpath(fold_prediction_path, save_dir)
@@ -756,6 +790,11 @@ def train_rolling(
     if not stitched["open_time_date_utc"].is_unique:
         raise RuntimeError("Rolling OOS predictions overlap")
     stitched.to_pickle(os.path.join(save_dir, manifest["predictions"]))
+    development = pd.concat(development_predictions, ignore_index=True)
+    if not development["open_time_date_utc"].is_unique:
+        raise RuntimeError("Rolling development predictions overlap")
+    development.to_pickle(os.path.join(save_dir, "development_predictions.pkl"))
+    manifest["development_predictions"] = "development_predictions.pkl"
     manifest["prediction_columns"] = list(stitched.columns)
     manifest["status"] = "complete"
     write_manifest()
