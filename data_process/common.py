@@ -85,6 +85,8 @@ class BaseDefine(MarketDataSourceConfig):
     label_type: str = "FTHL"  # FTHL / TBM / TBM_TREND / BBM
     # model / data
     vol_ewma_span: int = 20
+    vol_method: Literal["ewma", "hybrid"] = "ewma"
+    vol_sma_window: int = 2688
     predict_num: int = 32
     # risk / vol
     vol_multiplier_long: float = 1.7
@@ -98,6 +100,12 @@ class BaseDefine(MarketDataSourceConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.vol_method not in ("ewma", "hybrid"):
+            raise ValueError("vol_method must be 'ewma' or 'hybrid'")
+        if not isinstance(self.vol_ewma_span, int) or self.vol_ewma_span <= 0:
+            raise ValueError("vol_ewma_span must be a positive integer")
+        if not isinstance(self.vol_sma_window, int) or self.vol_sma_window <= 0:
+            raise ValueError("vol_sma_window must be a positive integer")
         if self.label_type == "PURE_BINARY":
             raise ValueError("PURE_BINARY requires PureBinaryDefine")
         if self.tbm_intrabar_interval is not None and self.label_type != "TBM":
@@ -126,12 +134,384 @@ class PureBinaryDefine(MarketDataSourceConfig):
             raise ValueError("PureBinaryDefine only supports PURE_BINARY")
 
 
-PreparationConfig = Union[BaseDefine, PureBinaryDefine]
+@dataclass(frozen=True)
+class MartingaleLabelParams:
+    side: int = 1
+    step_pct: float = 0.01
+    initial_take_profit_pct: float = 0.01
+
+    def __post_init__(self):
+        if self.side not in (1, -1):
+            raise ValueError("side must be 1 or -1")
+        if not np.isfinite(self.step_pct) or not 0 < self.step_pct < 1:
+            raise ValueError("step_pct must be in (0, 1)")
+        if not np.isfinite(self.initial_take_profit_pct) or self.initial_take_profit_pct <= 0:
+            raise ValueError("initial_take_profit_pct must be positive")
+        if min(self.layer_price(1., 9), self.target_price(1., 0)) <= 0:
+            raise ValueError("All grid and target prices must be positive")
+
+    def layer_price(self, entry, addition):
+        if not 0 <= addition <= 9:
+            raise ValueError("addition must be between 0 and 9")
+        if addition == 0:
+            return entry
+        a, b = 1, 2
+        for _ in range(1, addition):
+            a, b = b, a + b
+        return entry * (1 - self.side * self.step_pct * a)
+
+    def target_price(self, entry, additions):
+        return (entry * (1 + self.side * self.initial_take_profit_pct)
+                if additions == 0 else self.layer_price(entry, additions - 1))
+
+
+@dataclass
+class MartingaleDefine(MarketDataSourceConfig):
+    label_type: Literal["MARTINGALE"] = "MARTINGALE"
+    side: int = 1
+    step_pct: float = 0.01
+    initial_take_profit_pct: float = 0.01
+    intrabar_interval: Optional[str] = None
+    version: float = 1.0
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.label_type != "MARTINGALE":
+            raise ValueError("MartingaleDefine only supports MARTINGALE")
+        self.price_params()
+
+    def price_params(self):
+        return MartingaleLabelParams(self.side, self.step_pct, self.initial_take_profit_pct)
+
+    def resolve_tbm_intrabar_interval(self):
+        return self.intrabar_interval or ("1m" if get_interval_ms(self.interval) > 60000 else None)
+
+
+@dataclass(frozen=True)
+class MartingaleHit:
+    addition: int
+    index: int
+    time: object
+    price: float
+
+
+@dataclass(frozen=True)
+class MartingaleLabel:
+    start_index: int
+    start_time: object
+    entry_price: float
+    label: Optional[int]
+    status: str
+    max_additions: int
+    exit_index: int
+    exit_time: object
+    exit_price: float
+    hits: tuple
+    path_source: str
+
+
+def _martingale_valid_row(row):
+    o, h, l, c = row[:4]
+    return (all(np.isfinite(x) and x > 0 for x in (o, h, l, c))
+            and h >= max(o, l, c) and l <= min(o, h, c))
+
+
+class AggTradeResolver:
+    """Read only Parquet row groups overlapping an ambiguous candle."""
+
+    def __init__(self, main_interval_ms: int, fine_interval_ms: int, source=None):
+        from collections import OrderedDict
+        from pathlib import Path
+
+        source = source or MarketDataSourceConfig()
+        self.symbol = source.symbol
+        self.directory = Path(market_data_path(source)).parent
+        self.main_interval_ms = main_interval_ms
+        self.fine_interval_ms = fine_interval_ms
+        self.files = {}
+        self.groups = OrderedDict()
+        self.windows = OrderedDict()
+        self.last_error = None
+
+    def __call__(self, time_value, ohlc, is_fine: bool):
+        import pyarrow.parquet as pq
+
+        self.last_error = None
+        moment = pd.Timestamp(time_value, unit="ms", tz="UTC") if isinstance(time_value, (int, np.integer)) else pd.Timestamp(time_value)
+        start = moment.value // 1_000_000
+        duration = self.fine_interval_ms if is_fine else self.main_interval_ms
+        end = start + duration
+        key = (start, end)
+        if key in self.windows:
+            self.windows.move_to_end(key)
+            return self.windows[key]
+        year = moment.year
+        if year not in self.files:
+            path = self.directory / f"{self.symbol}_aggTrades_{year}.parquet"
+            if not path.is_file():
+                self.files[year] = None
+            else:
+                parquet = pq.ParquetFile(path)
+                column = parquet.schema_arrow.get_field_index("transact_time_ms_utc")
+                ranges = []
+                for index in range(parquet.num_row_groups):
+                    stats = parquet.metadata.row_group(index).column(column).statistics
+                    if stats is None or not stats.has_min_max:
+                        raise ValueError(f"Missing timestamp statistics in {path}")
+                    ranges.append((stats.min, stats.max))
+                self.files[year] = (parquet, ranges)
+        source = self.files[year]
+        if source is None:
+            self.last_error = "no_file"
+            return None
+        parquet, ranges = source
+        parts = []
+        for index, (minimum, maximum) in enumerate(ranges):
+            if maximum < start or minimum >= end:
+                continue
+            group_key = (year, index)
+            if group_key not in self.groups:
+                table = parquet.read_row_group(index, columns=["transact_time_ms_utc", "price"])
+                timestamps = table.column(0).to_numpy()
+                prices = table.column(1).to_numpy().astype(np.float64)
+                self.groups[group_key] = (timestamps, prices)
+                if len(self.groups) > 2:
+                    self.groups.popitem(last=False)
+            self.groups.move_to_end(group_key)
+            timestamps, prices = self.groups[group_key]
+            left = np.searchsorted(timestamps, start, side="left")
+            right = np.searchsorted(timestamps, end, side="left")
+            if right > left:
+                parts.append(prices[left:right])
+        if not parts:
+            self.last_error = "no_rows"
+            return None
+        prices = np.concatenate(parts)
+        o, h, l, c = ohlc
+        matched = np.allclose(
+            (prices.max(), prices.min(), prices[-1]), (h, l, c), rtol=2e-4, atol=1e-12
+        ) and l <= o <= h
+        if not matched:
+            self.last_error = "ohlc_mismatch"
+            return None
+        self.windows[key] = prices
+        if len(self.windows) > 256:
+            self.windows.popitem(last=False)
+        return prices
+
+
+def martingale_label(bars, start_index, params=MartingaleLabelParams(), path_policy="fixed"):
+    """Pure close-entry price replay; addition nine terminates immediately.
+
+    ``path_policy`` decides how a bar whose two orderings disagree is resolved:
+    ``fixed`` keeps the historical single ordering, ``pessimistic`` replays both
+    orderings at the finest available granularity and keeps the worse outcome,
+    and ``strict`` returns an ``ambiguous`` status instead of labelling it.
+    """
+    entry = float(bars.close[start_index])
+    exit_index = start_index
+    source = set()
+
+    def new_state():
+        return {"additions": 0, "hits": [], "exit_price": entry}
+
+    state = new_state()
+
+    def result(status, current, label=None):
+        return MartingaleLabel(start_index, bars.time[start_index], entry, label, status,
+                               current["additions"], exit_index, bars.time[exit_index],
+                               current["exit_price"], tuple(current["hits"]),
+                               "+".join(sorted(source)) or "none")
+
+    if not np.isfinite(entry) or entry <= 0:
+        return result("invalid", state)
+
+    def advance(current, price, index, time):
+        target = params.target_price(entry, current["additions"])
+        if params.side * (price - target) >= 0:
+            current["exit_price"] = target
+            return "take_profit"
+        while current["additions"] < 9 and params.side * (
+            price - params.layer_price(entry, current["additions"] + 1)
+        ) <= 0:
+            current["additions"] += 1
+            current["hits"].append(MartingaleHit(current["additions"], index, time, price))
+            if current["additions"] == 9:
+                current["exit_price"] = price
+                return "capped"
+        return None
+
+    def walk(current, row_values, index, time, alternate):
+        o, h, l, c = row_values
+        if params.side == 1:
+            path = (o, h, l, c) if alternate else (o, l, h, c)
+        else:
+            path = (o, l, h, c) if alternate else (o, h, l, c)
+        status = advance(current, o, index, time)
+        if status:
+            return status
+        previous = o
+        for endpoint in path[1:]:
+            while previous != endpoint:
+                target = params.target_price(entry, current["additions"])
+                level = params.layer_price(entry, current["additions"] + 1)
+                crossed = [x for x in (target, level)
+                           if previous < x <= endpoint or endpoint <= x < previous]
+                if not crossed:
+                    break
+                point = min(crossed, key=lambda x: abs(x - previous))
+                status = advance(current, point, index, time)
+                if status:
+                    return status
+                previous = point
+            previous = endpoint
+        current["exit_price"] = c
+        return None
+
+    def severity(status):
+        return 3 if status == "capped" else 2 if status is None else 1
+
+    def pick_worse(first, first_status, second, second_status):
+        first_rank, second_rank = severity(first_status), severity(second_status)
+        if first_rank != second_rank:
+            return (first, first_status) if first_rank > second_rank else (second, second_status)
+        if first["additions"] != second["additions"]:
+            return (first, first_status) if first["additions"] > second["additions"] else (second, second_status)
+        return (first, first_status)
+
+    def branch(current):
+        return {"additions": current["additions"], "hits": list(current["hits"]),
+                "exit_price": current["exit_price"]}
+
+    for index in range(start_index + 1, len(bars.close)):
+        exit_index = index
+        row = tuple(float(column[index]) for column in (bars.open, bars.high, bars.low, bars.close))
+        if not _martingale_valid_row(row):
+            return result("invalid", state)
+        _, high, low, close = row
+        target = params.target_price(entry, state["additions"])
+        next_layer = params.layer_price(entry, state["additions"] + 1)
+        favorable = high if params.side == 1 else low
+        adverse = low if params.side == 1 else high
+        # A matched intrabar OHLC may differ from the main bar within allclose tolerance.
+        tolerance = 1e-12 + 1e-9 * max(abs(high), abs(low), abs(target), abs(next_layer))
+        if (params.side * (favorable - target) < -tolerance
+                and params.side * (adverse - next_layer) > tolerance):
+            source.add("fixed_ohlc")
+            state["exit_price"] = close
+            continue
+        finer = None if getattr(bars, "intrabar", None) is None else bars.intrabar[index]
+        valid_finer = False
+        if finer is not None and len(finer):
+            finer = np.asarray(finer)
+            valid_finer = (all(_martingale_valid_row(r) for r in finer)
+                           and np.allclose([finer[0, 0], finer[:, 1].max(), finer[:, 2].min(), finer[-1, 3]], row,
+                                           rtol=1e-9, atol=1e-12))
+        rows = finer if valid_finer else (row,)
+        source.add("intrabar" if valid_finer else "fixed_ohlc")
+        for fine_offset, fine_row in enumerate(rows):
+            o, h, l, c = map(float, fine_row[:4])
+            time = fine_row[4] if len(fine_row) > 4 else bars.time[index]
+            if valid_finer and len(fine_row) <= 4 and hasattr(bars, "intrabar_step_ms"):
+                time = bars.time[index] + np.timedelta64(
+                    fine_offset * bars.intrabar_step_ms, "ms"
+                )
+            if path_policy == "fixed" and getattr(bars, "agg_trade_prices", None) is None:
+                status = walk(state, (o, h, l, c), index, time, False)
+                if status:
+                    return result(status, state, state["additions"])
+                continue
+            primary = branch(state)
+            alternate = branch(state)
+            primary_status = walk(primary, (o, h, l, c), index, time, False)
+            alternate_status = walk(alternate, (o, h, l, c), index, time, True)
+            if (primary_status, primary["additions"]) != (alternate_status, alternate["additions"]):
+                resolver = getattr(bars, "agg_trade_prices", None)
+                prices = None if resolver is None else resolver(time, (o, h, l, c), valid_finer)
+                if prices is not None:
+                    source.add("agg_trades")
+                    status = None
+                    for price in prices:
+                        status = advance(state, float(price), index, time)
+                        if status:
+                            return result(status, state, state["additions"])
+                    state["exit_price"] = c
+                    continue
+                if getattr(bars, "require_resolved_path", False):
+                    raise ValueError(
+                        f"Unresolved candle path at {time}: aggTrades data is missing "
+                        "or does not match the candle OHLC"
+                    )
+                if path_policy == "strict":
+                    return result("ambiguous", state)
+            if path_policy == "fixed":
+                state, status = primary, primary_status
+            else:
+                state, status = pick_worse(primary, primary_status, alternate, alternate_status)
+            if status:
+                return result(status, state, state["additions"])
+    return result("unresolved", state)
+
+
+def martingale_labels(bars, params=MartingaleLabelParams(), limit=None):
+    total = len(bars.close) if limit is None else min(limit, len(bars.close))
+    return [martingale_label(bars, i, params) for i in range(total)]
+
+
+def martingale_metadata(bars, params):
+    def descriptor(columns):
+        digest = hashlib.sha256()
+        for column in columns:
+            values = np.asarray(column).astype(str)
+            digest.update(str(values.shape).encode())
+            digest.update(values.tobytes())
+        return digest.hexdigest()
+    fine = getattr(bars, "intrabar", None)
+    return {"schema": "martingale_close_cap9_v1", "price_parameters": asdict(params),
+            "entry": "close", "replay_start": "next_bar", "cap": 9,
+            "path": "long_OLHC_short_OHLC", "intrabar": "validated_on_price_event_after_5m_gate",
+            "start": str(bars.time[0]), "end": str(bars.time[-1]), "rows": len(bars.close),
+            "main_sha256": descriptor((bars.time, bars.open, bars.high, bars.low, bars.close)),
+            "intrabar_sha256": None if fine is None else descriptor(
+                (np.asarray([]) if row is None else row for row in fine))}
+
+
+def attach_martingale_label(df, para, label_col="label", intrabar_df=None):
+    from types import SimpleNamespace
+    times = df["open_time_ms_utc"].to_numpy()
+    intrabar = None
+    if intrabar_df is not None:
+        interval = get_interval_ms(para.interval)
+        fine_interval = get_interval_ms(para.resolve_tbm_intrabar_interval())
+        fine_times = intrabar_df["open_time_ms_utc"].to_numpy()
+        intrabar = []
+        for time in times:
+            left, right = np.searchsorted(fine_times, (time, time + interval))
+            part = intrabar_df.iloc[left:right]
+            complete = np.array_equal(fine_times[left:right], np.arange(time, time + interval, fine_interval))
+            intrabar.append(part[["open", "high", "low", "close", "open_time_ms_utc"]].to_numpy()
+                            if complete else None)
+    bars = SimpleNamespace(time=times, intrabar=intrabar,
+                           **{name: df[name].to_numpy() for name in ("open", "high", "low", "close")})
+    bars.intrabar_step_ms = get_interval_ms(para.resolve_tbm_intrabar_interval() or "1m")
+    bars.agg_trade_prices = AggTradeResolver(
+        get_interval_ms(para.interval), bars.intrabar_step_ms
+    )
+    bars.require_resolved_path = True
+    labels = martingale_labels(bars, para.price_params())
+    df[label_col] = pd.array([item.label for item in labels], dtype="Int64")
+    for name in ("status", "max_additions", "entry_price", "exit_index", "exit_time", "exit_price", "path_source"):
+        df["martingale_" + name] = [getattr(item, name) for item in labels]
+    df.attrs["martingale_metadata"] = martingale_metadata(bars, para.price_params())
+    return df
+
+
+PreparationConfig = Union[BaseDefine, PureBinaryDefine, MartingaleDefine]
 
 
 def preparation_config_from_dict(parameters: dict) -> PreparationConfig:
     """Restore the preparation type identified by its serialized label type."""
-    config_type = PureBinaryDefine if parameters.get("label_type") == "PURE_BINARY" else BaseDefine
+    config_type = {"PURE_BINARY": PureBinaryDefine, "MARTINGALE": MartingaleDefine}.get(parameters.get("label_type"), BaseDefine)
     return config_type(**parameters)
 
 
@@ -409,8 +789,10 @@ def attch_open_time_sn(para: MarketDataSourceConfig, df):
 
 def attach_label(df, para=BaseDefine, label_col="label", intrabar_df=None):
     df = attch_open_time_sn(para, df)
+    if isinstance(para, MartingaleDefine):
+        return attach_martingale_label(df, para, label_col, intrabar_df)
     if isinstance(para, PureBinaryDefine):
-        return attach_pure_binary_label(df, para=para, label_col=label_col)
+        return attach_pure_binary_label(df, para=para, label_col=label_col, intrabar_df=intrabar_df)
     if para.label_type == "FTHL":
         df = attach_fthl_label(df, para=para, label_col=label_col)
     elif para.label_type == "TBM":
@@ -418,8 +800,215 @@ def attach_label(df, para=BaseDefine, label_col="label", intrabar_df=None):
     elif para.label_type == "TBM_TREND":
         df = attach_triple_barrier_trend_label(df, para=para, label_col=label_col)
     elif para.label_type == "BBM":
-        df = attach_binary_barrier_label(df, para=para, label_col=label_col, verbose=True)
+        df = attach_binary_barrier_label(df, para=para, label_col=label_col, verbose=True, intrabar_df=intrabar_df)
     return df
+
+
+class BarrierPathResolver:
+    """Resolve competing price barriers using validated 1m candles, then trades."""
+
+    def __init__(self, df, para, intrabar_df=None):
+        self.df = df
+        self.interval = get_interval_ms(para.interval)
+        self.times = df["open_time_ms_utc"].to_numpy(dtype=np.int64)
+        self.ohlc = df[["open", "high", "low", "close"]].to_numpy(dtype=float)
+        if intrabar_df is None and self.interval > 60_000:
+            from pathlib import Path
+            path = Path(market_data_path(replace(para, interval="1m")))
+            if path.is_file():
+                intrabar_df = pd.read_csv(path, usecols=[
+                    "open_time_ms_utc", "open", "high", "low", "close",
+                ])
+        self.fine_times = None
+        if intrabar_df is not None:
+            self.fine_times = intrabar_df["open_time_ms_utc"].to_numpy(dtype=np.int64)
+            if np.any(np.diff(self.fine_times) <= 0):
+                raise ValueError("Barrier resolution requires strictly increasing 1m timestamps")
+            self.fine_ohlc = intrabar_df[["open", "high", "low", "close"]].to_numpy(dtype=float)
+        self.trades = AggTradeResolver(self.interval, 60_000, source=para)
+        self.cache = {}
+
+    def rows(self, index):
+        if index not in self.cache:
+            moment, row = int(self.times[index]), self.ohlc[index]
+            rows = [(moment, row, False)]
+            if self.interval > 60_000 and self.interval % 60_000 == 0 and self.fine_times is not None:
+                left, right = np.searchsorted(self.fine_times, [moment, moment + self.interval])
+                fine = self.fine_ohlc[left:right]
+                expected = np.arange(moment, moment + self.interval, 60_000)
+                if (
+                    np.array_equal(self.fine_times[left:right], expected)
+                    and all(_martingale_valid_row(item) for item in fine)
+                    and np.allclose(
+                        [fine[0, 0], fine[:, 1].max(), fine[:, 2].min(), fine[-1, 3]],
+                        row, rtol=1e-9, atol=1e-12,
+                    )
+                ):
+                    rows = [(int(time), item, True) for time, item in zip(expected, fine)]
+            self.cache[index] = rows
+            if len(self.cache) > 4096:
+                del self.cache[next(iter(self.cache))]
+        return self.cache[index]
+
+    def events(self, moment, row, is_fine, barriers):
+        """Return ordered simultaneous-event groups, or None for unresolved order."""
+        if not _martingale_valid_row(row):
+            return None
+        def touched(price, barrier):
+            _, level, upward = barrier
+            return price >= level if upward else price <= level
+        remaining = list(barriers)
+        events = []
+        opening = [item for item in remaining if touched(row[0], item)]
+        if opening:
+            events.append([item[0] for item in opening])
+            remaining = [item for item in remaining if item not in opening]
+        hits = [item for item in remaining if touched(row[1] if item[2] else row[2], item)]
+        if len(hits) <= 1:
+            return events + [[item[0]] for item in hits]
+        if all(isinstance(item[0], str) and item[0].endswith("sl") for item in hits):
+            return events + [[item[0] for item in hits]]
+        if len({item[2] for item in hits}) == 1:
+            hits.sort(key=lambda item: item[1], reverse=not hits[0][2])
+            previous_level = None
+            for item in hits:
+                if item[1] == previous_level:
+                    events[-1].append(item[0])
+                else:
+                    events.append([item[0]])
+                previous_level = item[1]
+            return events
+        try:
+            prices = self.trades(moment, row, is_fine)
+        except (OSError, ValueError, KeyError) as exc:
+            logging.getLogger(__name__).warning(
+                "Cannot resolve barrier order at %s UTC: %s",
+                pd.Timestamp(moment, unit="ms", tz="UTC"), exc,
+            )
+            return None
+        if prices is None:
+            return None
+        remaining = hits
+        previous = row[0]
+        for price in prices:
+            hits = [item for item in remaining if touched(price, item)]
+            hits.sort(key=lambda item: abs(item[1] - previous))
+            for item in hits:
+                if events and item[1] == previous:
+                    events[-1].append(item[0])
+                else:
+                    events.append([item[0]])
+                previous = item[1]
+            remaining = [item for item in remaining if item not in hits]
+            previous = price
+        return events
+
+
+def resolve_binary_conflicts(df, para, labels, reach_times, scan_lens, invalid_reasons,
+                             upper, lower, intrabar_df=None):
+    """Revisit only same-bar dual hits; retain fast kernel results elsewhere."""
+    if not np.any(invalid_reasons == 1):
+        return
+    resolver = BarrierPathResolver(df, para, intrabar_df)
+    for anchor in np.flatnonzero(invalid_reasons == 1):
+        index = anchor + int(scan_lens[anchor])
+        barriers = [(1, upper[anchor], True), (-1, lower[anchor], False)]
+        for moment, row, is_fine in resolver.rows(index):
+            events = resolver.events(moment, row, is_fine, barriers)
+            if events is None:
+                break
+            if not events:
+                continue
+            if len(events[0]) == 1:
+                labels[anchor] = events[0][0]
+                reach_times[anchor] = scan_lens[anchor]
+                invalid_reasons[anchor] = 0
+            break
+
+
+def resolve_tbm_conflicts(df, para, thresholds, labels, reach_times, side_times, intrabar_df):
+    """Replay ambiguous TBM anchors while preserving main-close take-profit rules."""
+    if not np.any(labels == _SIGNAL_INVALID):
+        return
+    resolver = BarrierPathResolver(df, para, intrabar_df)
+    window = int(para.predict_num)
+    high_low = _tbm_take_profit_uses_high_low(para)
+    close = df["close"].to_numpy(dtype=float)
+    for anchor in np.flatnonzero(labels == _SIGNAL_INVALID):
+        if anchor + window >= len(df):
+            continue
+        future_times = resolver.times[anchor + 1:anchor + window + 1]
+        if not np.array_equal(
+            future_times, resolver.times[anchor] + np.arange(1, window + 1) * resolver.interval,
+        ):
+            continue
+        ltp, lsl, stp, ssl = thresholds[anchor]
+        barriers = {
+            "ltp": ("ltp", close[anchor] * (1 + ltp), True),
+            "lsl": ("lsl", close[anchor] * (1 - lsl), False),
+            "stp": ("stp", close[anchor] * (1 - stp), False),
+            "ssl": ("ssl", close[anchor] * (1 + ssl), True),
+        }
+        active = {"l": True, "s": True}
+        outcomes = {}
+        unresolved = False
+        for index in range(anchor + 1, anchor + window + 1):
+            rows = resolver.rows(index)
+            for offset, (moment, row, fine) in enumerate(rows):
+                current = [barrier for name, barrier in barriers.items()
+                           if active[name[0]] and (high_low or name.endswith("sl"))]
+                events = resolver.events(moment, row, fine, current)
+                if events is None:
+                    unresolved = True
+                    break
+                if not high_low and offset == len(rows) - 1:
+                    closing = [name for name in ("ltp", "stp") if active[name[0]] and (
+                        row[3] >= barriers[name][1] if barriers[name][2] else row[3] <= barriers[name][1]
+                    )]
+                    if closing:
+                        events.append(closing)
+                distance = index - anchor + (offset + 1) / len(rows) - 1
+                for group in events:
+                    if all(name in group and active[name[0]] for name in ("ltp", "stp")):
+                        unresolved = True
+                        break
+                    for side in ("l", "s"):
+                        hits = [name for name in group if name[0] == side and active[side]]
+                        if len(hits) > 1:
+                            unresolved = True
+                            break
+                        if hits:
+                            active[side] = False
+                            outcomes[hits[0]] = distance
+                    if unresolved:
+                        break
+                    if any(name.endswith("tp") for name in outcomes):
+                        break
+                if unresolved or not any(active.values()) or any(name.endswith("tp") for name in outcomes):
+                    break
+            if unresolved or not any(active.values()) or any(name.endswith("tp") for name in outcomes):
+                break
+        if unresolved:
+            continue
+        first_long = outcomes.get("ltp", float("inf"))
+        first_short = outcomes.get("stp", float("inf"))
+        # Equal minute distances can still have ordered trade events. The
+        # insertion order records their sequence within that minute.
+        winners = [name for name in outcomes if name.endswith("tp")]
+        if first_long == first_short and first_long != float("inf"):
+            winner = winners[0]
+        elif first_long < first_short:
+            winner = "ltp"
+        elif first_short < first_long:
+            winner = "stp"
+        else:
+            winner = None
+        labels[anchor] = (
+            _SIGNAL_POSITIVE if winner == "ltp" else _SIGNAL_NEGATIVE if winner == "stp" else _SIGNAL_NEUTRAL
+        )
+        reach_times[anchor] = outcomes[winner] if winner else window
+        for name, values in zip(("ltp", "lsl", "stp", "ssl"), side_times):
+            values[anchor] = outcomes.get(name, -1.0)
 
 
 def attach_fthl_label(df, para=BaseDefine, label_col="label"):
@@ -477,7 +1066,10 @@ def attach_fthl_label(df, para=BaseDefine, label_col="label"):
 
 def calculate_thresholds(df, para=BaseDefine, **kwargs):
     """
-    Compute dynamic volatility thresholds using Rogers–Satchell + EWMA.
+    Compute thresholds from RS variance using EWMA or an equal-weight hybrid.
+
+    Hybrid averages EWMA and SMA variances before taking the square root.
+    A complete SMA window is required; unavailable history is never filled.
     """
 
     required_cols = ["open", "high", "low", "close"]
@@ -495,11 +1087,20 @@ def calculate_thresholds(df, para=BaseDefine, **kwargs):
     # Guard against tiny negatives due to numeric errors (variance should be non-negative)
     rs_var = rs_var.clip(lower=0)
 
-    # ===== 2️⃣ EWMA-smoothed variance =====
+    # Smooth variance using only observations through the current candle.
     span = para.vol_ewma_span
-    ewma_var = rs_var.ewm(span=span, adjust=False).mean()
+    if para.vol_method == "hybrid":
+        ewma_var = rs_var.ewm(span=span, adjust=False, min_periods=span).mean()
+        sma_var = rs_var.rolling(
+            para.vol_sma_window, min_periods=para.vol_sma_window,
+        ).mean()
+        expected_var = 0.5 * ewma_var + 0.5 * sma_var
+    elif para.vol_method == "ewma":
+        expected_var = rs_var.ewm(span=span, adjust=False).mean()
+    else:
+        raise ValueError(f"Unsupported volatility method: {para.vol_method!r}")
     # Sqrt -> volatility
-    expected_vol = np.sqrt(ewma_var)
+    expected_vol = np.sqrt(expected_var)
     # ===== 3️⃣ Save the current one-bar expected volatility =====
     df["expected_vol"] = expected_vol
 
@@ -811,51 +1412,6 @@ def attach_triple_barrier_label(df, para=BaseDefine, label_col="label", intrabar
         raise ValueError("predict_num must be positive for TBM labels")
     use_high_low = _tbm_take_profit_uses_high_low(para)
     interval_ms = get_interval_ms(para.interval)
-    intrabar_args = {}
-    scan_window = window
-    ratio = 1
-    intrabar_interval = para.resolve_tbm_intrabar_interval()
-    if intrabar_interval is not None:
-        if intrabar_df is None:
-            raise ValueError("TBM intrabar labeling requires the configured lower-interval data")
-        fine_interval_ms = get_interval_ms(intrabar_interval)
-        if fine_interval_ms >= interval_ms or interval_ms % fine_interval_ms:
-            raise ValueError("TBM intrabar interval must be a smaller exact divisor of the main interval")
-        validate_kline_source(intrabar_df, fine_interval_ms, source="TBM intrabar data")
-        fine_times = intrabar_df["open_time_ms_utc"].to_numpy(dtype=np.int64)
-        anchor_times = df["open_time_ms_utc"].to_numpy(dtype=np.int64)
-        if np.any(np.diff(anchor_times) <= 0):
-            raise ValueError("TBM anchor timestamps must be strictly increasing")
-        # The anchor price is known only when its main candle has closed.
-        start_times = anchor_times + interval_ms
-        end_times = start_times + window * interval_ms
-        starts = np.searchsorted(fine_times, start_times)
-        ends = np.searchsorted(fine_times, end_times)
-        ratio = interval_ms // fine_interval_ms
-        scan_window = window * ratio
-        valid = (ends - starts == scan_window) & (starts < len(fine_times))
-        safe_starts = np.minimum(starts, len(fine_times) - 1)
-        valid &= fine_times[safe_starts] == start_times
-        intrabar_args = {
-            "anchor_close": close,
-            "window_starts": starts,
-            "valid_windows": valid,
-        }
-        if not use_high_low:
-            # Close-based TP remains a main-candle-close rule; SL is checked
-            # at every fine candle, including those before the main close.
-            intrabar_args["take_profit_mask"] = (
-                np.isin(fine_times + fine_interval_ms, anchor_times + interval_ms)
-            )
-        close = intrabar_df["close"].to_numpy(dtype=np.float64)
-        high = intrabar_df["high"].to_numpy(dtype=np.float64)
-        low = intrabar_df["low"].to_numpy(dtype=np.float64)
-        logging.getLogger(__name__).info(
-            "TBM intrabar scan | main_interval=%s | scan_interval=%s | "
-            "window=%d main bars | incomplete_intrabar_windows=%d",
-            para.interval, intrabar_interval, window, int((~valid).sum()),
-        )
-
     # 3. Call the numba accelerated kernel
     (
         labels,
@@ -869,18 +1425,18 @@ def attach_triple_barrier_label(df, para=BaseDefine, label_col="label", intrabar
         high,
         low,
         thresholds,
-        scan_window,
+        window,
         use_high_low,
-        **intrabar_args,
     )
 
-    if ratio != 1:
-        # Keep existing distance columns in main-bar units, with fractional
-        # bars retaining the finer scan resolution. Preserve the -1 sentinel.
-        reach_times, long_tp_times, long_sl_times, short_tp_times, short_sl_times = (
-            np.where(values >= 0, values / ratio, -1.0)
-            for values in (reach_times, long_tp_times, long_sl_times, short_tp_times, short_sl_times)
-        )
+    reach_times, long_tp_times, long_sl_times, short_tp_times, short_sl_times = (
+        values.astype(float) for values in
+        (reach_times, long_tp_times, long_sl_times, short_tp_times, short_sl_times)
+    )
+    resolve_tbm_conflicts(
+        df, para, thresholds, labels, reach_times,
+        (long_tp_times, long_sl_times, short_tp_times, short_sl_times), intrabar_df,
+    )
 
     # 4. Write the results back
     df[label_col] = labels
@@ -901,11 +1457,12 @@ def attach_triple_barrier_label(df, para=BaseDefine, label_col="label", intrabar
     valid_idx = np.where(in_bounds)[0]
     time_match[valid_idx] = time_values[target_indices[valid_idx]] == target_times[valid_idx]
 
-    # Handle the invalid rows
-    df.loc[~time_match, label_col] = Signal.INVALID
-    df.loc[~time_match, "reach_time"] = -1  # invalid reach time
+    # Estimator warmup must not silently produce neutral labels.
+    valid_label = time_match & np.isfinite(df["expected_vol"].to_numpy())
+    df.loc[~valid_label, label_col] = Signal.INVALID
+    df.loc[~valid_label, "reach_time"] = -1
     for col in TBM_REACH_TIME_COLUMNS.values():
-        df.loc[~time_match, col] = -1
+        df.loc[~valid_label, col] = -1
 
     return df
 
@@ -1306,7 +1863,7 @@ def fast_pure_binary_kernel(close, high, low, threshold_pct):
     return labels, reach_times, scan_lens, invalid_reasons
 
 
-def attach_pure_binary_label(df, para: Optional[PureBinaryDefine] = None, label_col="label", verbose=True):
+def attach_pure_binary_label(df, para: Optional[PureBinaryDefine] = None, label_col="label", verbose=True, intrabar_df=None):
     """Attach first-hit labels using configured symmetric return barriers.
 
     pure_binary_threshold_pct is a fractional return (0.01 means 1%).
@@ -1326,6 +1883,11 @@ def attach_pure_binary_label(df, para: Optional[PureBinaryDefine] = None, label_
         df["high"].to_numpy(dtype=np.float64),
         df["low"].to_numpy(dtype=np.float64),
         threshold_pct,
+    )
+    anchor_close = df["close"].to_numpy(dtype=float)
+    resolve_binary_conflicts(
+        df, para, labels, reach_times, scan_lens, invalid_reasons,
+        anchor_close * (1 + threshold_pct), anchor_close * (1 - threshold_pct), intrabar_df,
     )
     df[label_col] = labels.astype(int)
     df["reach_time"] = reach_times.astype(int)
@@ -1383,6 +1945,7 @@ def attach_binary_barrier_label(
     para=BaseDefine,
     label_col="label",
     verbose=True,
+    intrabar_df=None,
 ):
 
     df = df.copy()
@@ -1415,6 +1978,10 @@ def attach_binary_barrier_label(
         tp_short,
         window,
         float(para.min_expected_move_pct),
+    )
+    resolve_binary_conflicts(
+        df, para, labels, reach_times, scan_lens, invalid_reasons,
+        close * (1 + tp_long), close * (1 - tp_short), intrabar_df,
     )
 
     # 4. Write the results back

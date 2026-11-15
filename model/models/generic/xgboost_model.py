@@ -33,8 +33,7 @@ _REGRESSION_OBJECTIVE_METRICS = {
 class XGBoostAdapter(SklearnEstimatorAdapter):
     """
     Single-estimator XGBoost adapter (sklearn API), plugged into the same
-    single-task training flow as every other model (train_single /
-    run_single_model_3class_task). Trees don't need feature scaling, so
+    per-window training flow as every other model. Trees don't need feature scaling, so
     use_scaler defaults to False.
 
     Model version changes when estimator training semantics change because the

@@ -738,6 +738,16 @@ def run_once(
             low=bars.low[index],
             close=bars.close[index],
             intrabar=None if bars.intrabar is None else bars.intrabar[index],
+            trade_resolver=(
+                lambda fine_index, row: bars.agg_trade_prices(
+                    bars.time[index] + np.timedelta64(
+                        fine_index * bars.intrabar_step_ms, "ms"
+                    ),
+                    row,
+                    True,
+                )
+                if hasattr(bars, "agg_trade_prices") else None
+            ),
             allow_open=True if open_gate is None else bool(open_gate[index]),
         )
 

@@ -446,7 +446,7 @@ def analyse_volatility_parameters(
         # Use the project's own calculate_thresholds implementation with N=1,
         # then scale by sqrt(N). This exactly matches current expected_vol logic
         # while avoiding recalculating the same EWMA for every N.
-        m_para = replace(pare_para, vol_ewma_span=int(m), predict_num=1)
+        m_para = replace(pare_para, vol_method="ewma", vol_ewma_span=int(m), predict_num=1)
         one_bar = common.calculate_thresholds(df.copy(), para=m_para)["expected_vol"]
 
         for n in n_values:

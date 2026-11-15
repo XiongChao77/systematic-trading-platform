@@ -117,13 +117,15 @@ class TorchTrainer:
             train_loss = total_loss / max(total_samples, 1)
             validation = self.predict(model, task, validation_split)
             test = self.predict(model, task, test_split) if test_split is not None else None
-            validation_f1 = f1_score(
-                validation.y_true,
-                validation.y_pred,
-                labels=task.labels,
-                average="macro",
-                zero_division=0,
-            )
+            validation_f1 = None
+            if not task.numeric_regression:
+                validation_f1 = f1_score(
+                    validation.y_true,
+                    validation.y_pred,
+                    labels=task.labels,
+                    average="macro",
+                    zero_division=0,
+                )
             validation_loss = float(validation.loss)
             validation_values = (
                 validation.predictions if task.is_regression else validation.y_pred
@@ -137,8 +139,9 @@ class TorchTrainer:
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "validation_loss": validation_loss,
-                "validation_macro_f1": validation_f1,
             }
+            if not task.numeric_regression:
+                epoch_metrics["validation_macro_f1"] = validation_f1
             if test is not None:
                 epoch_metrics["test_loss"] = float(test.loss)
             if task.is_regression:
@@ -156,11 +159,11 @@ class TorchTrainer:
                 epoch_metrics["test_precision"] = float(class_precisions[-1])
             history.append(epoch_metrics)
             self.logger.info(
-                "Epoch %03d | train_loss %.4f | validation_loss %.4f | validation_macro_f1 %.4f%s",
+                "Epoch %03d | train_loss %.4f | validation_loss %.4f%s%s",
                 epoch,
                 train_loss,
                 validation_loss,
-                validation_f1,
+                f" | validation_macro_f1 {validation_f1:.4f}" if not task.numeric_regression else "",
                 f" | validation_mae {validation_mae:.4f}" if task.is_regression else "",
             )
 
@@ -175,10 +178,9 @@ class TorchTrainer:
             if improved:
                 best_score = score
                 best_state = _state_dict_on_cpu(model)
-                best_validation = {
-                    "loss": validation_loss,
-                    "macro_f1": validation_f1,
-                }
+                best_validation = {"loss": validation_loss}
+                if not task.numeric_regression:
+                    best_validation["macro_f1"] = validation_f1
                 if task.is_regression:
                     best_validation["mae"] = validation_mae
                     best_validation["rmse"] = float(
@@ -307,14 +309,17 @@ class SklearnTrainer:
                 model.fit(train_split.X, train_split.y)
             history = []
         validation = self.predict(model, task, validation_split)
-        macro_f1 = f1_score(
-            validation.y_true,
-            validation.y_pred,
-            labels=task.labels,
-            average="macro",
-            zero_division=0,
-        )
-        validation_metrics = {"loss": float(validation.loss), "macro_f1": float(macro_f1)}
+        macro_f1 = None
+        validation_metrics = {"loss": float(validation.loss)}
+        if not task.numeric_regression:
+            macro_f1 = f1_score(
+                validation.y_true,
+                validation.y_pred,
+                labels=task.labels,
+                average="macro",
+                zero_division=0,
+            )
+            validation_metrics["macro_f1"] = float(macro_f1)
         validation_values = (
             validation.predictions if task.is_regression else validation.y_pred
         )

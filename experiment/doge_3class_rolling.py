@@ -8,8 +8,7 @@ This is the 3-class counterpart of the existing binary fusion baseline
 (Trigger + Direction) produced by multi_symbol_sweep.py's `doge` combo, so
 the two can be compared on the same split boundary.
 
-Because `train_rolling`'s CLI hardcodes the Trigger+Direction fusion heads,
-the three-class config must be passed explicitly here.
+The three-class configuration is passed explicitly to the shared window executor.
 
 Outputs (under experiment/sweep_outputs/<tag>_3class/):
   data/ train/ backtest/ experiment.log
@@ -40,7 +39,7 @@ if PROJECT_DIR not in sys.path:
 from data_process import common
 from data_process import preparation
 from data_process.config import DOGE_15m_TBM
-from model.train import train_rolling
+from model.train import train_windows
 from model.train_config import (
     RollingConfig,
     TrainConfig,
@@ -137,7 +136,7 @@ def run(symbol: str, *, mode: str, period: str, split_time: str,
 
         # 2. Rolling training with a single three-class head (no fusion).
         logger.info("=== [%s] Training (mode=%s) ===", tag, mode)
-        train_rolling(
+        train_windows(
             configs=[build_three_class_config(seq_len, stride)],
             rolling_config=RollingConfig(mode=mode),
             prep_output_dir=data_dir,

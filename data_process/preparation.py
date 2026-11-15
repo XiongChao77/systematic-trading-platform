@@ -40,20 +40,27 @@ def _source_descriptor(df: pd.DataFrame, path: str) -> dict:
 
 def _load_tbm_intrabar_data(para, logger):
     """Resolve matching market data while keeping the main labeling interval."""
-    if not isinstance(para, common.BaseDefine):
+    if not isinstance(para, (common.BaseDefine, common.MartingaleDefine, common.PureBinaryDefine)):
         return None, None
-    intrabar_interval = para.resolve_tbm_intrabar_interval()
+    hierarchical = para.label_type in ("TBM", "BBM", "PURE_BINARY")
+    intrabar_interval = (
+        "1m" if hierarchical and common.get_interval_ms(para.interval) > 60_000
+        else None if hierarchical else para.resolve_tbm_intrabar_interval()
+    )
     if intrabar_interval is None:
         return None, None
     interval_ms = common.get_interval_ms(para.interval)
     fine_interval_ms = common.get_interval_ms(intrabar_interval)
     if fine_interval_ms >= interval_ms or interval_ms % fine_interval_ms:
-        raise ValueError("TBM intrabar interval must be a smaller exact divisor of the main interval")
-    source = replace(para, interval=intrabar_interval, tbm_intrabar_interval=None)
+        raise ValueError("Label intrabar interval must be a smaller exact divisor of the main interval")
+    source = replace(para, interval=intrabar_interval)
     path = common.market_data_path(source)
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"TBM intrabar data file not found: {path}")
-    logger.info("Loading TBM intrabar data: %s", path)
+        if hierarchical:
+            logger.warning("Local 1m data is unavailable: %s; ambiguous barriers will use aggTrades", path)
+            return None, None
+        raise FileNotFoundError(f"Label intrabar data file not found: {path}")
+    logger.info("Loading %s intrabar data: %s", para.label_type, path)
     frame = pd.read_csv(path, usecols=[
         "open_time_ms_utc", "close_time_ms_utc", "open", "high", "low", "close",
     ])
@@ -128,6 +135,8 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
         # Persist the effective scan interval so downstream artifacts describe
         # the actual labeling source rather than an unresolved automatic value.
         para = replace(para, tbm_intrabar_interval=para.resolve_tbm_intrabar_interval())
+    elif isinstance(para, common.MartingaleDefine):
+        para = replace(para, intrabar_interval=para.resolve_tbm_intrabar_interval())
     if len(para.symbols) > 1:
         return _prepare_multiasset(
             logger, feature_group_list, feature_conf_list, para,
@@ -169,6 +178,7 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
             intrabar_df = intrabar_df.loc[intrabar_times.loc[intrabar_df.index] <= pd.to_datetime(end_time, utc=True)]
         intrabar_df = intrabar_df.reset_index(drop=True)
     is_pure_binary = isinstance(para, common.PureBinaryDefine)
+    is_martingale = para.label_type == "MARTINGALE"
     if is_pure_binary:
         df['open_time_date_utc'] = pd.to_datetime(df['open_time_ms_utc'], unit='ms', utc=True)
         latest_time = df['open_time_date_utc'].max()
@@ -190,7 +200,7 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
     if para.label_type == "TBM" and not is_pure_binary:
         common.log_tbm_reach_time_percentiles(df, logger)
         df.drop(columns=list(common.TBM_REACH_TIME_COLUMNS.values()), inplace=True)
-    if "expected_vol" in df.columns:
+    if not is_martingale and "expected_vol" in df.columns:
         plot_path = os.path.join(
             prep_output_dir,
             "label_proportion_by_expected_vol.png",
@@ -221,6 +231,8 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
     logger.info("\n=== Label distribution summary ===")
     if is_pure_binary:
         logger.info("PURE_BINARY inclusive return threshold: %.4f%%", para.pure_binary_threshold_pct * 100)
+    elif is_martingale:
+        logger.info("MARTINGALE statuses: %s", df["martingale_status"].value_counts().to_dict())
     else:
         logger.info("Thresholds are saved in columns: 'threshold_long' and 'threshold_short'")
         logger.info(f"Long threshold range: Min={df['threshold_long'].min():.4f}, Max={df['threshold_long'].max():.4f}, Mean={df['threshold_long'].mean():.4f}")
@@ -228,6 +240,12 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
         common.log_threshold_percentiles(df, logger)
 
     for label_val, cnt in counts.items():
+        if is_martingale:
+            logger.info(
+                "MARTINGALE additions %s: %s rows, ratio %.4f%%",
+                int(label_val), cnt, proportions[label_val] * 100,
+            )
+            continue
         label_name = {
             common.Signal.INVALID: "INVALID",
             common.Signal.NEGATIVE: "Down",
@@ -281,6 +299,8 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
     }
     if intrabar_source is not None:
         manifest_payload["label_source"] = intrabar_source
+    if is_martingale:
+        manifest_payload["martingale_metadata"] = common.json_safe(df.attrs["martingale_metadata"])
     manifest = {
         **manifest_payload,
         "data_id": common.data_manifest_id(manifest_payload),
@@ -304,7 +324,7 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
 if __name__ == "__main__":
 #**********column info: open_time_date_utc,open,high,low,close,volume,close_time_ms_utc,quote_asset_volume,number_of_trades,taker_buy_base_volume,taker_buy_quote_volume,ignore
     logger, _ = common.setup_session_logger(sub_folder='data_process')
-    pare_para = config.DOGE_AAVE_15m_TBM
+    pare_para = config.DOGE_15m_TBM
     if pare_para.market_category == 'Forex':
         feature_conf_list = feature.FEATURE_LIST_COMMODITY
     else:

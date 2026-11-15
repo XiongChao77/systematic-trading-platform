@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Download Binance Vision kline ZIP files by date range.
+Download Binance Vision kline or aggTrades ZIP files by date range.
 
 Data source:
     https://data.binance.vision/
@@ -23,6 +23,8 @@ Main behavior:
       without scanning the full history; gaps remain eligible for monthly recovery.
     - Skip dates whose daily archives return HTTP 404 and have no monthly data.
       Keep later available data and report gaps; download failures remain fatal.
+    - Log download and conversion progress per archive, with per-month payload
+      progress and ETA, so long multi-gigabyte conversions stay observable.
     - Validate candle structure and OHLC values in the merged K-line sequence.
 
 Examples:
@@ -35,6 +37,9 @@ Examples:
     # Binance USDⓈ-M futures / UM futures
     python download_from_zip.py --market um --symbols DOGEUSDT --intervals 30m
 
+    # Download aggregate trades instead of klines
+    python download_from_zip.py --market um --symbols BTCUSDT --data-type aggTrades --start 2024-01-01 --end 2024-01-31
+
 Output:
     <out_dir>/<market>/<symbol>/<interval>/
         download_info.json
@@ -42,11 +47,14 @@ Output:
         monthly_zips/<symbol>-<interval>-YYYY-MM.zip
     <out_dir>/earliest_dates.json stores earliest dates for all market/symbols.
 
-    The validated CSV is moved to common.market_data_path(para).
+    K-line CSV files are moved to common.market_data_path(para). aggTrades are
+    written as one Parquet file per calendar year in the canonical data
+    directory.
 
     For um/cm markets, monthly fundingRate ZIPs are also downloaded (once per
     symbol, cached under <out_dir>/<market>/<symbol>/fundingRate/) and merged to
-    <market_data dir>/<symbol>_fundingRate.csv. Use --no-funding-rate to skip.
+    <market_data dir>/<symbol>_fundingRate.csv for kline downloads. Use
+    --no-funding-rate to skip.
 """
 
 import argparse
@@ -60,6 +68,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 import zipfile
 import xml.etree.ElementTree as ET
@@ -69,7 +78,12 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import requests
+import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.csv as pacsv
+import pyarrow.parquet as parquet
 from requests.adapters import HTTPAdapter
 
 
@@ -95,6 +109,9 @@ INFO_FILENAME = "download_info.json"
 EARLIEST_DATES_FILENAME = "earliest_dates.json"
 ZIP_DIRNAME = "zips"
 MONTHLY_ZIP_DIRNAME = "monthly_zips"
+PROGRESS_LOG_INTERVAL_SECONDS = 20.0
+DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024
+DOWNLOAD_PROGRESS_LOG_INTERVAL_SECONDS = 10.0
 
 
 class NoArchiveError(RuntimeError):
@@ -140,6 +157,165 @@ OUTPUT_COLUMNS = [
     "taker_buy_quote_volume",
     "ignore",
 ]
+AGG_TRADES_SOURCE_COLUMNS = [
+    "agg_trade_id",
+    "price",
+    "quantity",
+    "first_trade_id",
+    "last_trade_id",
+    "transact_time",
+    "is_buyer_maker",
+    "is_best_match",
+]
+AGG_TRADES_SCHEMA = pa.schema([
+    pa.field("agg_trade_id", pa.int64()),
+    pa.field("price", pa.string()),
+    pa.field("quantity", pa.string()),
+    pa.field("first_trade_id", pa.int64()),
+    pa.field("last_trade_id", pa.int64()),
+    pa.field("transact_time_ms_utc", pa.int64()),
+    pa.field("transact_time_date_utc", pa.string()),
+    pa.field("is_buyer_maker", pa.string()),
+    pa.field("is_best_match", pa.string()),
+])
+AGG_TRADES_READ_BLOCK_BYTES = 32 * 1024 * 1024
+AGG_TRADES_INTEGRITY_VERSION = 1
+
+
+def load_active_kline_minutes(directory: Path, symbol: str, start: date, end: date) -> set[int]:
+    """Return minutes with trades in a local 1m kline file, if available."""
+    path = directory / f"{symbol}_1m.csv"
+    if not path.is_file():
+        return set()
+    start_ms, end_ms = day_window_ms(start, end)
+    result: set[int] = set()
+    for chunk in pd.read_csv(
+        path, usecols=["open_time_ms_utc", "number_of_trades"], chunksize=250_000,
+    ):
+        timestamps = chunk["open_time_ms_utc"].to_numpy()
+        mask = (
+            (timestamps >= start_ms) & (timestamps < end_ms)
+            & (chunk["number_of_trades"].to_numpy() > 0)
+        )
+        result.update(int(value) for value in timestamps[mask] // 60_000)
+    return result
+
+
+class AggTradeYearBuilder:
+    """Stage daily shards, then atomically publish a sorted, unique yearly file."""
+
+    def __init__(self, directory: Path, symbol: str, year: int):
+        directory.mkdir(parents=True, exist_ok=True)
+        self.path = directory / f"{symbol}_aggTrades_{year}.parquet"
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix=f".{symbol}_aggTrades_{year}-", dir=directory,
+        )
+        self.shards: dict[date, list[Path]] = {}
+        self.writers: dict[date, parquet.ParquetWriter] = {}
+
+    def append(self, table: pa.Table) -> None:
+        timestamps = table["transact_time_ms_utc"].to_numpy()
+        days = timestamps // 86_400_000
+        for value in np.unique(days):
+            day = date(1970, 1, 1) + timedelta(days=int(value))
+            if day not in self.writers:
+                paths = self.shards.setdefault(day, [])
+                path = Path(self.temporary.name) / f"{day}-{len(paths)}.parquet"
+                paths.append(path)
+                self.writers[day] = parquet.ParquetWriter(
+                    path, AGG_TRADES_SCHEMA, compression="zstd", use_dictionary=False,
+                )
+            self.writers[day].write_table(table.filter(pa.array(days == value)))
+
+    def close_shards(self) -> None:
+        for writer in self.writers.values():
+            writer.close()
+        self.writers.clear()
+
+    def read_day(self, day: date, columns=None) -> pa.Table:
+        return pa.concat_tables([
+            parquet.ParquetFile(path).read(columns=columns) for path in self.shards[day]
+        ])
+
+    def inspect(self, start: date, end: date, active_minutes: set[int], previous=None) -> dict:
+        """Find ID gaps, empty dates and disagreements with local 1m klines."""
+        self.close_shards()
+        gaps = []
+        present_minutes: set[int] = set()
+        last = previous
+        for day in sorted(self.shards):
+            table = self.read_day(day, ["agg_trade_id", "transact_time_ms_utc"])
+            ids = table["agg_trade_id"].to_numpy()
+            timestamps = table["transact_time_ms_utc"].to_numpy()
+            if any(column.null_count for column in table.columns) or np.any(ids < 1):
+                raise ValueError(f"Invalid aggregate trade IDs or timestamps on {day}")
+            present_minutes.update(int(value) for value in np.unique(timestamps // 60_000))
+            ids, indices = np.unique(ids, return_index=True)
+            timestamps = timestamps[indices]
+            if last is not None:
+                if int(ids[0]) <= last[0]:
+                    raise ValueError(
+                        f"Aggregate trade IDs overlap across UTC dates at {day}: "
+                        f"previous={last[0]}, next={int(ids[0])}"
+                    )
+                ids = np.concatenate(([last[0]], ids))
+                timestamps = np.concatenate(([last[1]], timestamps))
+            for index in np.flatnonzero(np.diff(ids) > 1):
+                gaps.append({
+                    "before_id": int(ids[index]), "after_id": int(ids[index + 1]),
+                    "missing_ids": int(ids[index + 1] - ids[index] - 1),
+                    "before_ms": int(timestamps[index]), "after_ms": int(timestamps[index + 1]),
+                })
+            last = (int(ids[-1]), int(timestamps[-1]))
+        return {
+            "id_gaps": gaps,
+            "missing_dates": [day.isoformat() for day in date_range(start, end) if day not in self.shards],
+            "missing_kline_minutes": sorted(active_minutes - present_minutes),
+            "last_trade": last,
+        }
+
+    @staticmethod
+    def normalise(table: pa.Table) -> tuple[pa.Table, int]:
+        """Reject conflicting IDs, remove identical duplicates and sort the result."""
+        table = table.take(pc.sort_indices(table, sort_keys=[("agg_trade_id", "ascending")]))
+        ids = table["agg_trade_id"].to_numpy()
+        duplicate_indices = np.flatnonzero(ids[1:] == ids[:-1]) + 1
+        if len(duplicate_indices):
+            current = table.take(pa.array(duplicate_indices))
+            previous = table.take(pa.array(duplicate_indices - 1))
+            for name in table.column_names:
+                equal = pc.or_(
+                    pc.fill_null(pc.equal(current[name], previous[name]), False),
+                    pc.and_(pc.is_null(current[name]), pc.is_null(previous[name])),
+                ).to_numpy()
+                if not np.all(equal):
+                    trade_id = int(ids[duplicate_indices[np.flatnonzero(~equal)[0]]])
+                    raise ValueError(f"Conflicting agg_trade_id={trade_id}: field {name} differs")
+            keep = np.concatenate(([True], ids[1:] != ids[:-1]))
+            table = table.filter(pa.array(keep))
+        table = table.take(pc.sort_indices(table, sort_keys=[
+            ("transact_time_ms_utc", "ascending"), ("agg_trade_id", "ascending"),
+        ]))
+        return table, len(duplicate_indices)
+
+    def publish(self) -> dict:
+        self.close_shards()
+        output = Path(self.temporary.name) / "final.parquet"
+        rows = duplicates = 0
+        with parquet.ParquetWriter(
+            output, AGG_TRADES_SCHEMA, compression="zstd", use_dictionary=False,
+        ) as writer:
+            for day in sorted(self.shards):
+                table, removed = self.normalise(self.read_day(day))
+                writer.write_table(table, row_group_size=500_000)
+                rows += table.num_rows
+                duplicates += removed
+        os.replace(output, self.path)
+        return {"rows": rows, "duplicates_removed": duplicates}
+
+    def cleanup(self) -> None:
+        self.close_shards()
+        self.temporary.cleanup()
 
 
 def parse_date(s: Optional[str]) -> Optional[date]:
@@ -199,6 +375,79 @@ def date_range(start: date, end: date) -> Iterable[date]:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def format_byte_size(num_bytes: float) -> str:
+    """Render a byte count with a compact unit suffix."""
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} PB"
+
+
+def format_count(value: int) -> str:
+    """Render a large integer with a compact magnitude suffix."""
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f}B"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return str(value)
+
+
+def format_rows(value: int) -> str:
+    """Render a row count with correct pluralization."""
+    return f"{format_count(value)} row" if value == 1 else f"{format_count(value)} rows"
+
+
+def format_duration(seconds: float) -> str:
+    """Render an elapsed time as a short human-readable string."""
+    total = int(max(0.0, seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+class ArchiveConversionProgress:
+    """Log throttled row progress while one archive is converted into Parquet."""
+
+    def __init__(
+        self,
+        label: str,
+        interval_seconds: float = PROGRESS_LOG_INTERVAL_SECONDS,
+    ) -> None:
+        self.label = label
+        self.interval_seconds = interval_seconds
+        self.started_at = time.monotonic()
+        self.last_report_at = self.started_at
+        self.rows = 0
+
+    def update(self, rows: int) -> None:
+        """Record rows read from the source and log at most once per interval."""
+        self.rows += rows
+        now = time.monotonic()
+        if now - self.last_report_at < self.interval_seconds:
+            return
+        self.last_report_at = now
+        elapsed = max(now - self.started_at, 1e-9)
+        LOGGER.info(
+            "[%s] %s read in %s (%s rows/s)",
+            self.label,
+            format_rows(self.rows),
+            format_duration(elapsed),
+            format_count(int(self.rows / elapsed)),
+        )
+
+    def summary(self) -> tuple[int, float]:
+        """Return the total rows read and the elapsed seconds."""
+        return self.rows, max(time.monotonic() - self.started_at, 1e-9)
 
 
 def build_output_dir(base_dir: Path, market: str, symbol: str, interval: str) -> Path:
@@ -398,6 +647,1163 @@ def build_archive_prefix(
     if frequency not in {"daily", "monthly"}:
         raise ValueError(f"Unsupported archive frequency: {frequency}")
     return f"{MARKET_ROOTS[market]}/{frequency}/klines/{symbol}/{interval}/"
+
+
+def build_agg_trades_prefix(market: str, frequency: str, symbol: str) -> str:
+    if frequency not in {"daily", "monthly"}:
+        raise ValueError(f"Unsupported archive frequency: {frequency}")
+    return f"{MARKET_ROOTS[market]}/{frequency}/aggTrades/{symbol}/"
+
+
+def agg_trades_zip_filename(symbol: str, day_or_month: date, *, monthly: bool) -> str:
+    date_format = "%Y-%m" if monthly else "%Y-%m-%d"
+    return f"{symbol}-aggTrades-{day_or_month:{date_format}}.zip"
+
+
+def build_agg_trades_url(
+    market: str,
+    symbol: str,
+    day_or_month: date,
+    *,
+    monthly: bool,
+) -> str:
+    frequency = "monthly" if monthly else "daily"
+    filename = agg_trades_zip_filename(symbol, day_or_month, monthly=monthly)
+    return f"{BASE_URL}/{build_agg_trades_prefix(market, frequency, symbol)}{filename}"
+
+
+def read_agg_trades_zip_layout(
+    zip_path: Path,
+    source_name: str,
+) -> tuple[str, list[str], bool]:
+    """Return the CSV member, its column names and whether it carries a header line."""
+    with zipfile.ZipFile(zip_path) as archive:
+        csv_names = [name for name in archive.namelist() if name.lower().endswith(".csv")]
+        if not csv_names:
+            raise ValueError(f"No CSV file inside ZIP: {source_name}")
+        csv_name = csv_names[0]
+        with archive.open(csv_name) as file:
+            first_line = file.readline()
+
+    fields = first_line.decode("utf-8").strip().split(",")
+    if len(fields) < 7:
+        raise ValueError(
+            f"Bad aggTrades row with {len(fields)} fields in {source_name}: {fields[:3]}"
+        )
+    column_count = min(len(fields), len(AGG_TRADES_SOURCE_COLUMNS))
+    return (
+        csv_name,
+        AGG_TRADES_SOURCE_COLUMNS[:column_count],
+        not fields[0].strip().lstrip("-").isdigit(),
+    )
+
+
+def build_agg_trades_table(
+    table: pa.Table,
+    start_ms: int,
+    end_ms: int,
+    day_filter: Optional[pa.Array] = None,
+) -> tuple[pa.Table, Optional[pa.Array], pa.Array]:
+    """Convert one raw aggTrades batch into canonical columns trimmed to the date window."""
+    transact_time = table.column("transact_time")
+    # Binance Vision mixes seconds, milliseconds and microseconds across vintages.
+    transact_time = pc.if_else(
+        pc.less(transact_time, pa.scalar(10**10, pa.int64())),
+        pc.multiply(transact_time, 1000),
+        transact_time,
+    )
+    transact_time = pc.if_else(
+        pc.greater_equal(transact_time, pa.scalar(10**15, pa.int64())),
+        pc.divide(transact_time, 1000),
+        transact_time,
+    )
+    timestamps = pc.cast(transact_time, pa.timestamp("ms"))
+
+    mask = pc.and_(
+        pc.greater_equal(transact_time, pa.scalar(start_ms, pa.int64())),
+        pc.less(transact_time, pa.scalar(end_ms, pa.int64())),
+    )
+    days = None
+    if day_filter is not None:
+        days = pc.cast(timestamps, pa.date32())
+        mask = pc.and_(mask, pc.is_in(days, value_set=day_filter))
+
+    if not pc.all(mask).as_py():
+        table = table.filter(mask)
+        transact_time = transact_time.filter(mask)
+        timestamps = timestamps.filter(mask)
+        if days is not None:
+            days = days.filter(mask)
+    years = pc.year(timestamps)
+    is_best_match = (
+        table.column("is_best_match")
+        if "is_best_match" in table.column_names
+        else pc.fill_null(pa.nulls(table.num_rows, pa.string()), "")
+    )
+
+    return (
+        pa.Table.from_arrays(
+            [
+                table.column("agg_trade_id"),
+                table.column("price"),
+                table.column("quantity"),
+                table.column("first_trade_id"),
+                table.column("last_trade_id"),
+                transact_time,
+                pc.cast(pc.cast(timestamps, pa.timestamp("s"), safe=False), pa.string()),
+                table.column("is_buyer_maker"),
+                is_best_match,
+            ],
+            schema=AGG_TRADES_SCHEMA,
+        ),
+        days,
+        years,
+    )
+
+
+def iter_agg_trades_tables(
+    zip_path: Path,
+    source_name: str,
+    start_ms: int,
+    end_ms: int,
+    only_days: Optional[set[date]] = None,
+    progress: Optional[ArchiveConversionProgress] = None,
+) -> Iterable[tuple[int, pa.Table, Optional[pa.Array]]]:
+    """Stream aggTrades rows from a ZIP archive as canonical yearly Arrow tables."""
+    csv_name, columns, has_header = read_agg_trades_zip_layout(zip_path, source_name)
+    read_options = pacsv.ReadOptions(
+        column_names=columns,
+        skip_rows=1 if has_header else 0,
+        block_size=AGG_TRADES_READ_BLOCK_BYTES,
+    )
+    convert_options = pacsv.ConvertOptions(column_types={
+        name: pa.string() if name in {"price", "quantity", "is_buyer_maker", "is_best_match"}
+        else pa.int64()
+        for name in columns
+    })
+    day_filter = None if only_days is None else pa.array(sorted(only_days), type=pa.date32())
+
+    with zipfile.ZipFile(zip_path) as archive:
+        with archive.open(csv_name) as file:
+            reader = pacsv.open_csv(
+                file,
+                read_options=read_options,
+                convert_options=convert_options,
+            )
+            for batch in reader:
+                if progress is not None:
+                    progress.update(batch.num_rows)
+                table, days, years = build_agg_trades_table(
+                    pa.Table.from_batches([batch]),
+                    start_ms,
+                    end_ms,
+                    day_filter,
+                )
+                if not table.num_rows:
+                    continue
+                batch_years = pc.unique(years).to_pylist()
+                if len(batch_years) == 1:
+                    yield batch_years[0], table, days
+                    continue
+                for year in batch_years:
+                    year_mask = pc.equal(years, year)
+                    yield (
+                        year,
+                        table.filter(year_mask),
+                        None if days is None else days.filter(year_mask),
+                    )
+
+
+def inspect_agg_trades_archive_days(zip_path: Path, source_name: str) -> set[date]:
+    """Read only timestamps from an aggTrades ZIP to identify covered UTC dates."""
+    csv_name, columns, has_header = read_agg_trades_zip_layout(zip_path, source_name)
+    read_options = pacsv.ReadOptions(
+        column_names=columns,
+        skip_rows=1 if has_header else 0,
+        block_size=AGG_TRADES_READ_BLOCK_BYTES,
+    )
+    convert_options = pacsv.ConvertOptions(
+        include_columns=["transact_time"],
+        column_types={"transact_time": pa.int64()},
+    )
+    result: set[date] = set()
+    with zipfile.ZipFile(zip_path) as archive:
+        with archive.open(csv_name) as file:
+            reader = pacsv.open_csv(
+                file,
+                read_options=read_options,
+                convert_options=convert_options,
+            )
+            for batch in reader:
+                timestamps = batch.column("transact_time")
+                timestamps = pc.if_else(
+                    pc.less(timestamps, pa.scalar(10**10, pa.int64())),
+                    pc.multiply(timestamps, 1000),
+                    timestamps,
+                )
+                timestamps = pc.if_else(
+                    pc.greater_equal(timestamps, pa.scalar(10**15, pa.int64())),
+                    pc.divide(timestamps, 1000),
+                    timestamps,
+                )
+                days = pc.cast(pc.cast(timestamps, pa.timestamp("ms")), pa.date32())
+                result.update(pc.unique(days).to_pylist())
+    return result
+
+
+def check_zip_integrity(zip_bytes: bytes, source_name: str) -> None:
+    """Validate ZIP container metadata without decompressing its contents."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
+            if not archive.infolist():
+                raise ValueError(f"ZIP archive contains no files: {source_name}")
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ValueError(f"Corrupted ZIP archive: {source_name}: {exc}") from exc
+
+
+def check_zip_path_integrity(zip_path: Path) -> None:
+    """Validate a ZIP archive on disk without decompressing its contents."""
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            if not archive.infolist():
+                raise ValueError(f"ZIP archive contains no files: {zip_path}")
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ValueError(f"Corrupted ZIP archive: {zip_path}: {exc}") from exc
+
+
+def day_window_ms(start: date, end: date) -> tuple[int, int]:
+    """Return the half-open UTC millisecond window covering the given day range."""
+    start_ms = int(datetime(start.year, start.month, start.day, tzinfo=timezone.utc).timestamp() * 1000)
+    end_exclusive = end + timedelta(days=1)
+    end_ms = int(
+        datetime(
+            end_exclusive.year,
+            end_exclusive.month,
+            end_exclusive.day,
+            tzinfo=timezone.utc,
+        ).timestamp()
+        * 1000
+    )
+    return start_ms, end_ms
+
+
+def resolve_agg_trades_start_end(
+    session: requests.Session,
+    market: str,
+    symbol: str,
+    start_arg: Optional[str],
+    end_arg: Optional[str],
+    *,
+    skip_discovery: bool = False,
+    local_cache_dir: Optional[Path] = None,
+) -> tuple[date, date]:
+    requested_start = parse_date(start_arg)
+    end = parse_date(end_arg) or (datetime.now(timezone.utc).date() - timedelta(days=1))
+    if requested_start is not None:
+        return requested_start, end
+
+    if skip_discovery:
+        candidates: list[date] = []
+        if local_cache_dir is not None:
+            filename_pattern = re.compile(
+                rf"{re.escape(symbol)}-aggTrades-(\d{{4}}-\d{{2}}(?:-\d{{2}})?)\.zip"
+            )
+            for cache_dir in (local_cache_dir / ZIP_DIRNAME, local_cache_dir / MONTHLY_ZIP_DIRNAME):
+                if not cache_dir.is_dir():
+                    continue
+                for archive_path in cache_dir.glob(f"{symbol}-aggTrades-*.zip"):
+                    match = filename_pattern.fullmatch(archive_path.name)
+                    if match is None:
+                        continue
+                    date_text = match.group(1)
+                    date_format = "%Y-%m-%d" if len(date_text) == 10 else "%Y-%m"
+                    candidates.append(datetime.strptime(date_text, date_format).date())
+        if candidates:
+            start = min(candidates)
+            LOGGER.info(
+                "Using earliest local aggTrades archive date %s; Binance Vision date discovery skipped",
+                start,
+            )
+            return start, end
+
+        start = FALLBACK_START[market]
+        LOGGER.warning(
+            "Binance Vision date discovery skipped and no local aggTrades ZIPs found; "
+            "using market fallback start %s",
+            start,
+        )
+        return start, end
+
+    prefix = build_agg_trades_prefix(market, "daily", symbol)
+    pattern = re.compile(
+        rf"{re.escape(prefix)}{re.escape(symbol)}-aggTrades-(\d{{4}}-\d{{2}}-\d{{2}})\.zip"
+    )
+    LOGGER.info("Querying Binance Vision S3 listing for the earliest daily aggTrades ZIP:")
+    LOGGER.info(f"   {S3_LIST_URL}?prefix={prefix}")
+    for key in list_s3_keys(session, prefix):
+        match = pattern.fullmatch(key)
+        if match is not None:
+            start = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+            LOGGER.info(f"Earliest daily aggTrades ZIP: {start}")
+            return start, end
+    raise NoArchiveError(
+        f"No Binance Vision daily aggTrades ZIPs found for market={market}, symbol={symbol}."
+    )
+
+
+def read_response_bytes(
+    response: requests.Response,
+    url: str,
+    *,
+    label: str,
+) -> bytes:
+    """Read a streamed body in chunks, logging size and speed while it arrives."""
+    declared_length = response.headers.get("Content-Length")
+    total_bytes = int(declared_length) if declared_length and declared_length.isdigit() else 0
+    payload = bytearray()
+    started_at = time.monotonic()
+    last_report_at = started_at
+
+    for chunk in response.iter_content(DOWNLOAD_CHUNK_BYTES):
+        if not chunk:
+            continue
+        payload.extend(chunk)
+        now = time.monotonic()
+        if now - last_report_at < DOWNLOAD_PROGRESS_LOG_INTERVAL_SECONDS:
+            continue
+        last_report_at = now
+        elapsed = max(now - started_at, 1e-9)
+        fraction = f" ({len(payload) / total_bytes:.0%})" if total_bytes else ""
+        LOGGER.info(
+            "[%s] received %s%s of %s at %s/s",
+            label,
+            format_byte_size(len(payload)),
+            fraction,
+            format_byte_size(total_bytes) if total_bytes else "unknown size",
+            format_byte_size(len(payload) / elapsed),
+        )
+
+    elapsed = max(time.monotonic() - started_at, 1e-9)
+    if total_bytes and len(payload) != total_bytes:
+        raise ValueError(
+            f"Short read for {url}: {len(payload)} of {total_bytes} bytes"
+        )
+    LOGGER.info(
+        "[%s] download complete: %s in %s (%s/s)",
+        label,
+        format_byte_size(len(payload)),
+        format_duration(elapsed),
+        format_byte_size(len(payload) / elapsed),
+    )
+    return bytes(payload)
+
+
+def download_agg_trades_zip(
+    session: requests.Session,
+    url: str,
+    *,
+    label: str,
+) -> tuple[Optional[bytes], Optional[str]]:
+    for attempt in range(HTTP_RETRIES + 1):
+        try:
+            response = session.get(url, timeout=HTTP_TIMEOUT_SECONDS, stream=True)
+            if response.status_code == 404:
+                response.close()
+                return None, "missing"
+            with response:
+                response.raise_for_status()
+                content = read_response_bytes(response, url, label=label)
+            check_zip_integrity(content, url)
+            return content, None
+        except Exception as exc:
+            if attempt < HTTP_RETRIES:
+                LOGGER.warning(
+                    "[%s] request failed (%s: %s); retry %d/%d in %ss",
+                    label,
+                    type(exc).__name__,
+                    exc,
+                    attempt + 1,
+                    HTTP_RETRIES,
+                    RETRY_DELAY_SECONDS,
+                )
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+            return None, f"failed: {type(exc).__name__}: {exc}"
+        finally:
+            time.sleep(DOWNLOAD_DELAY_SECONDS)
+
+    return None, "failed: unknown error"
+
+
+def download_symbol_agg_trades(
+    args: argparse.Namespace,
+    session: requests.Session,
+    symbol: str,
+) -> Optional[Path]:
+    market = args.market
+    symbol = symbol.upper()
+    interval = "aggTrades"
+    para = common.MarketDataSourceConfig(
+        market_category="Cryptocurrency",
+        data_source="binance_public_data",
+        symbols=(symbol,),
+        interval=interval,
+        trading_type=market,
+    )
+    market_data_path = Path(common.market_data_path(para)).expanduser().resolve()
+    parquet_dir = market_data_path.parent
+    LOGGER.info("[%s aggTrades] Output Parquet directory: %s", symbol, parquet_dir)
+
+    output_dir = build_output_dir(
+        Path(args.out_dir).expanduser().resolve(), market, symbol, interval
+    )
+    daily_zip_dir = output_dir / ZIP_DIRNAME
+    monthly_zip_dir = output_dir / MONTHLY_ZIP_DIRNAME
+    info_path = build_info_path(output_dir)
+    known_missing_sources = (
+        set() if args.force
+        else load_known_missing_sources(info_path, market, symbol, interval)
+    )
+    start, end = resolve_agg_trades_start_end(
+        session,
+        market,
+        symbol,
+        args.start,
+        args.end,
+        skip_discovery=args.skip_start_date_discovery or args.offline,
+        local_cache_dir=output_dir,
+    )
+    LOGGER.info(
+        "[%s aggTrades] Resolved date range: %s -> %s UTC (%d days); checking existing Parquet coverage",
+        symbol,
+        start,
+        end,
+        (end - start).days + 1,
+    )
+    if start > end:
+        raise ValueError(f"start must be <= end, got start={start}, end={end}")
+    expected_parquet_paths = [
+        parquet_dir / f"{symbol}_aggTrades_{year}.parquet"
+        for year in range(start.year, end.year + 1)
+    ]
+    year_spans = {
+        year: (max(start, date(year, 1, 1)), min(end, date(year, 12, 31)))
+        for year in range(start.year, end.year + 1)
+    }
+    previous_coverage: dict[str, Any] = {}
+    if info_path.is_file() and not args.force:
+        try:
+            with info_path.open("r", encoding="utf-8") as file:
+                cached_info = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            cached_info = {}
+        if (
+            isinstance(cached_info, dict)
+            and cached_info.get("data_type") == "aggTrades"
+            and cached_info.get("market") == market
+            and cached_info.get("symbol") == symbol
+            and cached_info.get("daily_gap_scan_version") == 1
+            and cached_info.get("agg_trade_integrity_version") == AGG_TRADES_INTEGRITY_VERSION
+            and isinstance(cached_info.get("parquet_year_coverage"), dict)
+        ):
+            previous_coverage = cached_info["parquet_year_coverage"]
+
+    def has_complete_year(year: int) -> bool:
+        """Return whether the audit record confirms a finished yearly file for the request."""
+        path = parquet_dir / f"{symbol}_aggTrades_{year}.parquet"
+        if not path.is_file():
+            return False
+        entry = previous_coverage.get(str(year))
+        if not isinstance(entry, dict) or entry.get("complete") is not True:
+            return False
+        fingerprint = entry.get("file_fingerprint")
+        stat = path.stat()
+        if fingerprint != {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}:
+            return False
+        try:
+            covered_start = date.fromisoformat(entry["start"])
+            covered_end = date.fromisoformat(entry["end"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        requested_start, requested_end = year_spans[year]
+        return covered_start <= requested_start and covered_end >= requested_end
+
+    pending_years = {year for year in year_spans if not has_complete_year(year)}
+    # Reused years must survive in the audit file: an interrupted run rebuilds only
+    # the pending years, and dropping the others would make the next run redo them.
+    reused_year_coverage = {
+        str(year): previous_coverage[str(year)]
+        for year in sorted(year_spans)
+        if year not in pending_years and isinstance(previous_coverage.get(str(year)), dict)
+    }
+    LOGGER.info(
+        "[%s aggTrades] Existing Parquet coverage checked: %d/%d year(s) reusable; pending years: %s",
+        symbol,
+        len(year_spans) - len(pending_years),
+        len(year_spans),
+        ", ".join(str(year) for year in sorted(pending_years)) or "none",
+    )
+    if not pending_years:
+        LOGGER.info(
+            "[%s aggTrades] Reusing existing yearly Parquet files: %s",
+            symbol,
+            ", ".join(str(path) for path in expected_parquet_paths),
+        )
+        return expected_parquet_paths[0]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    daily_zip_dir.mkdir(parents=True, exist_ok=True)
+    monthly_zip_dir.mkdir(parents=True, exist_ok=True)
+    info: dict[str, Any] = {
+        "schema_version": 1,
+        "daily_gap_scan_version": 1,
+        "agg_trade_integrity_version": AGG_TRADES_INTEGRITY_VERSION,
+        "data_source": "binance_vision",
+        "data_type": "aggTrades",
+        "market": market,
+        "symbol": symbol,
+        "interval": interval,
+        "dataset_start_date": start.isoformat(),
+        "dataset_end_date": end.isoformat(),
+        "download_dir": str(output_dir),
+        "daily_zip_dir": ZIP_DIRNAME,
+        "monthly_zip_dir": MONTHLY_ZIP_DIRNAME,
+        "parquet_files": [path.name for path in expected_parquet_paths],
+        "parquet_year_coverage": reused_year_coverage,
+        "scan_started_utc": utc_now_iso(),
+        "last_updated_utc": utc_now_iso(),
+        "source_files": {},
+    }
+    info_path.parent.mkdir(parents=True, exist_ok=True)
+    write_download_info(info_path, info)
+
+    counters = {
+        "monthly_cached": 0,
+        "monthly_downloaded": 0,
+        "monthly_missing": 0,
+        "daily_cached": 0,
+        "daily_downloaded": 0,
+        "daily_missing": 0,
+        "failed": 0,
+    }
+
+    def record_source(
+        key: str,
+        frequency: str,
+        status: str,
+        path: Path,
+        url: str,
+        error: Optional[str] = None,
+    ) -> None:
+        entry: dict[str, Any] = {
+            "frequency": frequency,
+            "status": status,
+            "file": str(path.relative_to(output_dir)),
+            "url": url,
+            "checked_at_utc": utc_now_iso(),
+        }
+        if path.exists():
+            entry["bytes"] = path.stat().st_size
+        if error:
+            entry["error"] = error
+        info["source_files"][key] = entry
+        info["last_updated_utc"] = utc_now_iso()
+        write_download_info(info_path, info)
+
+    builders: dict[int, AggTradeYearBuilder] = {}
+    raw_rows = 0
+    unavailable_dates: list[date] = []
+    active_minutes = load_active_kline_minutes(parquet_dir, symbol, start, end)
+
+    def write_parquet_table(year: int, table: pa.Table) -> None:
+        nonlocal raw_rows
+        if table.num_rows == 0:
+            return
+        raw_rows += table.num_rows
+        if year not in builders:
+            builders[year] = AggTradeYearBuilder(parquet_dir, symbol, year)
+        builders[year].append(table)
+
+    def consume_source(
+        key: str,
+        frequency: str,
+        path: Path,
+        url: str,
+        start_ms: int,
+        end_ms: int,
+        only_days: Optional[set[date]] = None,
+    ) -> Optional[set[date]]:
+        """Stream one archive into the yearly Parquet files; None means it is unavailable."""
+        temporary_path = path.with_suffix(path.suffix + ".temp")
+        cached = False
+        for candidate in (path, temporary_path):
+            if not candidate.is_file():
+                continue
+            try:
+                check_zip_path_integrity(candidate)
+            except ValueError as exc:
+                LOGGER.warning("Ignoring invalid cache: %s", exc)
+                continue
+            if candidate == temporary_path:
+                os.replace(temporary_path, path)
+            cached = True
+            counters[f"{frequency}_cached"] += 1
+            record_source(key, frequency, "cached", path, url)
+            LOGGER.info(
+                "[%s aggTrades] %s: reusing cached ZIP %s (%s)",
+                symbol,
+                key,
+                path.name,
+                format_byte_size(path.stat().st_size),
+            )
+            break
+
+        if not cached:
+            if args.offline:
+                counters[f"{frequency}_missing"] += 1
+                record_source(
+                    key,
+                    frequency,
+                    "unavailable_offline",
+                    path,
+                    url,
+                    "Archive is not present in the local cache and offline mode is enabled.",
+                )
+                LOGGER.warning(
+                    "[%s aggTrades] %s: unavailable locally; skipped because offline mode is enabled",
+                    symbol,
+                    key,
+                )
+                return None
+
+            if key in known_missing_sources:
+                counters[f"{frequency}_missing"] += 1
+                record_source(key, frequency, "missing", path, url)
+                LOGGER.info(
+                    "[%s aggTrades] %s: previously confirmed missing, skipping",
+                    symbol,
+                    key,
+                )
+                return None
+
+            LOGGER.info("[%s aggTrades] Downloading %s: %s", symbol, key, url)
+            content, error = download_agg_trades_zip(
+                session, url, label=f"{symbol} aggTrades {key}"
+            )
+            if content is None:
+                if error == "missing":
+                    counters[f"{frequency}_missing"] += 1
+                    record_source(key, frequency, "missing", path, url)
+                    LOGGER.info(
+                        "[%s aggTrades] %s: archive absent (HTTP 404), skipping",
+                        symbol,
+                        key,
+                    )
+                    return None
+                counters["failed"] += 1
+                record_source(key, frequency, "failed", path, url, error)
+                raise RuntimeError(f"[{symbol} aggTrades] Failed to download {url}: {error}")
+            write_zip_cache(path, content)
+            counters[f"{frequency}_downloaded"] += 1
+            record_source(key, frequency, "downloaded", path, url)
+            LOGGER.info(
+                "[%s aggTrades] %s: cached ZIP saved (%s)",
+                symbol,
+                key,
+                format_byte_size(path.stat().st_size),
+            )
+
+        source_bytes = path.stat().st_size
+        LOGGER.info(
+            "[%s aggTrades] %s: converting %s of CSV into Parquet",
+            symbol,
+            key,
+            format_byte_size(source_bytes),
+        )
+        progress = ArchiveConversionProgress(f"{symbol} aggTrades {key}")
+        written_days: set[date] = set()
+        for year, table, days in iter_agg_trades_tables(
+            path, str(path), start_ms, end_ms, only_days, progress=progress
+        ):
+            write_parquet_table(year, table)
+            if days is not None:
+                written_days.update(days.to_pylist())
+        rows, elapsed = progress.summary()
+        LOGGER.info(
+            "[%s aggTrades] %s: converted %s from %s in %s (%s rows/s)",
+            symbol,
+            key,
+            format_rows(rows),
+            format_byte_size(source_bytes),
+            format_duration(elapsed),
+            format_count(int(rows / elapsed)),
+        )
+        return written_days
+
+    def planned_payload_bytes(month: date) -> int:
+        """Return the cached archive bytes expected for one month, for progress estimates."""
+        first_day, last_day = month_bounds(month)
+        segment_start = max(start, first_day)
+        segment_end = min(end, last_day)
+        monthly_path = monthly_zip_dir / agg_trades_zip_filename(symbol, month, monthly=True)
+        complete_month = segment_start == first_day and segment_end == last_day
+        if complete_month and monthly_path.is_file():
+            return monthly_path.stat().st_size
+        return sum(
+            daily_path.stat().st_size
+            for daily_path in (
+                daily_zip_dir / agg_trades_zip_filename(symbol, day, monthly=False)
+                for day in date_range(segment_start, segment_end)
+            )
+            if daily_path.is_file()
+        )
+
+    def process_month(month: date) -> None:
+        """Convert every available archive of one month into the yearly Parquet files."""
+        first_day, last_day = month_bounds(month)
+        segment_start = max(start, first_day)
+        segment_end = min(end, last_day)
+        complete_month = segment_start == first_day and segment_end == last_day
+        segment_start_ms, segment_end_ms = day_window_ms(segment_start, segment_end)
+        monthly_path = monthly_zip_dir / agg_trades_zip_filename(symbol, month, monthly=True)
+        monthly_url = build_agg_trades_url(market, symbol, month, monthly=True)
+        monthly_key = f"monthly:{month_key(month)}"
+
+        monthly_unavailable = False
+        if complete_month:
+            monthly_days: Optional[set[date]] = None
+            has_local_daily_archives = any(
+                (daily_zip_dir / agg_trades_zip_filename(symbol, day, monthly=False)).is_file()
+                for day in date_range(segment_start, segment_end)
+            )
+            if monthly_path.is_file() and has_local_daily_archives:
+                try:
+                    LOGGER.info(
+                        "[%s aggTrades] Checking date coverage in cached %s before conversion",
+                        symbol,
+                        monthly_path.name,
+                    )
+                    monthly_days = inspect_agg_trades_archive_days(
+                        monthly_path, str(monthly_path)
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "[%s aggTrades] Could not inspect monthly archive dates (%s: %s); "
+                        "using normal monthly processing",
+                        symbol,
+                        type(exc).__name__,
+                        exc,
+                    )
+
+            if monthly_days is not None:
+                missing_days = [
+                    day for day in date_range(segment_start, segment_end)
+                    if day not in monthly_days
+                ]
+                if missing_days:
+                    LOGGER.warning(
+                        "[%s aggTrades] %s has no rows for %d day(s); "
+                        "using daily ZIPs for those dates and monthly ZIPs for the rest",
+                        symbol,
+                        monthly_key,
+                        len(missing_days),
+                    )
+                    missing_set = set(missing_days)
+                    run_start: Optional[date] = None
+                    run_days: set[date] = set()
+
+                    def flush_monthly_run() -> None:
+                        nonlocal run_start, run_days
+                        if run_start is None or not run_days:
+                            return
+                        run_end = max(run_days)
+                        run_start_ms, run_end_ms = day_window_ms(run_start, run_end)
+                        consume_source(
+                            monthly_key,
+                            "monthly",
+                            monthly_path,
+                            monthly_url,
+                            run_start_ms,
+                            run_end_ms,
+                            only_days=run_days,
+                        )
+                        run_start = None
+                        run_days = set()
+
+                    for day in date_range(segment_start, segment_end):
+                        if day in missing_set:
+                            flush_monthly_run()
+                            day_path = daily_zip_dir / agg_trades_zip_filename(
+                                symbol, day, monthly=False
+                            )
+                            day_url = build_agg_trades_url(
+                                market, symbol, day, monthly=False
+                            )
+                            day_start_ms, day_end_ms = day_window_ms(day, day)
+                            daily_key = f"daily:{day.isoformat()}"
+                            daily_days = consume_source(
+                                daily_key,
+                                "daily",
+                                day_path,
+                                day_url,
+                                day_start_ms,
+                                day_end_ms,
+                            )
+                            if daily_days is None:
+                                unavailable_dates.append(day)
+                                continue
+                            info["source_files"][daily_key]["checked_for_monthly_gap"] = monthly_key
+                            if day in daily_days:
+                                info["source_files"][daily_key]["status"] = "filled_from_daily"
+                                info["source_files"][monthly_key].setdefault(
+                                    "recovered_from_daily", []
+                                ).append(day.isoformat())
+                            continue
+
+                        if run_start is None:
+                            run_start = day
+                        run_days.add(day)
+
+                    flush_monthly_run()
+                    info["source_files"][monthly_key]["dates_without_rows"] = [
+                        day.isoformat() for day in missing_days
+                    ]
+                    write_download_info(info_path, info)
+                    return
+
+            written_days = consume_source(
+                monthly_key,
+                "monthly",
+                monthly_path,
+                monthly_url,
+                segment_start_ms,
+                segment_end_ms,
+            )
+            if written_days is not None:
+                return
+            monthly_unavailable = True
+
+        missing_days: list[date] = []
+        for day in date_range(segment_start, segment_end):
+            day_path = daily_zip_dir / agg_trades_zip_filename(symbol, day, monthly=False)
+            day_url = build_agg_trades_url(market, symbol, day, monthly=False)
+            day_start_ms, day_end_ms = day_window_ms(day, day)
+            written_days = consume_source(
+                f"daily:{day.isoformat()}",
+                "daily",
+                day_path,
+                day_url,
+                day_start_ms,
+                day_end_ms,
+            )
+            if written_days is not None:
+                continue
+            missing_days.append(day)
+            if args.show_missing:
+                LOGGER.warning("[%s aggTrades] Daily archive missing: %s", symbol, day)
+
+        if not missing_days:
+            return
+
+        if monthly_unavailable:
+            filled_days: set[date] = set()
+        else:
+            filled_days = consume_source(
+                monthly_key,
+                "monthly",
+                monthly_path,
+                monthly_url,
+                segment_start_ms,
+                segment_end_ms,
+                only_days=set(missing_days),
+            ) or set()
+
+        for missing_day in missing_days:
+            if missing_day not in filled_days:
+                unavailable_dates.append(missing_day)
+                continue
+            source_key = f"daily:{missing_day.isoformat()}"
+            info["source_files"][source_key]["status"] = "filled_from_monthly"
+            info["source_files"][source_key]["daily_archive_status"] = "missing"
+            info["source_files"][source_key]["fallback_source"] = monthly_key
+        write_download_info(info_path, info)
+
+    planned_months = [
+        month for month in iter_month_starts(start, end) if month.year in pending_years
+    ]
+    planned_bytes = {month: planned_payload_bytes(month) for month in planned_months}
+    total_payload_bytes = sum(planned_bytes.values())
+    reused_years = sorted(year for year in year_spans if year not in pending_years)
+
+    LOGGER.info("=" * 80)
+    LOGGER.info("[%s aggTrades] Binance Vision aggregate-trade downloader", symbol)
+    LOGGER.info(
+        "[%s aggTrades] Scan range     : %s -> %s UTC (%d days)",
+        symbol,
+        start,
+        end,
+        (end - start).days + 1,
+    )
+    LOGGER.info(
+        "[%s aggTrades] Pending years  : %s",
+        symbol,
+        ", ".join(str(year) for year in sorted(pending_years)),
+    )
+    if reused_years:
+        LOGGER.info(
+            "[%s aggTrades] Reused years   : %s",
+            symbol,
+            ", ".join(str(year) for year in reused_years),
+        )
+    LOGGER.info(
+        "[%s aggTrades] Pending months : %d (cached ZIP payload %s)",
+        symbol,
+        len(planned_months),
+        format_byte_size(total_payload_bytes),
+    )
+    LOGGER.info("[%s aggTrades] Monthly cache  : %s", symbol, monthly_zip_dir)
+    LOGGER.info("[%s aggTrades] Daily cache    : %s", symbol, daily_zip_dir)
+    LOGGER.info("[%s aggTrades] Yearly Parquet : %s", symbol, parquet_dir)
+    LOGGER.info("=" * 80)
+
+    completed_year_coverage: dict[str, Any] = dict(reused_year_coverage)
+    last_month_of_year: dict[int, date] = {}
+    for planned_month in planned_months:
+        last_month_of_year[planned_month.year] = planned_month
+
+    def finalise_year(year: int) -> None:
+        """Repair local gaps, deduplicate, sort and publish a finished year."""
+        if year not in builders:
+            builders[year] = AggTradeYearBuilder(parquet_dir, symbol, year)
+        builder = builders[year]
+        span_start, span_end = year_spans[year]
+        start_ms, end_ms = day_window_ms(span_start, span_end)
+        expected_minutes = {
+            minute for minute in active_minutes if start_ms <= minute * 60_000 < end_ms
+        }
+        previous = None
+        if year > start.year:
+            prior_path = parquet_dir / f"{symbol}_aggTrades_{year - 1}.parquet"
+            if prior_path.is_file():
+                prior = parquet.ParquetFile(prior_path)
+                if prior.metadata.num_rows:
+                    last = prior.read_row_group(
+                        prior.num_row_groups - 1,
+                        columns=["agg_trade_id", "transact_time_ms_utc"],
+                    )
+                    previous = (
+                        int(last["agg_trade_id"][-1].as_py()),
+                        int(last["transact_time_ms_utc"][-1].as_py()),
+                    )
+        initial = builder.inspect(span_start, span_end, expected_minutes, previous)
+        repair_days = {date.fromisoformat(day) for day in initial["missing_dates"]}
+        repair_days.update(
+            datetime.fromtimestamp(minute * 60, timezone.utc).date()
+            for minute in initial["missing_kline_minutes"]
+        )
+        for gap in initial["id_gaps"]:
+            first = datetime.fromtimestamp(gap["before_ms"] / 1000, timezone.utc).date()
+            last = datetime.fromtimestamp(gap["after_ms"] / 1000, timezone.utc).date()
+            repair_days.update(date_range(max(first, span_start), min(last, span_end)))
+        repair_sources = []
+        for day in sorted(repair_days):
+            path = daily_zip_dir / agg_trades_zip_filename(symbol, day, monthly=False)
+            temporary_path = path.with_suffix(path.suffix + ".temp")
+            local_path = path if path.is_file() else temporary_path
+            if not local_path.is_file():
+                LOGGER.info(
+                    "[%s aggTrades] %s: no local daily ZIP for gap recovery", symbol, day,
+                )
+                continue
+            LOGGER.info(
+                "[%s aggTrades] %s: supplementing gaps from local daily ZIP %s",
+                symbol, day, local_path.name,
+            )
+            day_start_ms, day_end_ms = day_window_ms(day, day)
+            for table_year, table, _ in iter_agg_trades_tables(
+                local_path, str(local_path), day_start_ms, day_end_ms,
+            ):
+                if table_year != year:
+                    raise ValueError(f"Unexpected year in local daily ZIP {local_path}")
+                write_parquet_table(year, table)
+            repair_sources.append(str(local_path.relative_to(output_dir)))
+
+        integrity = builder.inspect(span_start, span_end, expected_minutes, previous)
+        complete = not (
+            integrity["id_gaps"] or integrity["missing_dates"]
+            or integrity["missing_kline_minutes"]
+        )
+        stats = builder.publish()
+        path = builder.path
+        builder.cleanup()
+        del builders[year]
+        unavailable_dates[:] = [day for day in unavailable_dates if day.year != year]
+        unavailable_dates.extend(date.fromisoformat(day) for day in integrity["missing_dates"])
+        for gap in integrity["id_gaps"]:
+            LOGGER.warning(
+                "[%s aggTrades] Final year %d has an unresolved ID gap: %d missing IDs "
+                "(%d..%d), %s -> %s UTC; local daily recovery exhausted",
+                symbol, year, gap["missing_ids"], gap["before_id"] + 1,
+                gap["after_id"] - 1,
+                datetime.fromtimestamp(gap["before_ms"] / 1000, timezone.utc).isoformat(),
+                datetime.fromtimestamp(gap["after_ms"] / 1000, timezone.utc).isoformat(),
+            )
+        if integrity["missing_dates"]:
+            LOGGER.warning(
+                "[%s aggTrades] Final year %d has dates with no records: %s",
+                symbol, year, ", ".join(integrity["missing_dates"]),
+            )
+        if integrity["missing_kline_minutes"]:
+            LOGGER.warning(
+                "[%s aggTrades] Final year %d has %d minute(s) with trades in local "
+                "1m klines but no aggTrades; first=%s UTC, last=%s UTC; "
+                "see missing_kline_minutes in download_info.json",
+                symbol, year, len(integrity["missing_kline_minutes"]),
+                datetime.fromtimestamp(integrity["missing_kline_minutes"][0] * 60, timezone.utc).isoformat(),
+                datetime.fromtimestamp(integrity["missing_kline_minutes"][-1] * 60, timezone.utc).isoformat(),
+            )
+        stat = path.stat()
+        completed_year_coverage[str(year)] = {
+            "start": span_start.isoformat(),
+            "end": span_end.isoformat(),
+            "complete": complete,
+            **stats,
+            **integrity,
+            "local_daily_recovery_sources": repair_sources,
+            "recovered_missing_ids": (
+                sum(gap["missing_ids"] for gap in initial["id_gaps"])
+                - sum(gap["missing_ids"] for gap in integrity["id_gaps"])
+            ),
+            "file_fingerprint": {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns},
+        }
+        info["parquet_year_coverage"] = {
+            key: completed_year_coverage[key] for key in sorted(completed_year_coverage)
+        }
+        info["last_updated_utc"] = utc_now_iso()
+        write_download_info(info_path, info)
+        LOGGER.info(
+            "[%s aggTrades] year %d finalised: %s in %s; %s duplicate rows removed (%s)",
+            symbol,
+            year,
+            format_rows(parquet.ParquetFile(path).metadata.num_rows),
+            format_byte_size(path.stat().st_size),
+            format_count(stats["duplicates_removed"]),
+            "coverage complete" if complete else "gaps recorded",
+        )
+
+    conversion_started_at = time.monotonic()
+    processed_payload_bytes = 0
+    for index, month in enumerate(planned_months, start=1):
+        month_started_at = time.monotonic()
+        month_bytes = planned_bytes[month]
+        LOGGER.info(
+            "[%s aggTrades] month %d/%d %s: starting (archive payload %s, %s converted so far)",
+            symbol,
+            index,
+            len(planned_months),
+            month_key(month),
+            format_byte_size(month_bytes),
+            format_byte_size(processed_payload_bytes),
+        )
+        try:
+            process_month(month)
+            if month == last_month_of_year.get(month.year):
+                finalise_year(month.year)
+        except BaseException:
+            for builder in builders.values():
+                builder.cleanup()
+            raise
+
+        processed_payload_bytes += month_bytes
+        elapsed_month = max(time.monotonic() - month_started_at, 1e-9)
+        if not total_payload_bytes:
+            LOGGER.info(
+                "[%s aggTrades] month %d/%d %s: done in %s (%s written)",
+                symbol,
+                index,
+                len(planned_months),
+                month_key(month),
+                format_duration(elapsed_month),
+                format_rows(raw_rows),
+            )
+            continue
+
+        elapsed_total = max(time.monotonic() - conversion_started_at, 1e-9)
+        speed = processed_payload_bytes / elapsed_total
+        remaining_bytes = max(total_payload_bytes - processed_payload_bytes, 0)
+        if not remaining_bytes:
+            eta_text = "complete"
+        elif index >= 2 and speed > 0:
+            eta_text = format_duration(remaining_bytes / speed)
+        else:
+            eta_text = "unknown"
+        LOGGER.info(
+            "[%s aggTrades] month %d/%d %s: done in %s (%s written); "
+            "payload %s/%s (%.0f%%), average %s/s, ETA %s",
+            symbol,
+            index,
+            len(planned_months),
+            month_key(month),
+            format_duration(elapsed_month),
+            format_rows(raw_rows),
+            format_byte_size(processed_payload_bytes),
+            format_byte_size(total_payload_bytes),
+            100.0 * processed_payload_bytes / total_payload_bytes,
+            format_byte_size(speed),
+            eta_text,
+        )
+
+    if counters["failed"]:
+        raise RuntimeError(f"Source download/read failures={counters['failed']}")
+
+    info["unavailable_dates"] = [day.isoformat() for day in sorted(set(unavailable_dates))]
+
+    available_paths = [path for path in expected_parquet_paths if path.is_file()]
+    if not available_paths:
+        info.update({
+            "final_rows": 0,
+            "last_updated_utc": utc_now_iso(),
+            "summary": {**counters, "complete": False},
+        })
+        write_download_info(info_path, info)
+        LOGGER.warning("[%s aggTrades] No data found for %s through %s", symbol, start, end)
+        return None
+
+    year_coverage: dict[str, Any] = dict(completed_year_coverage)
+    final_rows = sum(
+        parquet.ParquetFile(path).metadata.num_rows for path in available_paths
+    )
+    info.update({
+        "market_data_paths": [str(path) for path in available_paths],
+        "parquet_year_coverage": {key: year_coverage[key] for key in sorted(year_coverage)},
+        "raw_rows": raw_rows,
+        "final_rows": final_rows,
+        "last_updated_utc": utc_now_iso(),
+        "summary": {
+            **counters,
+            "unavailable_dates": len(info["unavailable_dates"]),
+            "unresolved_id_gaps": sum(len(entry.get("id_gaps", [])) for entry in year_coverage.values()),
+            "missing_ids": sum(
+                gap["missing_ids"] for entry in year_coverage.values()
+                for gap in entry.get("id_gaps", [])
+            ),
+            "duplicates_removed": sum(entry.get("duplicates_removed", 0) for entry in year_coverage.values()),
+            "complete": not unavailable_dates and all(
+                isinstance(year_coverage.get(str(year)), dict)
+                and year_coverage[str(year)].get("complete") is True
+                for year in year_spans
+            ),
+        },
+    })
+    write_download_info(info_path, info)
+
+    LOGGER.info(
+        "[%s aggTrades] Yearly Parquet files contain %s rows: %s",
+        symbol,
+        final_rows,
+        ", ".join(str(path) for path in available_paths),
+    )
+    return available_paths[0]
 
 
 def build_daily_url(market: str, symbol: str, interval: str, d: date) -> str:
@@ -834,6 +2240,10 @@ def download_symbol_interval(
                 os.replace(temporary_path, path)
             counters[f"{frequency}_cached"] += 1
             record_source(key, frequency=frequency, status="cached", path=path, url=url)
+            LOGGER.info(
+                f"[{symbol} {interval}] {key}: reusing cached ZIP "
+                f"{path.name} ({len(rows)} candles)"
+            )
             return rows, None
 
         if key in known_missing_sources:
@@ -1324,10 +2734,16 @@ def download_funding_rate(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Download Binance Vision monthly-first kline ZIP files and merge them."
+        description="Download Binance Vision kline or aggTrades ZIP files and merge them."
     )
     parser.add_argument("--market", choices=VALID_MARKETS.keys(), default="um",
                         help="Market: spot, um=USDⓈ-M futures, cm=COIN-M futures. Default: um")
+    parser.add_argument(
+        "--data-type",
+        choices=("klines", "aggTrades"),
+        default="klines",
+        help="Dataset to download. Default: klines.",
+    )
     parser.add_argument(
         "--symbols",
         "--symbol",
@@ -1357,11 +2773,27 @@ def main() -> int:
         help="End day UTC, YYYY-MM-DD. Default: latest completed UTC day (yesterday).",
     )
     parser.add_argument(
+        "--skip-start-date-discovery",
+        action="store_true",
+        help=(
+            "For aggTrades, skip the Binance Vision S3 earliest-date lookup and "
+            "infer the start from local ZIP caches (market fallback if none exist)."
+        ),
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help=(
+            "Use only local ZIP caches, skip Binance requests and earliest-date discovery, "
+            "and mark unavailable archives in the download audit."
+        ),
+    )
+    parser.add_argument(
         "--out-dir",
         "--dir",
         dest="out_dir",
         default=str(Path(__file__).resolve().parent / "data"),
-        help="ZIP cache and audit directory. Resume automatically from existing ZIPs under <dir>/<market>/<symbol>/<interval>/. Validated CSV files are moved to common.market_data_path().",
+        help="ZIP cache and audit directory. Resume from existing ZIPs under <dir>/<market>/<symbol>/<interval-or-data-type>/. K-lines use CSV; aggTrades use yearly Parquet files.",
     )
     parser.add_argument("--show-missing", action="store_true", help="Print every missing ZIP URL/date, not only summary.")
     parser.add_argument(
@@ -1394,54 +2826,70 @@ def main() -> int:
                 mapped_symbol,
             )
     intervals = list(dict.fromkeys(args.intervals))
-    total_tasks = len(symbols) * len(intervals)
+    total_tasks = (
+        len(symbols)
+        if args.data_type == "aggTrades"
+        else len(symbols) * len(intervals)
+    )
 
     succeeded = 0
     failures: list[tuple[str, str, str]] = []
     funding_succeeded = 0
     funding_failures: list[tuple[str, str]] = []
     with make_session() as session:
-        funding_api_limiter = FundingApiLimiter()
-        task_number = 0
-        for symbol in symbols:
-            no_kline_archives = False
-            for interval in intervals:
-                task_number += 1
-                LOGGER.info(f"\n[Task {task_number}/{total_tasks}] {symbol} {interval}")
-                if no_kline_archives:
-                    reason = "No daily archives found for this market symbol; remaining intervals skipped"
-                    failures.append((symbol, interval, reason))
-                    LOGGER.error(f"Failed {symbol} {interval}: {reason}")
-                    continue
+        if args.data_type == "aggTrades":
+            for task_number, symbol in enumerate(symbols, start=1):
+                LOGGER.info(f"\n[Task {task_number}/{total_tasks}] {symbol} aggTrades")
                 try:
-                    download_symbol_interval(args, session, symbol, interval)
+                    download_symbol_agg_trades(args, session, symbol)
                     succeeded += 1
                 except Exception as exc:
                     reason = f"{type(exc).__name__}: {exc}"
-                    failures.append((symbol, interval, reason))
-                    LOGGER.error(f"Failed {symbol} {interval}: {reason}")
-                    no_kline_archives = isinstance(exc, NoArchiveError)
-            if no_kline_archives:
-                if args.market in {"um", "cm"} and not args.no_funding_rate:
-                    reason = "No K-line archives found for this market symbol; funding download skipped"
-                    funding_failures.append((symbol, reason))
-                    LOGGER.error(f"Failed {symbol} fundingRate: {reason}")
-            elif args.market in {"um", "cm"} and not args.no_funding_rate:
-                try:
-                    download_funding_rate(args, session, symbol, funding_api_limiter)
-                    funding_succeeded += 1
-                except Exception as exc:
-                    reason = f"{type(exc).__name__}: {exc}"
-                    funding_failures.append((symbol, reason))
-                    LOGGER.error(f"Failed {symbol} fundingRate: {reason}")
+                    failures.append((symbol, "aggTrades", reason))
+                    LOGGER.error(f"Failed {symbol} aggTrades: {reason}")
+        else:
+            funding_api_limiter = FundingApiLimiter()
+            task_number = 0
+            for symbol in symbols:
+                no_kline_archives = False
+                for interval in intervals:
+                    task_number += 1
+                    LOGGER.info(f"\n[Task {task_number}/{total_tasks}] {symbol} {interval}")
+                    if no_kline_archives:
+                        reason = "No daily archives found for this market symbol; remaining intervals skipped"
+                        failures.append((symbol, interval, reason))
+                        LOGGER.error(f"Failed {symbol} {interval}: {reason}")
+                        continue
+                    try:
+                        download_symbol_interval(args, session, symbol, interval)
+                        succeeded += 1
+                    except Exception as exc:
+                        reason = f"{type(exc).__name__}: {exc}"
+                        failures.append((symbol, interval, reason))
+                        LOGGER.error(f"Failed {symbol} {interval}: {reason}")
+                        no_kline_archives = isinstance(exc, NoArchiveError)
+                if no_kline_archives:
+                    if args.market in {"um", "cm"} and not args.no_funding_rate:
+                        reason = "No K-line archives found for this market symbol; funding download skipped"
+                        funding_failures.append((symbol, reason))
+                        LOGGER.error(f"Failed {symbol} fundingRate: {reason}")
+                elif args.market in {"um", "cm"} and not args.no_funding_rate:
+                    try:
+                        download_funding_rate(args, session, symbol, funding_api_limiter)
+                        funding_succeeded += 1
+                    except Exception as exc:
+                        reason = f"{type(exc).__name__}: {exc}"
+                        funding_failures.append((symbol, reason))
+                        LOGGER.error(f"Failed {symbol} fundingRate: {reason}")
 
     LOGGER.info("\n" + "=" * 80)
     LOGGER.info("All download tasks finished")
-    LOGGER.info(f"K-line tasks: total={total_tasks}, succeeded={succeeded}, failed={len(failures)}")
+    task_label = "aggTrades" if args.data_type == "aggTrades" else "K-line"
+    LOGGER.info(f"{task_label} tasks: total={total_tasks}, succeeded={succeeded}, failed={len(failures)}")
     LOGGER.info("Existing output CSVs reused without --force count as succeeded.")
     for symbol, interval, reason in failures:
         LOGGER.error(f"  Failed {symbol} {interval}: {reason}")
-    if args.market in {"um", "cm"} and not args.no_funding_rate:
+    if args.data_type == "klines" and args.market in {"um", "cm"} and not args.no_funding_rate:
         LOGGER.info(
             f"Funding rate tasks: total={len(symbols)}, "
             f"succeeded={funding_succeeded}, failed={len(funding_failures)}"

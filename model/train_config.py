@@ -48,6 +48,8 @@ class BaseModelConfig:
 class TrainTask:
     DIRECT_3CLASS = "DIRECT_3CLASS"
     REGRESSION = "REGRESSION"
+    MARTINGALE_REGRESSION = "MARTINGALE_REGRESSION"
+    MARTINGALE_BINARY = "MARTINGALE_BINARY"
     DUAL_HEAD_3CLASS = "DUAL_HEAD_3CLASS"
     TRIGGER_DIRECTION = "TRIGGER_DIRECTION"
     LONG_SHORT_OVR = "LONG_SHORT_OVR"
@@ -57,7 +59,8 @@ class TrainTask:
     LONG_OVR = "LONG_OVR"
     SHORT_OVR = "SHORT_OVR"
 
-    BINARY_TASKS = {TRIGGER, DIRECTION, LONG_OVR, SHORT_OVR}
+    REGRESSION_TASKS = {REGRESSION, MARTINGALE_REGRESSION}
+    BINARY_TASKS = {TRIGGER, DIRECTION, LONG_OVR, SHORT_OVR, MARTINGALE_BINARY}
     COMBO_TASKS = {TRIGGER_DIRECTION, LONG_SHORT_OVR}
 
 
@@ -101,6 +104,31 @@ class TransformerConfig(BaseModelConfig):
     head: str = "linear"
     ffn_type: str = "swiglu"
     use_feature_weighting: bool = False
+
+
+@dataclass
+class RidgeRegressionConfig(BaseModelConfig):
+    seq_len: int = 32
+    model_type: str = "ridge_regression"
+    model_version: int = 1
+    alpha: float = 10.0
+    solver: str = "lsqr"
+    max_iter: int = 1000
+    tol: float = 1e-3
+    use_scaler: bool = True
+
+
+@dataclass
+class TransformerV1RegressionConfig(BaseModelConfig):
+    seq_len: int = 32
+    model_type: str = "transformer"
+    model_version: int = 1
+    d_model: int = 64
+    nhead: int = 8
+    num_layers: int = 2
+    dim_feedforward: int = 512
+    dropout: float = 0.3
+    local_kernel_size: int = 3
 
 
 @dataclass
@@ -264,10 +292,23 @@ class TrainConfig:
     label_smoothing: float = 0.02
     train_compatibility: str = ""
     train_task: str = TrainTask.REGRESSION
+    max_layers: Optional[int] = None
+    breach_positive: bool = False
 
     def __post_init__(self):
+        if self.train_task == TrainTask.MARTINGALE_BINARY:
+            if self.max_layers not in (2, 3, 4, 5, 6):
+                raise ValueError("MARTINGALE_BINARY max_layers must be 2, 3, 4, 5, or 6")
+            if self.selection_metric != "loss":
+                raise ValueError("MARTINGALE_BINARY requires loss selection")
+            if self.minority_sampling_ratio is not None:
+                raise ValueError("MARTINGALE_BINARY does not support class resampling")
+            if isinstance(self.model_cfg, XGBoostConfig):
+                self.model_cfg.eval_metric = "logloss"
         if self.selection_metric not in {"mae", "macro_f1", "loss"}:
             raise ValueError("selection_metric must be 'mae', 'macro_f1', or 'loss'")
+        if self.train_task == TrainTask.MARTINGALE_REGRESSION and self.selection_metric == "macro_f1":
+            raise ValueError("MARTINGALE_REGRESSION does not support macro_f1 selection")
         if self.epochs <= 0 or self.batch_size <= 0 or self.patience <= 0:
             raise ValueError("epochs, batch_size and patience must be positive")
         if self.minority_sampling_ratio is not None and not 0 < self.minority_sampling_ratio < 0.5:
@@ -316,7 +357,7 @@ TriggerModel = TrainConfig(
 )
 
 DirectionModel = TrainConfig(
-    model_cfg=XGBoostConfig(seq_len=32 , xgb_depth = 3, xgb_estimators =500, model_version=1,
+    model_cfg=XGBoostConfig(seq_len=32 , xgb_depth = 2, xgb_estimators =500, model_version=1,
                              learning_rate=0.002,subsample=0.8, colsample_bytree=0.7, reg_lambda=10, 
                               reg_alpha=0 ),
     feature_conf_list=None,#feature.FEATURE_LIST_CRYPTOCURRENCY,

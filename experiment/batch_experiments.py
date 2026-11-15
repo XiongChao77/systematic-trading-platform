@@ -738,12 +738,14 @@ def _train_task(
         # Single model mode (DIRECT_3CLASS/LONG_OVR/...) and the combo_model sub-model mode share one
         # worker: which task is trained is decided by the train_task field of the TrainConfig itself
         # tagged every row when it was built), nothing is hard coded to one task type here.
-        result = train.train(
+        result = train.train_windows(
             logger=logger,
-            config=t_cfg,
+            configs=[t_cfg],
             prep_output_dir=prep_output_dir,
             save_dir=save_dir,
         )
+        # Batch fusion and static backtests consume the one window's model artifact.
+        save_dir = os.path.join(save_dir, result["folds"][0]["model_dir"])
 
         if sim_tasks:
             # Re-load the just-saved checkpoint in this same training process. If CUDA

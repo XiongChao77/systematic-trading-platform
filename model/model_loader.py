@@ -15,6 +15,8 @@ from model.models.fusion_wrapper import (
     FusionWrapper,
 )
 from model.train_config import *
+from model.evaluator import evaluate_numeric_regression, evaluate_classification
+from model.training_types import PredictionResult
 # -----------------------------------------------------------------------------
 # Encapsulated Model Handler
 # -----------------------------------------------------------------------------
@@ -92,11 +94,12 @@ class ModelHandler(MetaConfig):
         if self.task_type in TrainTask.COMBO_TASKS:
             # produced by save_fusion_run: "models": {role: relative_dir_to_a_save_single_run_output}
             self._load_fusion_mode()
+        elif self.task_type == TrainTask.MARTINGALE_BINARY:
+            self._load_martingale_binary_mode()
         elif self.task_type in TrainTask.BINARY_TASKS:
             # produced by save_single_run for a lone TRIGGER/DIRECTION/LONG_OVR/SHORT_OVR model
             self._load_binary_mode()
-        elif self.task_type in (
-            TrainTask.REGRESSION,
+        elif self.task_type in TrainTask.REGRESSION_TASKS or self.task_type in (
             TrainTask.DIRECT_3CLASS,
             TrainTask.DUAL_HEAD_3CLASS,
         ):
@@ -124,12 +127,27 @@ class ModelHandler(MetaConfig):
             device=self.device
         )
         raw_model.eval()
-        if self.task_type == TrainTask.REGRESSION:
+        if self.task_type in TrainTask.REGRESSION_TASKS:
             self.model = raw_model
         elif self.task_type == TrainTask.DIRECT_3CLASS:
             self.model = DirectThreeClassInferenceWrapper(raw_model)
         else:
             self.model = DualHeadInferenceWrapper(raw_model)
+        self.model.to(self.device)
+        self.model.eval()
+
+    def _load_martingale_binary_mode(self):
+        files = self.task_desc["models"]["main"]
+        meta_path = os.path.join(self.base_dir, files["meta"])
+        with open(meta_path, "r", encoding="utf-8") as handle:
+            meta = json.load(handle)
+        self._init_config_from_meta(meta)
+        self.max_layers = meta["task_configuration"]["max_layers"]
+        self.breach_positive = meta["task_configuration"]["positive_class"] == "breach"
+        self.model, _ = ModelFactory.load_from_checkpoint(
+            model_path=os.path.join(self.base_dir, files["model"]),
+            meta_path=meta_path, device=self.device,
+        )
         self.model.to(self.device)
         self.model.eval()
 
@@ -381,14 +399,26 @@ class ModelHandler(MetaConfig):
 
             fused_rows = stage_frame[["pred", self.label_col]].dropna()
             stage_result["predicted_count"] = int(len(fused_rows))
-            stage_result["fused"] = (
-                self.evaluate_performance(
+            if fused_rows.empty:
+                stage_result["fused"] = {}
+            elif self.task_type == TrainTask.MARTINGALE_BINARY:
+                rows = self._martingale_evaluation_rows(stage_frame)
+                stage_result["predicted_count"] = int(len(rows))
+                stage_result["fused"] = self._martingale_binary_metrics(rows)
+            elif self.task_type == TrainTask.MARTINGALE_REGRESSION:
+                stage_result["fused"] = evaluate_numeric_regression(
+                    PredictionResult(
+                        y_true=fused_rows[self.label_col].to_numpy(),
+                        probabilities=None,
+                        predictions=fused_rows["pred"].to_numpy(),
+                    ),
+                    list(range(10)),
+                )
+            else:
+                stage_result["fused"] = self.evaluate_performance(
                     fused_rows[self.label_col].astype(int).to_numpy(),
                     fused_rows["pred"].astype(int).to_numpy(),
                 )
-                if not fused_rows.empty
-                else {}
-            )
 
             sub_models = {}
             for column in sub_model_pred_columns:
@@ -411,8 +441,6 @@ class ModelHandler(MetaConfig):
                     "sample_count": int(mask.sum()),
                     **stats,
                 }
-            from model.train_config import TrainTask
-
             trigger_columns = [
                 column for column in sub_model_pred_columns
                 if self.sub_model_task_type[column[len("sub_") : -len("_pred")]]
@@ -482,7 +510,16 @@ class ModelHandler(MetaConfig):
         by component.
         Rows without a valid window stay NaN. It is empty for single models.
         """
+        if self.task_type == TrainTask.MARTINGALE_BINARY:
+            if diff_thresh is not None:
+                raise ValueError("Signal thresholds are not supported for martingale probabilities")
+            frame, stats = self.predict_raw_probabilities_with_ds(ds, df, is_live, batch_size)
+            return frame, stats, {}, pd.DataFrame(index=df.index)
         self.logger.info(f"Starting inference pipeline (Mode={'Live' if is_live else 'Backtest'}, diff_thresh={diff_thresh})...")
+        is_regression = self.task_type in TrainTask.REGRESSION_TASKS
+        is_numeric_regression = self.task_type == TrainTask.MARTINGALE_REGRESSION
+        if is_regression and diff_thresh is not None:
+            raise ValueError("diff_thresh is a probability threshold and is not supported for regression scores")
         self._validate_inference_dataset(ds)
         # Check whether any valid windows were generated (may be dropped if too short or discontinuous)
         if len(ds) == 0:
@@ -495,9 +532,6 @@ class ModelHandler(MetaConfig):
         self.logger.info(f"Dataset created. Valid windows: {len(ds)}")
 
         # 2. Inference loop (logits -> probabilities)
-        is_regression = self.task_type == TrainTask.REGRESSION
-        if is_regression and diff_thresh is not None:
-            raise ValueError("diff_thresh is a probability threshold and is not supported for regression scores")
         probs_list = []
         direction_preds_list = []
         collected = {name: ([], []) for name in self.loaded_sub_models} if evaluate_sub_models else {}
@@ -535,7 +569,12 @@ class ModelHandler(MetaConfig):
         probs_all = np.concatenate(probs_list)
         regression_scores = probs_all.reshape(-1) if is_regression else None
         if is_regression:
-            final_pred = _decode_regression_scores(regression_scores)
+            if is_numeric_regression:
+                if not np.isfinite(regression_scores).all():
+                    raise ValueError("Regression model produced non-finite numeric scores")
+                final_pred = regression_scores
+            else:
+                final_pred = _decode_regression_scores(regression_scores)
             final_conf = np.full(len(final_pred), np.nan)
             p_short = p_neutral = p_long = np.full(len(final_pred), np.nan)
             net_score = regression_scores
@@ -605,12 +644,23 @@ class ModelHandler(MetaConfig):
             # Only evaluate rows that have both predictions and labels
             df_valid = df_out[['pred', self.label_col]].dropna()
             if not df_valid.empty:
-                y_true = df_valid[self.label_col].values.astype(int)
-                y_pred = df_valid['pred'].values.astype(int)
-                stats = self.evaluate_performance(y_true, y_pred)
-                self.logger.info("\n" + classification_report(y_true, y_pred, digits=4, zero_division=0))
-                self._log_performance_summary(stats)
-                self.logger.info(f"Label distribution (true): {stats.get('label_proportions_true', {})}")
+                if is_numeric_regression:
+                    stats = evaluate_numeric_regression(
+                        PredictionResult(
+                            y_true=df_valid[self.label_col].to_numpy(),
+                            probabilities=None,
+                            predictions=df_valid['pred'].to_numpy(),
+                        ),
+                        list(range(10)),
+                    )
+                    self.logger.info("Numeric regression metrics: %s", stats)
+                else:
+                    y_true = df_valid[self.label_col].values.astype(int)
+                    y_pred = df_valid['pred'].values.astype(int)
+                    stats = self.evaluate_performance(y_true, y_pred)
+                    self.logger.info("\n" + classification_report(y_true, y_pred, digits=4, zero_division=0))
+                    self._log_performance_summary(stats)
+                    self.logger.info(f"Label distribution (true): {stats.get('label_proportions_true', {})}")
         stats['feature_config'] = self.raw_config
         stats['feature_cols']   = self.feature_cols
         self.logger.info(f"Inference complete. Valid signals: {len(final_pred)}")
@@ -620,6 +670,56 @@ class ModelHandler(MetaConfig):
             self._sub_model_metrics(collected),
             sub_model_predictions,
         )
+
+    def predict_raw_probabilities_with_ds(self, ds, df, is_live=False, batch_size=512):
+        """Predict survival probabilities without adapting them to trading signals."""
+        if self.task_type != TrainTask.MARTINGALE_BINARY:
+            raise ValueError("Raw survival probabilities require MARTINGALE_BINARY")
+        self._validate_inference_dataset(ds)
+        frame = df.copy()
+        for column in ["pred", "direction_pred", "pred_prob", "prob_short", "prob_neutral",
+                       "prob_long", "net_score", "regression_score",
+                       "survival_probability", "breach_probability"]:
+            frame[column] = np.nan
+        stats = {"feature_config": self.raw_config, "feature_cols": self.feature_cols}
+        batches = []
+        self.model.eval()
+        with torch.no_grad():
+            for inputs, _, _ in self._inference_batches(ds, batch_size):
+                logits = self.model(inputs.to(self.device))
+                batches.append(torch.softmax(logits.float(), dim=1).cpu().numpy())
+        if not batches:
+            return frame, stats
+        probabilities = np.concatenate(batches)
+        if probabilities.shape != (len(ds), 2) or not np.isfinite(probabilities).all():
+            raise ValueError("Martingale model must produce finite binary probabilities")
+        indices = [df.index[-1]] if is_live else ds.indices
+        positive_probability = probabilities[-1:, 1] if is_live else probabilities[:, 1]
+        survival = 1.0 - positive_probability if self.breach_positive else positive_probability
+        frame.loc[indices, "survival_probability"] = survival
+        frame.loc[indices, "breach_probability"] = 1.0 - survival
+        frame.loc[indices, "pred"] = (survival >= 0.5).astype(int)
+        frame.loc[indices, "pred_prob"] = np.maximum(survival, 1.0 - survival)
+        if not is_live and self.label_col in frame:
+            rows = self._martingale_evaluation_rows(frame.loc[indices])
+            stats.update(self._martingale_binary_metrics(rows))
+        return frame, stats
+
+    def _martingale_evaluation_rows(self, frame):
+        rows = frame.dropna(subset=[self.label_col, "pred", "survival_probability"]).copy()
+        rows[self.label_col] = pd.to_numeric(rows[self.label_col], errors="coerce")
+        labels = rows[self.label_col]
+        return rows.loc[labels.between(0, 9) & (labels == np.floor(labels))]
+
+    def _martingale_binary_metrics(self, rows):
+        if rows.empty:
+            return {}
+        survival = rows["survival_probability"].to_numpy()
+        return evaluate_classification(PredictionResult(
+            y_true=(rows[self.label_col].to_numpy() <= self.max_layers).astype(int),
+            probabilities=np.column_stack([1.0 - survival, survival]),
+            predicted_labels=rows["pred"].to_numpy().astype(int),
+        ), [0, 1])
 
     def _validate_inference_dataset(self, ds) -> None:
         """Require exact feature identity/order before accepting a prebuilt dataset."""
@@ -663,8 +763,8 @@ class ModelHandler(MetaConfig):
         3. Compute per-threshold signal density, precision, and recall.
         """
         self.logger.info(f"🔍 Scanning thresholds: {thresholds}...")
-        if self.task_type == TrainTask.REGRESSION:
-            raise ValueError("Probability threshold scans are not defined for regression outputs")
+        if self.task_type in TrainTask.REGRESSION_TASKS or self.task_type == TrainTask.MARTINGALE_BINARY:
+            raise ValueError("Signal threshold scans are not defined for this task")
         
         # 1. Prepare data & run inference (reuse dataset logic)
         ds = TimeSeriesWindowDataset(

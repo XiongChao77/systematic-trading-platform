@@ -1334,7 +1334,7 @@ class MartingaleSimulator:
         return self._outcome_signature(first) != self._outcome_signature(second)
 
     def _replay_intrabar(
-        self, state: AccountState, intrabar: Sequence[Sequence[float]]
+        self, state: AccountState, intrabar: Sequence[Sequence[float]], trade_resolver=None
     ) -> Optional[AccountState]:
         """Replay the finer bars in their real order to settle a bar ambiguity.
 
@@ -1342,7 +1342,7 @@ class MartingaleSimulator:
         pessimistic two-path result.  A cycle closed inside the bar does not
         reopen before the next bar, matching the bar-level restart rule.
         """
-        for row in intrabar:
+        for fine_index, row in enumerate(intrabar):
             open_, high, low, close = (float(value) for value in row)
             # NaN compares unequal to itself; unusable rows fall back.
             if not all(value > 0.0 and value == value for value in (open_, high, low, close)):
@@ -1357,6 +1357,17 @@ class MartingaleSimulator:
             baseline_events = state.events
             down_first = self._replay(state.clone(), open_, (low, high, close))
             up_first = self._replay(state.clone(), open_, (high, low, close))
+            if trade_resolver is not None and self._paths_disagree(down_first, up_first):
+                prices = trade_resolver(fine_index, (open_, high, low, close))
+                if prices is None:
+                    raise ValueError(
+                        f"Unresolved intrabar path at finer bar {fine_index}: "
+                        "aggTrades data is missing or does not match the candle OHLC"
+                    )
+                state = self._replay(
+                    state.clone(), float(prices[0]), tuple(float(price) for price in prices[1:])
+                )
+                continue
             if (
                 down_first.events == baseline_events
                 and up_first.events == baseline_events
@@ -1396,6 +1407,7 @@ class MartingaleSimulator:
         low: float,
         close: float,
         intrabar: Optional[Sequence[Sequence[float]]] = None,
+        trade_resolver=None,
         allow_open: bool = True,
     ) -> AccountState:
         """Replay one completed bar and return the pessimistic valid path.
@@ -1453,11 +1465,15 @@ class MartingaleSimulator:
 
         dual_count = state.dual_path_bars + 1
         if intrabar is not None and self._paths_disagree(down_first, up_first):
-            resolved = self._replay_intrabar(state.clone(), intrabar)
+            resolved = self._replay_intrabar(state.clone(), intrabar, trade_resolver)
             if resolved is not None:
                 resolved = self._close_if_cycle_timeout(resolved, close)
                 resolved.dual_path_bars = dual_count
                 return resolved
+        if trade_resolver is not None and self._paths_disagree(down_first, up_first):
+            raise ValueError(
+                f"Unresolved candle path at {time}: finer bars are missing or invalid"
+            )
         if self._path_key(up_first, close) < self._path_key(down_first, close):
             up_first.up_first_worse_bars = state.up_first_worse_bars + 1
             up_first.dual_path_bars = dual_count

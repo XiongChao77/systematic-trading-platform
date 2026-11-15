@@ -16,6 +16,7 @@ confmat_cnn.csv
 data_process/data/*
 data_process/download/binance/data/
 output*
+quant_output/
 *keys*
 launch.json
 #label_viewer

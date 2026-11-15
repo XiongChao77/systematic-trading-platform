@@ -21,7 +21,7 @@ if PROJECT_DIR not in sys.path:
 
 from data_process import common
 from data_process.utils import config_from_dict_train
-from trade.runner import backtest_runner
+from trade.runner import backtest_entry
 from trade.runner.analyze_backtest_report import plot_equity_curves
 
 
@@ -108,8 +108,8 @@ def build_runner_config(
     period_report: dict[str, Any],
     *,
     save_dir: str,
-) -> tuple[backtest_runner.RunnerConfig, common.BaseDefine, Any, str | None]:
-    """Restore backtest_runner configuration objects from a report snapshot."""
+) -> tuple[backtest_entry.RunnerConfig, common.BaseDefine, Any, str | None]:
+    """Restore backtest_entry configuration objects from a report snapshot."""
     params = _required_dict(period_report, "params")
     strategy_params = _required_dict(params, "strategy")
     broker_params = _required_dict(params, "broker")
@@ -117,8 +117,8 @@ def build_runner_config(
     train_params = _required_dict(params, "train")
     data_params = _required_dict(params, "data")
 
-    strategy_config = backtest_runner.strategy_config_from_dict(strategy_params)
-    broker_config = backtest_runner.BrokerConfig(**broker_params)
+    strategy_config = backtest_entry.strategy_config_from_dict(strategy_params)
+    broker_config = backtest_entry.BrokerConfig(**broker_params)
     market_config = common.preparation_config_from_dict(common_params)
     train_config = config_from_dict_train(train_params)
 
@@ -129,18 +129,18 @@ def build_runner_config(
     if not train_output_dir:
         raise ValueError("Missing params.data.train_output_dir")
 
-    data_config = backtest_runner.ModelDataConfig(
+    data_config = backtest_entry.ModelDataConfig(
         prep_output_dir=str(prep_output_dir),
         train_output_dir=str(train_output_dir),
         device=str(data_params.get("device", "cpu")),
         symbol=str(data_params["symbol"]) if data_params.get("symbol") else None,
     )
-    runner_config = backtest_runner.RunnerConfig(
+    runner_config = backtest_entry.RunnerConfig(
         strategy_config=strategy_config,
         broker_config=broker_config,
         data_config=data_config,
         save_dir=save_dir,
-        experiment_context=backtest_runner.ExperimentContext(
+        experiment_context=backtest_entry.ExperimentContext(
             git_commit=common.git_revision(),
         ),
     )
@@ -167,6 +167,20 @@ def model_artifacts_exist(train_output_dir: str) -> bool:
         if artifact_dir in visited:
             return False
         visited.add(artifact_dir)
+
+        manifest_path = os.path.join(artifact_dir, "rolling_manifest.json")
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, encoding="utf-8") as handle:
+                    manifest = json.load(handle)
+                return (
+                    manifest["status"] == "complete" and bool(manifest["folds"])
+                    and os.path.isfile(os.path.join(artifact_dir, manifest["predictions"]))
+                    and all(validate_artifact_dir(os.path.join(artifact_dir, fold["model_dir"]))
+                            for fold in manifest["folds"])
+                )
+            except (OSError, KeyError, TypeError, json.JSONDecodeError):
+                return False
 
         task_path = os.path.join(artifact_dir, "task_description.json")
         data_config_path = common.get_data_config_path_in_dir(artifact_dir)
@@ -202,7 +216,7 @@ def model_artifacts_exist(train_output_dir: str) -> bool:
 
 
 def ensure_backtest_artifacts(
-    config: backtest_runner.RunnerConfig,
+    config: backtest_entry.RunnerConfig,
     market_config: common.BaseDefine,
     train_config: Any,
     logger: logging.Logger,
@@ -247,9 +261,9 @@ def ensure_backtest_artifacts(
             prep_output_dir=data_config.prep_output_dir,
         )
         os.makedirs(data_config.train_output_dir, exist_ok=True)
-        train.train(
+        train.train_windows(
             logger=logger,
-            config=train_config,
+            configs=[train_config],
             prep_output_dir=data_config.prep_output_dir,
             save_dir=data_config.train_output_dir,
         )
@@ -310,7 +324,7 @@ def main() -> None:
     logger.info("Prep output: %s", runner_config.data_config.prep_output_dir)
     logger.info("Train output: %s", runner_config.data_config.train_output_dir)
     ensure_backtest_artifacts(runner_config, market_config, train_config, logger)
-    result = backtest_runner.main(logger, runner_config, PERIOD)
+    result = backtest_entry.main(logger, runner_config, PERIOD)
     reports_path = os.path.join(output_dir, "reports.jsonl")
     common.append_jsonl(reports_path, result["report"])
     plot_equity_curves(

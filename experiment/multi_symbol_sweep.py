@@ -39,8 +39,8 @@ import pandas as pd
 from data_process import common
 from data_process import preparation
 from data_process.config import DOGE_15m_TBM
-from model.train import train_rolling
-from model.train_config import RollingConfig
+from model.train import train_windows
+from model.train_config import RollingConfig, TriggerModel, DirectionModel
 from trade.runner.analyze_backtest_report import plot_equity_curves
 from trade.runner.backtest_entry import main as run_backtest
 from trade.runner.config import (
@@ -163,7 +163,8 @@ def run_combo(symbols, *, mode: str, period: str, split_time: str, stop_on_error
 
         # 2. Rolling training (expanding or sliding).
         logger.info("=== [%s] Training (mode=%s) ===", tag, mode)
-        train_rolling(
+        train_windows(
+            configs=[TriggerModel, DirectionModel],
             rolling_config=RollingConfig(mode=mode),
             prep_output_dir=data_dir,
             save_dir=train_dir,

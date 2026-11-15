@@ -34,6 +34,10 @@ def validate_required_feature_columns(
     if feature_cols is None:
         raise ValueError("Required feature list must not be None")
 
+    forbidden = [name for name in feature_cols if name.startswith("martingale_")]
+    if forbidden:
+        raise ValueError(f"Outcome columns cannot be model features: {forbidden}")
+
     duplicated_requirements = sorted({name for name in feature_cols if feature_cols.count(name) > 1})
     if duplicated_requirements:
         raise ValueError("Required feature list contains duplicates: " f"{duplicated_requirements}")
@@ -75,17 +79,14 @@ def valid_window_end_indices(
 
     frame = df[cols].copy()
     frame["orig_index"] = df.index
-    complete_rows = frame.notna().all(axis=1)
+    complete_rows = frame[clean_features + ["open_time_sn"]].notna().all(axis=1)
     if not complete_rows.any():
         raise RuntimeError("No complete rows found while calculating valid window indices")
     first_valid_label = complete_rows.idxmax()
     first_valid_pos = frame.index.get_loc(first_valid_label)
     frame = frame.iloc[first_valid_pos:].copy()
-    frame.dropna(
-        subset=[column for column in frame.columns if column != "trend_strength"],
-        inplace=True,
-    )
     frame.reset_index(drop=True, inplace=True)
+    finite_rows = np.isfinite(frame[clean_features + ["open_time_sn"]].to_numpy(dtype=np.float64, na_value=np.nan)).all(axis=1)
 
     window_count = (len(frame) - seq_len) // stride + 1
     if window_count <= 0:
@@ -99,8 +100,11 @@ def valid_window_end_indices(
 
     label_valid = np.ones(window_count, dtype=bool)
     if label_col and label_col in frame.columns:
-        label_valid = frame[label_col].to_numpy()[ends] != common.Signal.INVALID
-    valid = global_continuous & tail_continuous & label_valid
+        values = pd.to_numeric(frame[label_col], errors="coerce").to_numpy(dtype=np.float64, na_value=np.nan)[ends]
+        label_valid = np.isfinite(values) & (values != common.Signal.INVALID)
+    invalid_prefix = np.concatenate(([0], np.cumsum(~finite_rows)))
+    feature_valid = invalid_prefix[ends + 1] == invalid_prefix[starts]
+    valid = global_continuous & tail_continuous & label_valid & feature_valid
     return frame["orig_index"].to_numpy()[ends][valid]
 
 
@@ -294,7 +298,7 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
 
         # --- Part 1: remove initial cold-start NaNs ---
         # Logic: find the first row with no NaNs, drop all rows before it
-        is_valid_row = df_work.notna().all(axis=1)
+        is_valid_row = df_work[clean_features + [self.time_col]].notna().all(axis=1)
         if is_valid_row.any():
             first_valid_idx_label = is_valid_row.idxmax()  # First index label where all columns are valid
             first_valid_loc = df_work.index.get_loc(first_valid_idx_label)  # Physical position for that label
@@ -308,13 +312,12 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
             raise RuntimeError("❌ [Data Clean] Error: no complete rows found! Please check feature computation logic.")
 
         # --- Part 2: identify non-finite inputs without removing timeline rows ---
-        exclude_nan_check_cols = ["trend_strength"]  # "trend_strength" is not feature
-        nan_check_cols = [c for c in cols if c not in exclude_nan_check_cols]
+        nan_check_cols = clean_features + [self.time_col]
         numeric_values = df_work[nan_check_cols].apply(
             pd.to_numeric,
             errors="coerce",
         )
-        invalid_values = ~np.isfinite(numeric_values.to_numpy(dtype=np.float64))
+        invalid_values = ~np.isfinite(numeric_values.to_numpy(dtype=np.float64, na_value=np.nan))
         finite_rows = ~invalid_values.any(axis=1)
         if invalid_values.any():
             invalid_rows = np.flatnonzero(~finite_rows)
@@ -393,9 +396,11 @@ class TimeSeriesWindowDataset(torch.utils.data.Dataset):
 
         # --- B. Label validity check ---
         if has_label:
-            raw_labels = df_work[label_col].values[self.seq_len - 1 :: self.stride]
+            raw_labels = pd.to_numeric(df_work[label_col], errors="coerce").to_numpy(
+                dtype=np.float64, na_value=np.nan,
+            )[self.seq_len - 1 :: self.stride]
             labels_all = raw_labels[:original_count]
-            mask_label = labels_all != common.Signal.INVALID
+            mask_label = np.isfinite(labels_all) & (labels_all != common.Signal.INVALID)
         else:
             labels_all = np.zeros(original_count)
             mask_label = np.ones(original_count, dtype=bool)

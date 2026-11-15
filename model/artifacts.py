@@ -15,6 +15,7 @@ from model.evaluator import (
     plot_threshold_precision_recall_curve,
     plot_training_curves,
 )
+from model.train_config import TrainTask
 from model.training_types import FitResult, PredictionResult
 
 
@@ -76,6 +77,22 @@ def save_single_run(
         seq_len=seq_len,
         task_type=task_type,
     )
+    if task_type == TrainTask.MARTINGALE_REGRESSION:
+        meta["prediction_type"] = "continuous"
+        meta["target_semantics"] = "martingale_addition_count"
+        meta["target_range"] = [0, 9]
+    if task_type == TrainTask.MARTINGALE_BINARY:
+        meta["prediction_type"] = "survival_probability"
+        meta["task_configuration"] = {
+            "max_layers": train_config["max_layers"],
+            "comparison": "<=",
+            "source_label": "martingale_label",
+            "valid_target_range": [0, 9],
+            "class_encoding": ({"Y": 0, "N": 1} if train_config.get("breach_positive")
+                               else {"Y": 1, "N": 0}),
+            "positive_class": "breach" if train_config.get("breach_positive") else "survival",
+            "negative_class": "survival" if train_config.get("breach_positive") else "breach",
+        }
     meta["arch_hash"] = state_source.architecture_hash(meta)
 
     torch.save(
@@ -109,7 +126,8 @@ def save_single_run(
     _write_json(metrics_path, metrics_report)
     _write_json(history_path, fit_result.history)
     _write_json(train_config_path, train_config)
-    confusion_frame(metrics).to_csv(os.path.join(save_dir, "confusion_matrix.csv"))
+    if "confusion_matrix" in metrics:
+        confusion_frame(metrics).to_csv(os.path.join(save_dir, "confusion_matrix.csv"))
     is_regression = "regression_metrics" in metrics
     if not is_regression:
         plot_precision_recall_curve(

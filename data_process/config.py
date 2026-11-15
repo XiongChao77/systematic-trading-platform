@@ -8,8 +8,10 @@ from data_process import feature
 DOGE_15m_TBM =common.BaseDefine(
     market_category="Cryptocurrency", data_source="binance_public_data", symbols=("DOGEUSDT",), interval="15m",
     trading_type='um', label_type="TBM",
-    vol_ewma_span=4*24*7,
-    predict_num=4*12,
+    vol_method="hybrid",
+    vol_ewma_span=192,
+    vol_sma_window=2688,
+    predict_num=4*24,
     vol_multiplier_long=10,
     stop_multiplier_rate_long=0.618,
     vol_multiplier_short=10,
@@ -25,6 +27,7 @@ DOGE_AAVE_15m_TBM = replace(
 DOGE_1m_TBM = replace(
     DOGE_15m_TBM,
     interval="1m",
+    vol_method="ewma",
     vol_ewma_span = 60*24*7,
     predict_num = 60*12,
     vol_multiplier_long = 25,
@@ -38,6 +41,7 @@ DOGE_1m_TBM = replace(
 DOGE_5m_TBM = replace(
     DOGE_15m_TBM,
     interval="5m",
+    vol_method="ewma",
     tbm_intrabar_interval="1m",
     vol_ewma_span = 12*24*7,
     predict_num =12*8,

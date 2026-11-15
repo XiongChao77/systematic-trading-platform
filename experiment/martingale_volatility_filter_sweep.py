@@ -24,6 +24,7 @@ Each worker keeps its own 5m + 1m bar cache, so memory scales with
 from __future__ import annotations
 
 import argparse
+import numpy as np
 import logging
 import os
 import sys
@@ -122,6 +123,14 @@ def _init_worker(data_kwargs: dict, intrabar_interval: "str | None") -> None:
     logger = logging.getLogger("vol-filter-sweep")
     _WORKER_BARS = mb.load_bars(
         logger, mb.DataParams(**data_kwargs), intrabar_interval=intrabar_interval
+    )
+    main_interval_ms = int(
+        np.median(np.diff(_WORKER_BARS.time)) / np.timedelta64(1, "ms")
+    )
+    fine_interval_ms = common.get_interval_ms(intrabar_interval or "1m")
+    _WORKER_BARS.intrabar_step_ms = fine_interval_ms
+    _WORKER_BARS.agg_trade_prices = common.AggTradeResolver(
+        main_interval_ms, fine_interval_ms
     )
 
 
@@ -230,7 +239,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-intrabar", action="store_true",
-        help="disable the 1m ambiguity resolution (faster, pessimistic EV)",
+        help="disable the 1m ambiguity resolution (faster, unresolved paths raise an error)",
     )
     parser.add_argument(
         "--out", default=None,

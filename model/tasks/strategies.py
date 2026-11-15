@@ -50,6 +50,7 @@ class TaskStrategy(ABC):
     labels: list[int]
     output_dim: int
     is_regression = False
+    numeric_regression = False
     source_labels: list[int] | None = None
 
     def __init__(self, config: TrainConfig, device: torch.device):
@@ -129,6 +130,69 @@ class ThreeClassRegressionTask(TaskStrategy):
         )
         nearest = np.abs(values[:, None] - centers[None, :]).argmin(axis=1)
         return centers[nearest].astype(np.int64)
+
+
+class MartingaleRegressionTask(TaskStrategy):
+    labels = list(range(10))
+    output_dim = 1
+    is_regression = True
+    numeric_regression = True
+
+    def dataset_split(self, split: TensorSplit) -> TensorSplit:
+        values = split.labels
+        if not (
+            np.isfinite(values).all()
+            and np.equal(values, np.floor(values)).all()
+            and ((values >= 0) & (values <= 9)).all()
+        ):
+            raise ValueError("MARTINGALE_REGRESSION targets must be finite integers from 0 to 9")
+        return TensorSplit(split.X, split.y.float(), split.returns, split.assets)
+
+    def forward(self, model: torch.nn.Module, inputs: torch.Tensor) -> torch.Tensor:
+        return model(inputs).reshape(-1)
+
+    def loss(
+        self,
+        output: torch.Tensor,
+        labels: torch.Tensor,
+        returns: torch.Tensor,
+        epoch: int,
+    ) -> torch.Tensor:
+        return F.mse_loss(output, labels)
+
+    def probabilities(self, output: torch.Tensor) -> torch.Tensor:
+        return output.reshape(-1, 1)
+
+    @staticmethod
+    def decode(values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        if not np.isfinite(values).all():
+            raise ValueError("MARTINGALE_REGRESSION model produced non-finite predictions")
+        return values
+
+
+class MartingaleBinaryTask(TaskStrategy):
+    labels = [0, 1]
+    output_dim = 2
+
+    def dataset_split(self, split: TensorSplit) -> TensorSplit:
+        values = split.y
+        valid = torch.isfinite(values) & (values >= 0) & (values <= 9)
+        valid &= values == values.floor()
+        return TensorSplit(
+            split.X[valid], ((values[valid] > self.config.max_layers) if self.config.breach_positive
+                             else (values[valid] <= self.config.max_layers)).long(),
+            split.returns[valid], split.assets[valid] if split.assets is not None else None,
+        )
+
+    def forward(self, model: torch.nn.Module, inputs: torch.Tensor) -> torch.Tensor:
+        return model(inputs)
+
+    def loss(self, output: torch.Tensor, labels: torch.Tensor, returns: torch.Tensor, epoch: int) -> torch.Tensor:
+        return F.cross_entropy(output, labels)
+
+    def probabilities(self, output: torch.Tensor) -> torch.Tensor:
+        return torch.softmax(output, dim=1)
 
 
 class DirectThreeClassTask(TaskStrategy):
@@ -391,15 +455,29 @@ class FusedThreeClassTask(DirectThreeClassTask):
         return probabilities
 
 
+def validate_preparation_config(preparation, task_type: str) -> None:
+    if task_type in (TrainTask.MARTINGALE_REGRESSION, TrainTask.MARTINGALE_BINARY):
+        if preparation.label_type != "MARTINGALE":
+            raise ValueError(f"{task_type} requires MARTINGALE addition-count labels")
+    elif preparation.label_type == "MARTINGALE":
+        raise ValueError(
+            "MARTINGALE addition-count labels are not supported by Signal-based training tasks"
+        )
+
+
 def build_task(task_type: str, config: TrainConfig, device: torch.device, model: Optional[torch.nn.Module] = None) -> TaskStrategy:
-    if task_type == TrainTask.REGRESSION:
+    if task_type in TrainTask.REGRESSION_TASKS:
+        if task_type == TrainTask.MARTINGALE_REGRESSION and config.selection_metric == "macro_f1":
+            raise ValueError("MARTINGALE_REGRESSION does not support macro_f1 selection")
         if model is not None and (
             hasattr(model, "head_trigger") or hasattr(model, "head_direction")
         ):
             raise TypeError(
-                "REGRESSION requires a single-output model, "
+                f"{task_type} requires a single-output model, "
                 f"model:{config.model_cfg.model_type} {config.model_cfg.model_version}"
             )
+        if task_type == TrainTask.MARTINGALE_REGRESSION:
+            return MartingaleRegressionTask(config, device)
         return ThreeClassRegressionTask(config, device)
     if task_type == TrainTask.DIRECT_3CLASS:
         if model is not None and (
@@ -413,6 +491,8 @@ def build_task(task_type: str, config: TrainConfig, device: torch.device, model:
         ):
             raise TypeError(f"DUAL_HEAD_3CLASS requires a model with trigger and direction heads, model:{config.model_cfg.model_type} {config.model_cfg.model_version}")
         return DualHeadThreeClassTask(config, device)
+    if task_type == TrainTask.MARTINGALE_BINARY:
+        return MartingaleBinaryTask(config, device)
     if task_type in TrainTask.BINARY_TASKS:
         return BinaryTask(task_type, config, device)
     raise ValueError(f"Unsupported training task: {task_type}")

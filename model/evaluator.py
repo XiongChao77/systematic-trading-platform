@@ -20,6 +20,9 @@ from sklearn.metrics import (
     matthews_corrcoef,
     precision_recall_curve,
     r2_score,
+    log_loss,
+    brier_score_loss,
+    roc_auc_score,
 )
 
 from model.training_types import FitResult, PredictionResult
@@ -121,6 +124,68 @@ def plot_threshold_precision_recall_curve(
         figure.savefig(output_path, dpi=160)
     finally:
         figure.clear()
+
+
+def plot_rolling_binary_oos_curves(
+    predictions: pd.DataFrame,
+    max_layers: int,
+    output_dir: str,
+    name: str,
+) -> dict | None:
+    """Plot pooled out-of-sample breach precision and recall for rolling folds."""
+    required = {"martingale_label", "breach_probability"}
+    if not required.issubset(predictions.columns):
+        raise ValueError(f"Rolling OOS predictions lack {sorted(required - set(predictions.columns))}")
+    valid = predictions.dropna(subset=["martingale_label", "breach_probability"])
+    if valid.empty:
+        return None
+    truth = valid["martingale_label"].to_numpy() > max_layers
+    if not truth.any() or truth.all():
+        return None
+    score = valid["breach_probability"].to_numpy(dtype=float)
+    if not np.isfinite(score).all():
+        raise ValueError("Rolling OOS breach probabilities must be finite")
+    precision, recall, thresholds = precision_recall_curve(truth, score)
+    average_precision = float(average_precision_score(truth, score))
+    os.makedirs(output_dir, exist_ok=True)
+
+    figure = Figure(figsize=(12, 5))
+    FigureCanvasAgg(figure)
+    precision_axis, recall_axis = figure.subplots(1, 2)
+    try:
+        draw_index = np.unique(np.r_[np.arange(0, len(thresholds), max(1, len(thresholds) // 4000)), len(thresholds) - 1])
+        for axis, values, label in (
+            (precision_axis, precision, "Precision (%)"),
+            (recall_axis, recall, "Recall (%)"),
+        ):
+            axis.plot(thresholds[draw_index], 100 * values[draw_index], linewidth=1.3)
+            axis.set(xlabel="Breach probability threshold", ylabel=label)
+            axis.set_xlim(0, 1)
+            axis.grid(True, alpha=0.3)
+        precision_axis.axhline(100 * truth.mean(), color="gray", linestyle=":", label="Event rate")
+        precision_axis.legend()
+        recall_axis.set_ylim(0, 100)
+        figure.suptitle(f"Rolling OOS X{max_layers} breach threshold curves ({name})")
+        figure.tight_layout()
+        figure.savefig(os.path.join(output_dir, f"{name}_threshold_precision_recall.png"), dpi=160)
+    finally:
+        figure.clear()
+
+    figure = Figure(figsize=(7, 5))
+    FigureCanvasAgg(figure)
+    axis = figure.subplots()
+    try:
+        axis.plot(recall, precision, label=f"AP={average_precision:.4f}")
+        axis.axhline(truth.mean(), color="gray", linestyle=":", label="Event rate")
+        axis.set(xlabel="Recall", ylabel="Precision", title=f"Rolling OOS X{max_layers} breach PR curve ({name})", xlim=(0, 1))
+        axis.set_ylim(bottom=0)
+        axis.grid(True, alpha=0.3)
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(os.path.join(output_dir, f"{name}_pr_curve.png"), dpi=160)
+    finally:
+        figure.clear()
+    return {"rows": int(len(score)), "events": int(truth.sum()), "average_precision": average_precision}
 
 
 def plot_training_curves(fit_result: FitResult, output_path: str) -> None:
@@ -237,7 +302,19 @@ def evaluate_classification(result: PredictionResult, labels: list[int]) -> dict
             "actual_distribution": actual_distribution,
         }
 
+    probability_metrics = {}
+    if labels == [0, 1] and total:
+        survival = result.probabilities[:, 1]
+        breach = np.asarray(y_true) == 0
+        probability_metrics = {
+            "logloss": float(log_loss(y_true, result.probabilities, labels=labels)),
+            "brier": float(brier_score_loss(y_true, survival)),
+            "roc_auc": float(roc_auc_score(y_true, survival)) if len(np.unique(y_true)) == 2 else None,
+            "breach_ap": float(average_precision_score(breach, 1.0 - survival)) if breach.any() else None,
+            "breach_base_rate": float(breach.mean()),
+        }
     return {
+        **probability_metrics,
         "macro_f1": float(report["macro avg"]["f1-score"]),
         "macro_precision": float(report["macro avg"]["precision"]),
         "macro_recall": float(report["macro avg"]["recall"]),
@@ -319,6 +396,31 @@ def evaluate_regression(result: PredictionResult, labels: list[int]) -> dict:
     return classification
 
 
+def evaluate_numeric_regression(result: PredictionResult, labels: list[int]) -> dict:
+    if result.predictions is None:
+        raise ValueError("Numeric regression evaluation requires continuous predictions")
+    predictions = np.asarray(result.predictions, dtype=np.float64).reshape(-1)
+    y_true = np.asarray(result.y_true, dtype=np.float64).reshape(-1)
+    if predictions.shape != y_true.shape:
+        raise ValueError("Numeric regression predictions and labels must have matching lengths")
+    if not np.isfinite(predictions).all() or not np.isfinite(y_true).all():
+        raise ValueError("Numeric regression evaluation requires finite predictions and labels")
+    mse = float(mean_squared_error(y_true, predictions))
+    return {
+        "labels": labels,
+        "sample_count": len(y_true),
+        "loss": None if result.loss is None else float(result.loss),
+        "prediction_type": "continuous",
+        "regression_metrics": {
+            "mae": float(mean_absolute_error(y_true, predictions)),
+            "mse": mse,
+            "rmse": float(mse ** 0.5),
+            "r2": float(r2_score(y_true, predictions)),
+            "mean_error": float((predictions - y_true).mean()),
+        },
+    }
+
+
 def confusion_frame(metrics: dict) -> pd.DataFrame:
     labels = metrics["confusion_matrix"]["labels"]
     return pd.DataFrame(
@@ -363,7 +465,22 @@ def log_evaluation_report(
     save_dir: str,
     model_label: str = "Model",
 ) -> None:
-    """Print a classification report table plus label proportions and the save path."""
+    """Print task metrics and the artifact save path."""
+    if metrics.get("prediction_type") == "continuous":
+        regression = metrics["regression_metrics"]
+        logger.info("Numeric regression evaluation | Model: %s | Task: %s", model_label, task_type)
+        logger.info(
+            "Samples: %d | Loss: %s | MAE: %.4f | MSE: %.4f | RMSE: %.4f | R2: %.4f | Mean error: %.4f",
+            metrics["sample_count"],
+            f"{metrics['loss']:.4f}" if metrics["loss"] is not None else "n/a",
+            regression["mae"],
+            regression["mse"],
+            regression["rmse"],
+            regression["r2"],
+            regression["mean_error"],
+        )
+        logger.info("Numeric regression evaluation complete. Artifacts saved to: %s", save_dir)
+        return
     kind = (
         "Regression"
         if "regression_metrics" in metrics

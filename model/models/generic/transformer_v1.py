@@ -401,11 +401,7 @@ class Transformer1D_V1(BaseTimeSeriesModel):
         model = cls(
             input_size=meta["input_size"],
 
-            n_classes=(
-                len(meta["classes"])
-                if "classes" in meta
-                else meta["n_classes"]
-            ),
+            n_classes=meta["n_classes"],
 
             d_model=meta["d_model"],
             nhead=meta["nhead"],
