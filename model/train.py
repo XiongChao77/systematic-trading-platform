@@ -32,6 +32,7 @@ from model.train_config import (
 from model.tasks.strategies import TaskStrategy
 from model.trainer import build_trainer
 from model.training_types import TensorSplit, PredictionResult
+from model.window_predictions import annotate_predictions, validate_predictions
 
 
 @dataclass(frozen=True)
@@ -173,35 +174,23 @@ def _fit_window_model(
 
 
 def fusion_trigger_dir(logger: logging.Logger, trigger_dir: str, direction_dir: str, fusion_dir: str) -> dict:
-    """Fuse two independently trained models (trigger + direction) into one artifact dir.
-
-    Both models must already be trained (e.g. via `train_windows()` with `TrainTask.TRIGGER`
-    and `TrainTask.DIRECTION`). This does not retrain or evaluate anything; it only
-    records where each checkpoint lives so inference code can load and fuse them.
-    """
-    description = save_fusion_run(
+    """Fuse saved window predictions from two independent training roots."""
+    from model.window_fusion import fuse_window_runs
+    return fuse_window_runs(
         task_type=TrainTask.TRIGGER_DIRECTION,
         role_directories={"trigger": trigger_dir, "direction": direction_dir},
-        fusion_dir=fusion_dir,
+        fusion_dir=fusion_dir, logger=logger,
     )
-    logger.info("Fused TRIGGER_DIRECTION: trigger=%s direction=%s -> %s", trigger_dir, direction_dir, fusion_dir)
-    return description
 
 
 def fusion_long_short_ovr(logger: logging.Logger, long_ovr_dir: str, short_ovr_dir: str, fusion_dir: str) -> dict:
-    """Fuse two independently trained models (long OvR + short OvR) into one artifact dir.
-
-    Both models must already be trained (e.g. via `train_windows()` with `TrainTask.LONG_OVR`
-    and `TrainTask.SHORT_OVR`). This does not retrain or evaluate anything; it only
-    records where each checkpoint lives so inference code can load and fuse them.
-    """
-    description = save_fusion_run(
+    """Fuse saved window predictions from two independent training roots."""
+    from model.window_fusion import fuse_window_runs
+    return fuse_window_runs(
         task_type=TrainTask.LONG_SHORT_OVR,
         role_directories={"long_ovr": long_ovr_dir, "short_ovr": short_ovr_dir},
-        fusion_dir=fusion_dir,
+        fusion_dir=fusion_dir, logger=logger,
     )
-    logger.info("Fused LONG_SHORT_OVR: long_ovr=%s short_ovr=%s -> %s", long_ovr_dir, short_ovr_dir, fusion_dir)
-    return description
 
 
 def single_window(times, config: DataConfig, interval):
@@ -341,23 +330,24 @@ def _evaluate_oos_models(configs, fitted_models, symbol_frames, preparation, int
 def rolling_windows(start, end, forward_start, config):
     """Anchor calendar windows to the persisted Forward boundary."""
     start, end, forward_start = map(pd.Timestamp, (start, end, forward_start))
-    history = config.train_months + config.validation_months
+    def history_start(oos_start):
+        return oos_start - config.validation_offset() - config.training_offset()
     offset = 1
     development = []
     while True:
-        oos_start = forward_start - pd.DateOffset(months=offset * config.oos_months)
-        if oos_start - pd.DateOffset(months=history) < start:
+        oos_start = forward_start - config.update_offset(offset)
+        if history_start(oos_start) < start:
             break
         development.append(oos_start)
         offset += 1
     starts = list(reversed(development))
     offset = 0
-    while forward_start + pd.DateOffset(months=offset * config.oos_months) < end:
-        starts.append(forward_start + pd.DateOffset(months=offset * config.oos_months))
+    while forward_start + config.update_offset(offset) < end:
+        starts.append(forward_start + config.update_offset(offset))
         offset += 1
-    fixed_train_start = starts[0] - pd.DateOffset(months=history) if starts else None
+    fixed_train_start = history_start(starts[0]) if starts else None
     for index, oos_start in enumerate(starts):
-        if oos_start - pd.DateOffset(months=history) < start:
+        if history_start(oos_start) < start:
             raise ValueError("Insufficient history for the first Forward training window")
         phase = "development" if oos_start < forward_start else "forward"
         boundary = forward_start if phase == "development" else end
@@ -365,9 +355,9 @@ def rolling_windows(start, end, forward_start, config):
             "fold_id": f"{index:04d}", "phase": phase,
             "train_start": (
                 fixed_train_start if config.mode == "expanding"
-                else oos_start - pd.DateOffset(months=history)
+                else history_start(oos_start)
             ).isoformat(),
-            "validation_start": (oos_start - pd.DateOffset(months=config.validation_months)).isoformat(),
+            "validation_start": (oos_start - config.validation_offset()).isoformat(),
             "oos_start": oos_start.isoformat(),
             "oos_end": min(
                 starts[index + 1] if index + 1 < len(starts) else end, boundary,
@@ -447,6 +437,7 @@ def _execute_windows(
     del frame
 
     predictions = []
+    window_predictions = []
     development_predictions = []
     evaluations = {config.train_task: [] for config in configs}
     for fold in folds:
@@ -562,6 +553,9 @@ def _execute_windows(
             )
             fitted_models[config.train_task] = fitted
             role_dirs[config.train_task.lower()] = role_dir
+            with open(os.path.join(role_dir, "window_metadata.json"), "w", encoding="utf-8") as handle:
+                json.dump({**fold, "data_id": provenance["data_id"],
+                           "training_root": os.path.relpath(save_dir, role_dir)}, handle, indent=2)
             del prepared, train_split, valid_split, X, y, returns, ys, rets
         oos_results = _evaluate_oos_models(
             configs, fitted_models, symbol_frames, preparation, interval_ms,
@@ -575,6 +569,9 @@ def _execute_windows(
         if combo:
             model_dir = os.path.join(fold_dir, "fusion")
             save_fusion_run(task_type=combo, role_directories=role_dirs, fusion_dir=model_dir)
+            with open(os.path.join(model_dir, "window_metadata.json"), "w", encoding="utf-8") as handle:
+                json.dump({**fold, "data_id": provenance["data_id"],
+                           "training_root": os.path.relpath(save_dir, model_dir)}, handle, indent=2)
         handler = ModelHandler(model_dir, device)
         # The first fold also predicts its own train/validation span so the
         # development backtest can compare in-sample against OOS behaviour.
@@ -596,7 +593,11 @@ def _execute_windows(
                 features_only, interval_ms, handler.feature_cols, None, handler.seq_len,
                 is_live=False, materialize_windows=False, show_feature_distribution=False,
             )
-            predicted, _, _, sub_predictions = handler.predict_with_ds(
+            predict = (handler.predict_binary_component_with_ds
+                       if handler.task_type in (TrainTask.TRIGGER, TrainTask.DIRECTION,
+                                                TrainTask.LONG_OVR, TrainTask.SHORT_OVR)
+                       else handler.predict_with_ds)
+            predicted, _, _, sub_predictions = predict(
                 dataset, features_only, is_live=False, batch_size=configs[0].batch_size,
                 evaluate_sub_models=False, collect_sub_predictions=True,
             )
@@ -620,6 +621,9 @@ def _execute_windows(
         if not segment_parts:
             raise RuntimeError("Rolling window has no valid predictions")
         window = pd.concat(segment_parts, ignore_index=True)
+        window = annotate_predictions(window, fold)
+        validate_predictions(window, {"folds": [*manifest["folds"], fold]}, allow_in_sample=True)
+        window_predictions.append(window)
         window_path = os.path.join(fold_dir, "window_predictions.pkl")
         window.to_pickle(window_path)
         fold["window_predictions"] = os.path.relpath(window_path, save_dir)
@@ -639,6 +643,7 @@ def _execute_windows(
         write_manifest()
         del handler
     stitched = pd.concat(predictions, ignore_index=True)
+    validate_predictions(stitched, manifest)
     if stitched.duplicated(subset=["symbol", "open_time_date_utc"]).any():
         raise RuntimeError("Rolling OOS predictions overlap")
     stitched.to_pickle(os.path.join(save_dir, manifest["predictions"]))
@@ -646,6 +651,10 @@ def _execute_windows(
     if development.duplicated(subset=["symbol", "open_time_date_utc"]).any():
         raise RuntimeError("Rolling development predictions overlap")
     development.to_pickle(os.path.join(save_dir, "development_predictions.pkl"))
+    all_windows = pd.concat(window_predictions, ignore_index=True)
+    validate_predictions(all_windows, manifest, allow_in_sample=True)
+    all_windows.to_pickle(os.path.join(save_dir, "window_predictions.pkl"))
+    manifest["window_predictions"] = "window_predictions.pkl"
     manifest["development_predictions"] = "development_predictions.pkl"
     manifest["prediction_columns"] = list(stitched.columns)
     manifest["oos_metrics"] = {}
@@ -739,6 +748,7 @@ def train_windows(
     copy_data_config_meta(prep_output_dir, save_dir)
     manifest = {
         "status": "running", "data_id": provenance["data_id"],
+        "prediction_contract": 1,
         "include_forward": include_forward, "window_mode": mode,
         "forward_start": forward_start.isoformat(),
         "rolling_config": asdict(rolling_config) if rolling_config else None,
@@ -778,15 +788,22 @@ def train_windows(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train models on one or more chronological windows")
     planning = parser.add_mutually_exclusive_group()
-    planning.add_argument("--rolling", action="store_true")
+    planning.add_argument("--rolling", dest="rolling", action="store_true",
+                          help="Use rolling training windows (default)")
+    planning.add_argument("--single", dest="rolling", action="store_false",
+                          help="Use one ratio-based training window")
     planning.add_argument("--windows-file", help="JSON list of explicit chronological windows")
+    parser.set_defaults(rolling=True)
     parser.add_argument("--mode", choices=("sliding", "expanding"), default="expanding",
                         help="Training window mode used with --rolling")
     parser.add_argument("--prep-output-dir", default=common.DATA_OUT_DIR)
     parser.add_argument("--save-dir")
     parser.add_argument("--train-months", type=int, default=12)
     parser.add_argument("--validation-months", type=int, default=2)
-    parser.add_argument("--oos-months", type=int, default=1)
+    parser.add_argument("--oos-months", type=int, default=3)
+    parser.add_argument("--oos-days", type=int, help="Retrain every N days; overrides --oos-months")
+    parser.add_argument("--train-days", type=int, help="Training history in days; overrides --train-months")
+    parser.add_argument("--validation-days", type=int, help="Validation history in days; overrides --validation-months")
     args = parser.parse_args()
     windows = None
     if args.windows_file:
@@ -803,7 +820,8 @@ if __name__ == "__main__":
             rolling_config=RollingConfig(
                 mode=args.mode, train_months=args.train_months,
                 validation_months=args.validation_months, oos_months=args.oos_months,
-            ) if args.rolling else None,
+                oos_days=args.oos_days, train_days=args.train_days, validation_days=args.validation_days,
+            ) if args.rolling and windows is None else None,
             prep_output_dir=args.prep_output_dir, save_dir=args.save_dir, logger=session_logger,
         )
     finally:

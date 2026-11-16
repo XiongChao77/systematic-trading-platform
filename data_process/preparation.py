@@ -43,10 +43,12 @@ def _load_tbm_intrabar_data(para, logger):
     if not isinstance(para, (common.BaseDefine, common.MartingaleDefine, common.PureBinaryDefine)):
         return None, None
     hierarchical = para.label_type in ("TBM", "BBM", "PURE_BINARY")
-    intrabar_interval = (
-        "1m" if hierarchical and common.get_interval_ms(para.interval) > 60_000
-        else None if hierarchical else para.resolve_tbm_intrabar_interval()
-    )
+    if hierarchical:
+        intrabar_interval = "1m" if common.get_interval_ms(para.interval) > 60_000 else None
+    elif isinstance(para, common.MartingaleDefine):
+        intrabar_interval = para.resolve_tbm_intrabar_interval()
+    else:
+        intrabar_interval = None
     if intrabar_interval is None:
         return None, None
     interval_ms = common.get_interval_ms(para.interval)
@@ -131,11 +133,7 @@ def _prepare_multiasset(logger, feature_group_list, feature_conf_list, para,
 
 def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,feature_conf_list=[],para: common.PreparationConfig = common.BaseDefine(), prep_output_dir =common.DATA_OUT_DIR,
          split_time=None, start_time=None, end_time=None):
-    if isinstance(para, common.BaseDefine):
-        # Persist the effective scan interval so downstream artifacts describe
-        # the actual labeling source rather than an unresolved automatic value.
-        para = replace(para, tbm_intrabar_interval=para.resolve_tbm_intrabar_interval())
-    elif isinstance(para, common.MartingaleDefine):
+    if isinstance(para, common.MartingaleDefine):
         para = replace(para, intrabar_interval=para.resolve_tbm_intrabar_interval())
     if len(para.symbols) > 1:
         return _prepare_multiasset(
@@ -254,6 +252,23 @@ def main(logger:logging.Logger, feature_group_list = common.FEATURE_GROUP_LIST,f
         }.get(label_val, "UNKNOWN")
         pct_val = proportions[label_val]
         logger.info(f"Label {label_val} ({label_name}): {cnt} rows, ratio {pct_val:.4%}")
+    if para.label_type == "TBM":
+        invalid_count = int((df[label_col] == common.Signal.INVALID).sum())
+        descriptions = {
+            "volatility_warmup": "Volatility estimator warmup (insufficient historical observations)",
+            "invalid_volatility_estimate": "Non-finite volatility estimate after warmup",
+            "insufficient_future_window": "Insufficient future candles at the end of the dataset",
+            "future_time_gap": "Missing or misaligned future-window timestamp",
+            "unresolved_barrier_order": "Barrier order unresolved after 1m / aggTrades resolution",
+        }
+        logger.info("=== TBM INVALID breakdown (one primary reason per sample) ===")
+        logger.info("%-73s | %8s | %12s | %12s", "Reason", "Count", "All samples", "INVALID only")
+        for reason, count in df.attrs["tbm_invalid_reason_counts"].items():
+            logger.info(
+                "%-73s | %8d | %11.4f%% | %11.4f%%", descriptions[reason], count,
+                count / len(df) * 100 if len(df) else 0.0,
+                count / invalid_count * 100 if invalid_count else 0.0,
+            )
     logger.info("==========================\n")
     
     # ---------------------------------------------------------

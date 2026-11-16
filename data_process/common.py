@@ -94,7 +94,6 @@ class BaseDefine(MarketDataSourceConfig):
     vol_multiplier_short: float = 1.7
     stop_multiplier_rate_short: Optional[float] = None
     tbm_take_profit_price: Optional[Literal["close", "high_low"]] = None
-    tbm_intrabar_interval: Optional[str] = None  # Auto-select 1m for TBM intervals above 1m.
     min_expected_move_pct: float = 0.01
     version: float = 0.1
 
@@ -108,16 +107,6 @@ class BaseDefine(MarketDataSourceConfig):
             raise ValueError("vol_sma_window must be a positive integer")
         if self.label_type == "PURE_BINARY":
             raise ValueError("PURE_BINARY requires PureBinaryDefine")
-        if self.tbm_intrabar_interval is not None and self.label_type != "TBM":
-            raise ValueError("tbm_intrabar_interval is only supported for TBM labels")
-
-    def resolve_tbm_intrabar_interval(self) -> Optional[str]:
-        """Use minute paths by default for every higher-interval TBM task."""
-        if self.label_type != "TBM":
-            return None
-        if self.tbm_intrabar_interval is not None:
-            return self.tbm_intrabar_interval
-        return "1m" if get_interval_ms(self.interval) > 60000 else None
 
 
 @dataclass
@@ -1463,6 +1452,28 @@ def attach_triple_barrier_label(df, para=BaseDefine, label_col="label", intrabar
     df.loc[~valid_label, "reach_time"] = -1
     for col in TBM_REACH_TIME_COLUMNS.values():
         df.loc[~valid_label, col] = -1
+
+    # Assign one primary reason per invalid anchor so counts are additive.
+    finite_estimate = np.isfinite(df["expected_vol"].to_numpy())
+    warmup_bars = (
+        max(para.vol_ewma_span, para.vol_sma_window) - 1
+        if para.vol_method == "hybrid" else 0
+    )
+    invalid = df[label_col].to_numpy() == int(Signal.INVALID)
+    remaining = invalid.copy()
+    reason_masks = {
+        "volatility_warmup": ~finite_estimate & (np.arange(len(df)) < warmup_bars),
+        "invalid_volatility_estimate": ~finite_estimate,
+        "insufficient_future_window": target_times > time_values[-1],
+        "future_time_gap": ~time_match,
+        "unresolved_barrier_order": np.ones(len(df), dtype=bool),
+    }
+    reason_counts = {}
+    for reason, mask in reason_masks.items():
+        selected = remaining & mask
+        reason_counts[reason] = int(selected.sum())
+        remaining &= ~selected
+    df.attrs["tbm_invalid_reason_counts"] = reason_counts
 
     return df
 

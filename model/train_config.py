@@ -30,12 +30,31 @@ class RollingConfig:
     validation_months: int = 2
     oos_months: int = 1
     mode: str = "expanding"
+    oos_days: Optional[int] = None
+    train_days: Optional[int] = None
+    validation_days: Optional[int] = None
 
     def __post_init__(self):
         if self.mode not in ("sliding", "expanding"):
             raise ValueError("Rolling mode must be sliding or expanding")
         if min(self.train_months, self.validation_months, self.oos_months) < 1:
             raise ValueError("Rolling window lengths must be positive calendar months")
+        for name in ("oos_days", "train_days", "validation_days"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                raise ValueError(f"{name} must be a positive integer when set")
+
+    def training_offset(self):
+        import pandas as pd
+        return pd.DateOffset(days=self.train_days) if self.train_days is not None else pd.DateOffset(months=self.train_months)
+
+    def validation_offset(self):
+        import pandas as pd
+        return pd.DateOffset(days=self.validation_days) if self.validation_days is not None else pd.DateOffset(months=self.validation_months)
+
+    def update_offset(self, count=1):
+        import pandas as pd
+        return pd.DateOffset(days=count * self.oos_days) if self.oos_days is not None else pd.DateOffset(months=count * self.oos_months)
 
 
 @dataclass

@@ -21,8 +21,6 @@ from data_process.common import *
 from data_process import common
 from data_process.utils import TaskIdentity, config_from_dict_train, param_hash
 from model import model_loader
-from model import data_loader
-from model.training_types import temporal_split_bounds
 from trade.runner import cus_analyzer
 from trade.runner.analyze_backtest_report import (
     analyze_backtest_report,
@@ -205,8 +203,7 @@ def _resolve_device(device_name):
     return torch.device(device_name) if isinstance(device_name, str) else device_name
 
 
-_MODEL_TIME_REGION_CACHE: dict[tuple, dict] = {}
-_PREDICTION_CACHE_SCHEMA = 6
+_PREDICTION_CACHE_SCHEMA = 7
 _PREDICTION_COLUMNS = (
     "pred",
     "direction_pred",
@@ -233,7 +230,11 @@ def _prediction_artifact_files(train_output_dir: str) -> list[str]:
             files.add(rolling_path)
             with open(rolling_path, "r", encoding="utf-8") as handle:
                 rolling_manifest = json.load(handle)
-            files.add(os.path.abspath(os.path.join(directory, rolling_manifest["predictions"])))
+            for key in ("predictions", "development_predictions", "window_predictions"):
+                if rolling_manifest.get(key):
+                    files.add(os.path.abspath(os.path.join(directory, rolling_manifest[key])))
+            for fold in rolling_manifest["folds"]:
+                visit(os.path.join(directory, fold["model_dir"]))
         description_path = os.path.join(directory, "task_description.json")
         if os.path.isfile(description_path):
             files.add(description_path)
@@ -247,7 +248,7 @@ def _prediction_artifact_files(train_output_dir: str) -> list[str]:
                         relative_path = value.get(key)
                         if relative_path:
                             files.add(os.path.abspath(os.path.join(directory, relative_path)))
-        for filename in ("model.pt", "meta.json", "train_config.json"):
+        for filename in ("model.pt", "meta.json", "train_config.json", "window_metadata.json"):
             path = os.path.join(directory, filename)
             if os.path.isfile(path):
                 files.add(path)
@@ -408,81 +409,6 @@ def _load_model_period_frame(
     raise AssertionError("validated period was not handled")
 
 
-def _model_time_regions(
-    data_config: ModelDataConfig,
-    train_cfg: train_config.TrainConfig,
-    handler: model_loader.ModelHandler,
-    current_frame: pd.DataFrame,
-    period: str,
-) -> dict[str, dict[str, Any]]:
-    """Calculate the exact train/valid/test/OOS timestamp regions."""
-    data_cfg = train_cfg.data_cfg
-    cache_key = (
-        os.path.abspath(data_config.prep_output_dir),
-        tuple(handler.feature_cols),
-        handler.label_col,
-        handler.seq_len,
-        train_cfg.stride,
-        data_cfg.train_ratio,
-        data_cfg.val_ratio,
-        data_cfg.purge_overlap,
-    )
-    cached = _MODEL_TIME_REGION_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    train_frame = current_frame if period in {"development", "long"} else common.load_train_df_from_dir(data_config.prep_output_dir)
-    oos_frame = current_frame if period == "forward" else common.load_test_df_from_dir(data_config.prep_output_dir)
-    valid_indices = data_loader.valid_window_end_indices(
-        train_frame,
-        feature_cols=handler.feature_cols,
-        label_col=handler.label_col,
-        seq_len=handler.seq_len,
-        stride=train_cfg.stride,
-    )
-    bounds = temporal_split_bounds(
-        len(valid_indices),
-        train_ratio=data_cfg.train_ratio,
-        val_ratio=data_cfg.val_ratio,
-        purge_overlap=data_cfg.purge_overlap,
-        seq_len=handler.seq_len,
-        stride=train_cfg.stride,
-    )
-
-    def as_iso(value) -> str:
-        # Prepared feather frames can hold timezone-naive timestamps, so the
-        # region boundaries must be normalized before they are compared with
-        # the UTC-aware backtest frame.
-        timestamp = pd.Timestamp(value)
-        if timestamp.tzinfo is None:
-            timestamp = timestamp.tz_localize("UTC")
-        else:
-            timestamp = timestamp.tz_convert("UTC")
-        return timestamp.isoformat()
-
-    def sample_time(sample_position: int) -> str:
-        row_index = valid_indices[sample_position]
-        return as_iso(train_frame.loc[row_index, "open_time_date_utc"])
-
-    regions = {
-        name: {
-            "start": sample_time(start),
-            "end": sample_time(end - 1),
-            "sample_count": end - start,
-        }
-        for name, (start, end) in bounds.items()
-    }
-    oos_times = pd.to_datetime(oos_frame["open_time_date_utc"], utc=True)
-    if oos_times.empty:
-        raise ValueError("OOS dataset is empty; cannot calculate plot boundaries")
-    regions["oos"] = {
-        "start": as_iso(oos_times.iloc[0]),
-        "end": as_iso(oos_times.iloc[-1]),
-    }
-    _MODEL_TIME_REGION_CACHE[cache_key] = regions
-    return regions
-
-
 def _infer_prediction_payload(
     logger,
     data_config: ModelDataConfig,
@@ -503,13 +429,20 @@ def _infer_prediction_payload(
         if not manifest.get("data_id") or manifest["data_id"] != prep_manifest["data_id"]:
             raise ValueError("Rolling prediction data_id does not match the preparation manifest")
 
-        prediction_key = "development_predictions" if period == "development" else "predictions"
+        prediction_key = {"development": "development_predictions", "all": "window_predictions"}.get(period, "predictions")
         prediction_file = manifest.get(prediction_key)
         if not prediction_file:
             raise ValueError(
                 f"Rolling manifest has no {prediction_key!r}; retrain to export it"
             )
         saved_predictions = pd.read_pickle(os.path.join(train_output_dir, prediction_file))
+        from model.window_predictions import validate_predictions
+        validate_predictions(saved_predictions, manifest, allow_in_sample=period in ("development", "all"))
+        diagnostic_count = int(saved_predictions["prediction_scope"].ne("oos").sum())
+        logger.info("Using saved window predictions | OOS=%d | in-sample diagnostics=%d",
+                    len(saved_predictions) - diagnostic_count, diagnostic_count)
+        if diagnostic_count:
+            logger.warning("First-model train/validation predictions are in-sample diagnostics; evaluate OOS performance separately")
         time_column = "open_time_date_utc"
         missing_columns = [column for column in (time_column, *_PREDICTION_COLUMNS) if column not in saved_predictions.columns]
         if missing_columns:
@@ -539,6 +472,11 @@ def _infer_prediction_payload(
             first_fold = development_folds[0]
             time_regions["train"] = {
                 "start": pd.Timestamp(first_fold["train_start"]).isoformat(),
+                "end": pd.Timestamp(first_fold["validation_start"]).isoformat(),
+                "exclusive_end": True,
+            }
+            time_regions["valid"] = {
+                "start": pd.Timestamp(first_fold["validation_start"]).isoformat(),
                 "end": pd.Timestamp(first_fold["oos_start"]).isoformat(),
                 "exclusive_end": True,
             }
@@ -549,6 +487,14 @@ def _infer_prediction_payload(
                 ).isoformat(),
             }
         else:
+            if period == "all":
+                first = manifest["folds"][0]
+                time_regions["train"] = {
+                    "start": first["train_start"], "end": first["validation_start"], "exclusive_end": True,
+                }
+                time_regions["valid"] = {
+                    "start": first["validation_start"], "end": first["oos_start"], "exclusive_end": True,
+                }
             for phase, region_name in (("development", "test"), ("forward", "oos")):
                 folds = [fold for fold in manifest["folds"] if fold["phase"] == phase]
                 if not folds:
@@ -568,6 +514,8 @@ def _infer_prediction_payload(
             tarin_out_path=os.path.join(train_output_dir, manifest["folds"][0]["model_dir"]),
             device=_resolve_device(data_config.device),
         )
+        if handler.task_type == train_config.TrainTask.TRIGGER:
+            raise ValueError("A standalone TRIGGER has no trading direction; fuse its window predictions with DIRECTION")
         sub_columns = [
             column for column in predictions.columns
             if any(
@@ -628,57 +576,10 @@ def _infer_prediction_payload(
             "time_regions": time_regions,
         }
 
-    handler = model_loader.ModelHandler(
-        tarin_out_path=train_output_dir,
-        device=_resolve_device(data_config.device),
+    raise ValueError(
+        "Backtesting requires a train_windows output root with rolling_manifest.json; "
+        "a detached checkpoint cannot define a safe historical prediction schedule"
     )
-    time_regions = _model_time_regions(
-        data_config,
-        train_cfg,
-        handler,
-        frame,
-        period,
-    )
-    dataset = data_loader.TimeSeriesWindowDataset(
-        df=frame,
-        kline_interval_ms=interval_ms,
-        feature_cols=handler.feature_cols,
-        label_col=handler.label_col,
-        seq_len=handler.seq_len,
-        is_live=False,
-        materialize_windows=False,
-    )
-    predicted_frame, model_stats, sub_model_stats, sub_model_predictions = (
-        handler.predict_with_ds(
-            dataset,
-            frame,
-            is_live=False,
-            batch_size=inference_batch_size,
-            diff_thresh=None,
-            evaluate_sub_models=True,
-        )
-    )
-    first_valid_idx = predicted_frame["pred"].first_valid_index()
-    if first_valid_idx is None:
-        raise RuntimeError("No valid predictions found in the entire dataset")
-
-    predictions = predicted_frame.loc[:, list(_PREDICTION_COLUMNS)].copy()
-    if len(sub_model_predictions.columns):
-        predictions = predictions.join(sub_model_predictions)
-    stage_model_stats = handler.stage_performance(
-        predicted_frame,
-        time_regions,
-        sub_model_predictions=sub_model_predictions,
-    )
-    return {
-        "schema": _PREDICTION_CACHE_SCHEMA,
-        "predictions": predictions,
-        "first_valid_idx": first_valid_idx,
-        "model_stats": model_stats,
-        "sub_model_stats": sub_model_stats,
-        "stage_model_stats": stage_model_stats,
-        "time_regions": time_regions,
-    }
 
 
 def _prediction_inputs(data_config: ModelDataConfig, period: str):
@@ -689,6 +590,8 @@ def _prediction_inputs(data_config: ModelDataConfig, period: str):
     train_output_dir = data_config.train_output_dir
     if not os.path.isabs(train_output_dir):
         train_output_dir = os.path.join(PROJECT_DIR, train_output_dir)
+    if not os.path.isfile(os.path.join(train_output_dir, "rolling_manifest.json")):
+        raise ValueError("Backtesting requires a train_windows output root, not a detached checkpoint")
     return pre_para, frame, train_output_dir, common.get_interval_ms(pre_para.interval)
 
 
@@ -778,19 +681,6 @@ def _load_model_data(
     sub_model_stats = payload["sub_model_stats"]
     stage_model_stats = payload.get("stage_model_stats") or {}
     time_regions = payload["time_regions"]
-    if period == "development" and time_regions.get("test"):
-        # A single-fold run exposes the in-sample span as Train and the
-        # untouched last slice as OOS, so both stages report separately.
-        time_regions = {
-            "train": {
-                "start": time_regions["train"]["start"],
-                "end": time_regions["test"]["start"],
-                "exclusive_end": True,
-            },
-            "valid": {},
-            "test": {},
-            "oos": time_regions["test"],
-        }
     logger.info(
         "Model time regions | train=%s | valid=%s | test=%s | OOS=%s",
         time_regions["train"].get("start"),
@@ -885,6 +775,9 @@ _STAGE_PREDICTION_COLUMNS = (
     "prob_long",
     "net_score",
     "direction_pred",
+    "fold_id",
+    "prediction_scope",
+    "model_available_at",
 )
 
 
@@ -1059,7 +952,6 @@ def _labeling_summary(pre_para) -> dict:
         "stop_loss_vol_multiple_short": _optional_product(vol_short, stop_rate_short),
         "label_window_bars": getattr(pre_para, "predict_num", None),
         "min_expected_move_pct": getattr(pre_para, "min_expected_move_pct", None),
-        "tbm_intrabar_interval": getattr(pre_para, "tbm_intrabar_interval", None),
     }
 
 
@@ -1457,10 +1349,6 @@ def build_stage_summary_markdown(summary: dict) -> str:
                     (
                         "min expected move",
                         _md_pct(labeling.get("min_expected_move_pct")) + " of price",
-                    ),
-                    (
-                        "intrabar interval",
-                        _md_text(labeling.get("tbm_intrabar_interval")),
                     ),
                 ]
             )

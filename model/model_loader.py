@@ -361,8 +361,7 @@ class ModelHandler(MetaConfig):
         """Evaluate fused and sub-model metrics separately for every stage.
 
         ``frame`` must carry the label column and the fused ``pred`` column.
-        ``time_regions`` provides the stage timestamp boundaries produced by
-        ``backtest_runner._model_time_regions``.
+        ``time_regions`` provides the timestamp boundaries recorded by window training.
         """
         if time_regions is None or not time_regions:
             return {}
@@ -390,7 +389,8 @@ class ModelHandler(MetaConfig):
                 continue
             start = pd.Timestamp(region["start"])
             end = pd.Timestamp(region["end"])
-            stage_frame = metric_frame.loc[(times >= start) & (times <= end)]
+            before_end = times < end if region.get("exclusive_end") else times <= end
+            stage_frame = metric_frame.loc[(times >= start) & before_end]
             stage_result = {
                 "start": region["start"],
                 "end": region["end"],
@@ -670,6 +670,57 @@ class ModelHandler(MetaConfig):
             self._sub_model_metrics(collected),
             sub_model_predictions,
         )
+
+    def predict_binary_component_with_ds(self, ds, df, is_live=False, batch_size=512, **kwargs):
+        """Export a binary component once, including its unfused probabilities.
+
+        Trigger predictions describe action/no-action and are only suitable for
+        component analysis or subsequent fusion, never directional trading.
+        """
+        if self.task_type not in (TrainTask.TRIGGER, TrainTask.DIRECTION,
+                                  TrainTask.LONG_OVR, TrainTask.SHORT_OVR):
+            raise ValueError("Component export requires a directional or trigger binary task")
+        self._validate_inference_dataset(ds)
+        frame = df.copy()
+        for column in ("pred", "direction_pred", "pred_prob", "prob_short", "prob_neutral",
+                       "prob_long", "net_score", "regression_score"):
+            frame[column] = np.nan
+        role = self.task_type.lower()
+        sub = pd.DataFrame(index=df.index, columns=[f"sub_{role}_pred", f"sub_{role}_prob_0",
+                                                   f"sub_{role}_prob_1"], dtype=float)
+        batches = []
+        self.model.eval()
+        with torch.no_grad():
+            for inputs, _, _ in self._inference_batches(ds, batch_size):
+                logits = self.model.model(inputs.to(self.device))
+                batches.append(torch.softmax(logits.float(), dim=1).cpu().numpy())
+        if not batches:
+            return frame, {}, {}, sub
+        probabilities = np.concatenate(batches)
+        if probabilities.shape != (len(ds), 2) or not np.isfinite(probabilities).all():
+            raise ValueError("Binary component produced invalid probabilities")
+        indices = [df.index[-1]] if is_live else ds.indices
+        probabilities = probabilities[-1:] if is_live else probabilities
+        negative, positive = probabilities.T
+        raw_pred = probabilities.argmax(axis=1)
+        sub.loc[indices] = np.column_stack((raw_pred, negative, positive))
+        zero = np.zeros_like(positive)
+        if self.task_type == TrainTask.TRIGGER:
+            mapped = np.column_stack((zero, negative, positive))
+            signals = raw_pred
+        else:
+            if self.task_type == TrainTask.DIRECTION:
+                mapped = np.column_stack((negative, zero, positive))
+            elif self.task_type == TrainTask.LONG_OVR:
+                mapped = np.column_stack((zero, negative, positive))
+            else:
+                mapped = np.column_stack((positive, negative, zero))
+            signals = _decode_class_indices(mapped.argmax(axis=1))
+        frame.loc[indices, ["prob_short", "prob_neutral", "prob_long"]] = mapped
+        frame.loc[indices, "pred"] = signals
+        frame.loc[indices, "pred_prob"] = mapped.max(axis=1)
+        frame.loc[indices, "net_score"] = mapped[:, 2] - mapped[:, 0]
+        return frame, {}, {}, sub
 
     def predict_raw_probabilities_with_ds(self, ds, df, is_live=False, batch_size=512):
         """Predict survival probabilities without adapting them to trading signals."""

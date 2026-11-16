@@ -741,11 +741,16 @@ def _train_task(
         result = train.train_windows(
             logger=logger,
             configs=[t_cfg],
+            rolling_config=train_config.RollingConfig(
+                train_months=12,
+                validation_months=4,
+                oos_months=1,
+                mode="expanding",
+            ),
             prep_output_dir=prep_output_dir,
             save_dir=save_dir,
         )
-        # Batch fusion and static backtests consume the one window's model artifact.
-        save_dir = os.path.join(save_dir, result["folds"][0]["model_dir"])
+        # All window counts use the training root and its recorded predictions.
 
         if sim_tasks:
             # Re-load the just-saved checkpoint in this same training process. If CUDA

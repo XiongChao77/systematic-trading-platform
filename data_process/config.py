@@ -42,7 +42,6 @@ DOGE_5m_TBM = replace(
     DOGE_15m_TBM,
     interval="5m",
     vol_method="ewma",
-    tbm_intrabar_interval="1m",
     vol_ewma_span = 12*24*7,
     predict_num =12*8,
     vol_multiplier_long = 12,
