@@ -103,6 +103,7 @@ unavailable.
 ```bash
 uvicorn UI.backend.main:app --host 0.0.0.0 --port 8000
 cd UI/quant-ui
+npm install
 npm run dev
 ```
 
@@ -110,6 +111,7 @@ For a single-process deployment, build the frontend first and open port 8000:
 
 ```bash
 cd UI/quant-ui
+npm install
 npm run build
 cd ../..
 uvicorn UI.backend.main:app --host 0.0.0.0 --port 8000

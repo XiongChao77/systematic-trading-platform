@@ -2,14 +2,15 @@ import "./live.css";
 
 import { escapeHtml, formatPrice } from "../../shared/formatters.js";
 import { loadLiveStrategies, loadLiveStrategy, releaseLiveViewer } from "./live-api.js";
+import { mountOverview } from "./live-overview.js";
 
 const REFRESH_INTERVAL_MS = 1_000;
 
 export async function mountLivePage(container, context) {
   const instanceId = context.params.get("instance_id");
-  return instanceId
-    ? mountDetail(container, context, instanceId)
-    : mountList(container, context);
+  if (instanceId) return mountDetail(container, context, instanceId);
+  if (context.params.get("view") === "strategies") return mountList(container, context);
+  return mountOverview(container, context);
 }
 
 function mountList(container, context) {
@@ -29,6 +30,7 @@ function mountList(container, context) {
     <section class="module-page scroll-page live-page">
       <header class="page-header live-list-header">
         <div>
+          <button type="button" class="back-button" data-action="back-overview">← 返回资金总览</button>
           <p class="page-eyebrow">Live monitoring</p>
           <h1>Strategy List</h1>
           <p class="page-subtitle">Current state reported by live runners</p>
@@ -63,6 +65,9 @@ function mountList(container, context) {
       </section>
     </section>
   `;
+  container.querySelector('[data-action="back-overview"]').addEventListener("click", () => {
+    context.navigate("live");
+  });
 
   const state = container.querySelector('[data-role="state"]');
   const tableWrap = container.querySelector('[data-role="table-wrap"]');
@@ -231,7 +236,7 @@ function mountDetail(container, context, instanceId) {
   `;
 
   container.querySelector('[data-action="back"]').addEventListener("click", () => {
-    context.navigate("live");
+    context.navigate("live", { view: "strategies" });
   });
   const cards = container.querySelector('[data-role="cards"]');
   const state = container.querySelector('[data-role="state"]');

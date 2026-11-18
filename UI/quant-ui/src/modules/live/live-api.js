@@ -1,5 +1,9 @@
 import { apiRequest } from "../../shared/api-client.js";
 
+export function loadLiveOverview(options) {
+  return apiRequest("/api/live/overview", options);
+}
+
 export function loadLiveStrategies({ viewerId, ...options } = {}) {
   return apiRequest(`/api/live/strategies?viewer_id=${encodeURIComponent(viewerId || "")}`, options);
 }

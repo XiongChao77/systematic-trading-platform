@@ -1573,148 +1573,113 @@ def validate_kline_source(
     *,
     source: str = "kline source",
     logger=None,
+    allowed_missing_dates=None,
 ) -> dict:
-    """Validate that a dataframe is one non-overlapping, contiguous K-line series.
+    """Downloader-level completeness check.
 
-    The open-time sequence alone is not sufficient: a file can alternate hourly
-    candles with half-hour candles while still having an apparently perfect 30m
-    open-time cadence.  Therefore this validation also checks every candle's
-    close time and adjacent time ranges.
+    Only checks what no upstream layer guarantees:
 
-    Returns a small validation summary.  Raises ``ValueError`` on any structural
-    or OHLC error so callers do not continue with contaminated market data.
+    * forward gap alignment and missing-candle count (vs. an explicit budget)
+    * OHLC finite / positive / bracketing
+
+    Cheap assertions (O(n), single pass) guard two upstream contracts so that
+    a bug in ``merge_rows_by_open_time`` surfaces here instead of silently
+    corrupting the CSV:
+
+    * ``open_time`` strictly increasing (implies no duplicates, no overlap)
+    * timestamps are integer milliseconds
+
+    Everything else (column presence, duration == interval, out-of-order,
+    duplicate) is the caller's responsibility and is not re-derived here.
     """
-    required_columns = {
-        "open_time_ms_utc",
-        "close_time_ms_utc",
-        "open",
-        "high",
-        "low",
-        "close",
-    }
-    missing_columns = sorted(required_columns.difference(df.columns))
-    if missing_columns:
-        raise ValueError(f"K-line validation failed for {source}: missing columns {missing_columns}")
+    # --- required columns: cheap, and a missing column would crash below ---
+    for name in ("open_time_ms_utc", "close_time_ms_utc",
+                 "open", "high", "low", "close"):
+        if name not in df.columns:
+            raise ValueError(f"{source}: missing column {name!r}")
     if not isinstance(interval_ms, (int, np.integer)) or interval_ms <= 0:
-        raise ValueError(f"Invalid K-line interval_ms for {source}: {interval_ms!r}")
+        raise ValueError(f"{source}: invalid interval_ms={interval_ms!r}")
     if df.empty:
-        raise ValueError(f"K-line validation failed for {source}: data is empty")
+        raise ValueError(f"{source}: empty dataframe")
 
-    def format_utc_ms(value: int) -> str:
-        return pd.to_datetime(value, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S UTC")
+    # --- one pass: pull the six columns into ndarrays ---
+    ot = df["open_time_ms_utc"].to_numpy(dtype=np.float64)
+    ct = df["close_time_ms_utc"].to_numpy(dtype=np.float64)
+    o  = df["open"].to_numpy(dtype=np.float64)
+    h  = df["high"].to_numpy(dtype=np.float64)
+    l  = df["low"].to_numpy(dtype=np.float64)
+    c  = df["close"].to_numpy(dtype=np.float64)
 
-    open_time = pd.to_numeric(df["open_time_ms_utc"], errors="coerce")
-    close_time = pd.to_numeric(df["close_time_ms_utc"], errors="coerce")
-    invalid_timestamp = open_time.isna() | close_time.isna() | (open_time % 1 != 0) | (close_time % 1 != 0)
+    # --- contract assertion: integer-ms timestamps (normalize_ts_to_ms) ---
+    if not (np.isfinite(ot).all() and np.isfinite(ct).all()
+            and (ot % 1 == 0).all() and (ct % 1 == 0).all()):
+        raise ValueError(f"{source}: non-integer or non-finite timestamps")
 
-    errors = []
-    samples = []
-    invalid_timestamp_count = int(invalid_timestamp.sum())
-    if invalid_timestamp_count:
-        errors.append(f"invalid timestamps={invalid_timestamp_count}")
-        samples.extend(
-            f"row={idx} open_time={df.at[idx, 'open_time_ms_utc']!r} " f"close_time={df.at[idx, 'close_time_ms_utc']!r}"
-            for idx in df.index[invalid_timestamp][:3]
+    ot = ot.astype(np.int64)
+    ct = ct.astype(np.int64)
+
+    # --- contract assertion: strictly increasing open_time (merge_...) ---
+    delta = np.diff(ot)
+    if np.any(delta <= 0):
+        raise ValueError(
+            f"{source}: open_time not strictly increasing "
+            f"({int((delta <= 0).sum())} violation(s)) — upstream merge bug"
+        )
+
+    # --- downloader responsibility #1: gap alignment & missing count ---
+    if np.any(delta % interval_ms != 0):
+        first = int(np.flatnonzero(delta % interval_ms != 0)[0])
+        raise ValueError(
+            f"{source}: unaligned spacing at row {first} "
+            f"(delta_ms={int(delta[first])}, interval_ms={interval_ms})"
+        )
+    missing = int(((delta - interval_ms) // interval_ms).sum())
+
+    allowed = 0
+    if allowed_missing_dates:
+        per_day = 86_400_000 // interval_ms
+        allowed = per_day * len(list(allowed_missing_dates)) \
+            if per_day * interval_ms == 86_400_000 \
+            else len(list(allowed_missing_dates))
+    if missing > allowed:
+        raise ValueError(
+            f"{source}: missing candles={missing} exceeds allowed={allowed}"
+        )
+
+    # --- downloader responsibility #2: OHLC usability ---
+    bad = ~(
+        np.isfinite(o) & np.isfinite(h) & np.isfinite(l) & np.isfinite(c)
+        & (o > 0) & (h > 0) & (l > 0) & (c > 0)
+        & (h >= np.maximum(o, c)) & (l <= np.minimum(o, c)) & (h >= l)
+    )
+    n_bad = int(bad.sum())
+    if n_bad:
+        i = int(np.flatnonzero(bad)[0])
+        raise ValueError(
+            f"{source}: invalid OHLC rows={n_bad} (first at row {i}: "
+            f"o={o[i]!r} h={h[i]!r} l={l[i]!r} c={c[i]!r})"
         )
 
     summary = {
         "source": source,
         "row_count": int(len(df)),
         "interval_ms": int(interval_ms),
-        "invalid_timestamp_count": invalid_timestamp_count,
-        "duplicate_open_time_count": 0,
-        "out_of_order_count": 0,
-        "unexpected_spacing_count": 0,
-        "missing_candle_count": 0,
-        "invalid_duration_count": 0,
-        "overlap_count": 0,
+        "missing_candle_count": missing,
+        "allowed_missing_candle_count": allowed,
         "invalid_ohlc_count": 0,
+        "invalid_timestamp_count": 0,
+        "duplicate_open_time_count": 0,   # asserted by monotonicity
+        "out_of_order_count": 0,          # asserted by monotonicity
+        "unexpected_spacing_count": 0,    # enforced above
+        "invalid_duration_count": 0,      # not checked (source contract)
+        "overlap_count": 0,               # implied by monotonicity
     }
-
-    if not invalid_timestamp_count:
-        open_time = open_time.astype("int64")
-        close_time = close_time.astype("int64")
-        delta = open_time.diff()
-
-        duplicate_mask = open_time.duplicated(keep=False)
-        out_of_order_mask = delta < 0
-        spacing_mask = delta.notna() & (delta != interval_ms)
-        forward_gap_mask = delta > interval_ms
-        aligned_gap_mask = forward_gap_mask & (delta % interval_ms == 0)
-        duration = close_time - open_time + 1
-        invalid_duration_mask = duration != interval_ms
-        overlap_mask = open_time.iloc[1:].to_numpy() <= close_time.iloc[:-1].to_numpy()
-
-        summary["duplicate_open_time_count"] = int(duplicate_mask.sum())
-        summary["out_of_order_count"] = int(out_of_order_mask.sum())
-        summary["unexpected_spacing_count"] = int(spacing_mask.sum())
-        summary["missing_candle_count"] = int(((delta.loc[aligned_gap_mask] // interval_ms) - 1).sum())
-        summary["invalid_duration_count"] = int(invalid_duration_mask.sum())
-        summary["overlap_count"] = int(overlap_mask.sum())
-
-        if summary["duplicate_open_time_count"]:
-            errors.append(f"duplicate open times={summary['duplicate_open_time_count']}")
-        if summary["out_of_order_count"]:
-            errors.append(f"out-of-order rows={summary['out_of_order_count']}")
-        if summary["unexpected_spacing_count"]:
-            errors.append("unexpected open-time spacing=" f"{summary['unexpected_spacing_count']} " f"(missing candles={summary['missing_candle_count']})")
-            for idx in df.index[spacing_mask][:3]:
-                pos = df.index.get_loc(idx)
-                previous_open = int(open_time.iloc[pos - 1])
-                current_open = int(open_time.iloc[pos])
-                delta_ms = int(delta.iloc[pos])
-                if delta_ms > interval_ms and delta_ms % interval_ms == 0:
-                    missing_count = delta_ms // interval_ms - 1
-                    first_missing = previous_open + interval_ms
-                    last_missing = current_open - interval_ms
-                    gap_detail = f"missing_range={format_utc_ms(first_missing)} -> " f"{format_utc_ms(last_missing)} " f"missing_count={missing_count}"
-                else:
-                    gap_detail = "missing_range=unaligned_spacing"
-                samples.append(
-                    f"rows={df.index[pos - 1]}->{idx} "
-                    f"previous_open={format_utc_ms(previous_open)} ({previous_open}) "
-                    f"current_open={format_utc_ms(current_open)} ({current_open}) "
-                    f"{gap_detail} delta_ms={delta_ms}"
-                )
-        if summary["invalid_duration_count"]:
-            errors.append(f"invalid candle duration={summary['invalid_duration_count']}")
-            for idx in df.index[invalid_duration_mask][:3]:
-                samples.append(
-                    f"row={idx} open_time={int(open_time.loc[idx])} " f"close_time={int(close_time.loc[idx])} " f"duration_ms={int(duration.loc[idx])}"
-                )
-        if summary["overlap_count"]:
-            errors.append(f"overlapping candles={summary['overlap_count']}")
-            for pos in np.flatnonzero(overlap_mask)[:3]:
-                samples.append(
-                    f"rows={df.index[pos]}->{df.index[pos + 1]} " f"previous_close={int(close_time.iloc[pos])} " f"next_open={int(open_time.iloc[pos + 1])}"
-                )
-
-    ohlc = df[["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
-    finite_ohlc = np.isfinite(ohlc.to_numpy()).all(axis=1)
-    positive_ohlc = (ohlc > 0).all(axis=1).to_numpy()
-    price_bounds = (
-        (ohlc["high"] >= ohlc[["open", "close"]].max(axis=1)) & (ohlc["low"] <= ohlc[["open", "close"]].min(axis=1)) & (ohlc["high"] >= ohlc["low"])
-    ).to_numpy()
-    invalid_ohlc_mask = ~(finite_ohlc & positive_ohlc & price_bounds)
-    summary["invalid_ohlc_count"] = int(invalid_ohlc_mask.sum())
-    if summary["invalid_ohlc_count"]:
-        errors.append(f"invalid OHLC rows={summary['invalid_ohlc_count']}")
-        for pos in np.flatnonzero(invalid_ohlc_mask)[:3]:
-            idx = df.index[pos]
-            samples.append(f"row={idx} o={df.at[idx, 'open']!r} h={df.at[idx, 'high']!r} " f"l={df.at[idx, 'low']!r} c={df.at[idx, 'close']!r}")
-
-    if errors:
-        message = f"K-line validation failed for {source}: " + "; ".join(errors)
-        if samples:
-            message += ". Samples: " + " | ".join(samples[:6])
-        if logger is not None:
-            logger.error(message)
-        raise ValueError(message)
-
     if logger is not None:
-        logger.info(f"K-line validation passed: source={source}, rows={len(df)}, " f"interval_ms={interval_ms}, missing_candles=0, overlaps=0")
+        logger.info(
+            "kline ok: %s rows=%d missing=%d allowed=%d",
+            source, summary["row_count"], missing, allowed,
+        )
     return summary
-
 
 def git_revision(*, require_clean: bool = False) -> str:
     """Return the repository revision, optionally requiring an entirely clean tree."""

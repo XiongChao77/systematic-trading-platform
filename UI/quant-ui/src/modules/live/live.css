@@ -55,3 +55,62 @@
   .live-pnl-group { padding: 12px; }
   .live-pnl-group dl { grid-template-columns: 1fr; gap: 12px; }
 }
+
+.live-portfolio-header {
+  align-items: center;
+  justify-content: space-between;
+}
+
+.live-page button[data-action="strategies"],
+.live-page button[data-action="back-overview"] {
+  width: auto;
+  padding: 0 12px;
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.live-portfolio-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.live-portfolio-metrics > div,
+.live-portfolio-chart-panel {
+  padding: 16px;
+}
+
+.live-portfolio-metrics dd {
+  margin: 6px 0 0;
+  font-size: 1.25rem;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.live-portfolio-chart-panel + .live-portfolio-chart-panel {
+  margin-top: 16px;
+}
+
+.live-portfolio-chart {
+  height: 320px;
+  min-width: 0;
+}
+
+.live-portfolio-drawdown {
+  height: 180px;
+}
+
+.live-portfolio-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.live-portfolio-legend span:first-child {
+  color: #246ca0;
+}
+
+.live-portfolio-legend span:last-child {
+  color: #008476;
+}

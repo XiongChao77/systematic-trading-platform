@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from typing import Any
+import json
 import logging
+from pathlib import Path
 import time
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
+from data_process import common
 
 from UI.backend.modules.live.models import RunnerSnapshot
 from UI.backend.modules.live.store import (
@@ -50,6 +53,21 @@ class TimedLiveRoute(APIRoute):
 
 
 router = APIRouter(tags=["live"], route_class=TimedLiveRoute)
+
+
+@router.get("/api/live/overview")
+def portfolio_overview() -> dict[str, Any]:
+    root = Path(common.PERSISTENCE_DIR) / "live_runner"
+    reports = sorted(
+        root.glob("*/bitget_performance/daily_overview.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not reports:
+        return {"available": False}
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    payload.pop("account_ids", None)
+    return {"available": True, **payload}
 
 
 @router.post("/internal/live/snapshots")

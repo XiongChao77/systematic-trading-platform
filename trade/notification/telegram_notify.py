@@ -88,15 +88,7 @@ class TelegramNotify(Notify):
         if not text:
             raise ValueError("Telegram notification message must not be empty")
         try:
-            response = self._session.post(
-                f"https://api.telegram.org/bot{self._bot_token}/sendMessage",
-                json={"chat_id": self._chat_id, "text": text},
-                timeout=self._timeout,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict) or payload.get("ok") is not True:
-                raise RuntimeError("Telegram API did not confirm message delivery")
+            self.call("sendMessage", chat_id=self._chat_id, text=text)
             return True
         except Exception as exc:
             # Do not log the request URL because it contains the bot token.
@@ -105,3 +97,22 @@ class TelegramNotify(Notify):
                 type(exc).__name__,
             )
             return False
+
+    @property
+    def chat_id(self) -> str:
+        return self._chat_id
+
+    def call(self, method: str, *, request_timeout=None, **params):
+        try:
+            response = self._session.post(
+                f"https://api.telegram.org/bot{self._bot_token}/{method}",
+                json=params,
+                timeout=self._timeout if request_timeout is None else request_timeout,
+                allow_redirects=False,
+            )
+            payload = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            raise RuntimeError(f"Telegram {method}: {type(exc).__name__}") from None
+        if not response.ok or not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise RuntimeError(f"Telegram {method}: HTTP {response.status_code}")
+        return payload.get("result")

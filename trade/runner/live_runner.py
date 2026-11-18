@@ -67,11 +67,13 @@ from trade.recording.prediction_trace import (
     PredictionTraceConfig,
 )
 from trade.recording.persistent_output import OutputLease, prepare_output
+from trade.recording.daily_bitget import DailyBitgetUpdate
 from trade.recording.execution_trace import (
     ExecutionTraceConfig,
     LiveExecutionTraceRecorder,
 )
 from trade.notification.notify import Notify
+from trade.notification.backup_reminder import BackupReminder
 from trade.notification.telegram_notify import TelegramNotify
 from trade.notification.execution_failure import ExecutionFailureNotifications
 from trade.venue.live.binance_data_feed import BinanceDataFeed
@@ -491,6 +493,8 @@ class LiveRunnerConfiguration:
     monitoring: LiveMonitoringConfig | None = None
     prediction_trace: PredictionTraceConfig | None = None
     execution_trace: ExecutionTraceConfig | None = None
+    config_path: str | None = None
+    backup_reminder_credentials: str | None = None
 
 
 def _resolve_data_check_timer_interval_ms(
@@ -750,6 +754,11 @@ def load_live_runner_configuration(
 
     raw_strategy_entries = _strategy_entries(payload)
     telegram_token_path = payload.get("telegram_token")
+    backup_reminder = payload.get("backup_reminder", False)
+    if not isinstance(backup_reminder, bool):
+        raise TypeError("backup_reminder must be a JSON boolean")
+    if backup_reminder and not telegram_token_path:
+        raise ValueError("backup_reminder requires telegram_token")
     strategy_entries: list[LiveStrategySpec] = []
     strategies_by_report: dict[str, list[LiveStrategySpec]] = {}
     for raw_entry in raw_strategy_entries:
@@ -841,6 +850,10 @@ def load_live_runner_configuration(
         monitoring=monitoring,
         prediction_trace=prediction_trace,
         execution_trace=execution_trace,
+        config_path=config_path,
+        backup_reminder_credentials=(
+            _resolve_path(config_path, telegram_token_path) if backup_reminder else None
+        ),
     )
 
 
@@ -924,6 +937,8 @@ class LiveRunner:
         monitoring_config: LiveMonitoringConfig | None = None,
         prediction_trace_config: PredictionTraceConfig | None = None,
         execution_trace_config: ExecutionTraceConfig | None = None,
+        config_path: str | None = None,
+        backup_reminder_credentials: str | None = None,
     ):
         if not specs:
             raise ValueError("LiveRunner requires at least one strategy")
@@ -940,6 +955,17 @@ class LiveRunner:
         self._monitoring_config = monitoring_config
         self._prediction_trace_config = prediction_trace_config
         self._execution_trace_config = execution_trace_config
+        self._backup_reminder = (
+            BackupReminder(backup_reminder_credentials, self.output_dir, self.logger)
+            if backup_reminder_credentials and self.output_dir else None
+        )
+        self._daily_bitget = (
+            DailyBitgetUpdate(config_path, self.output_dir, self.runner_id, self.logger)
+            if config_path and self.output_dir and any(
+                spec.enable and spec.run_live and spec.venue_config.venue == "bitget"
+                for spec in specs
+            ) else None
+        )
         self._live_registry: LiveStateRegistry | None = None
         self._monitoring_service: LiveMonitoringService | None = None
         self._prediction_trace: LivePredictionTraceRecorder | None = None
@@ -1043,6 +1069,8 @@ class LiveRunner:
             monitoring_config=configuration.monitoring,
             prediction_trace_config=configuration.prediction_trace,
             execution_trace_config=configuration.execution_trace,
+            config_path=configuration.config_path,
+            backup_reminder_credentials=configuration.backup_reminder_credentials,
         )
 
     @staticmethod
@@ -2195,6 +2223,10 @@ class LiveRunner:
         terminal_thread = None
         try:
             self.initialize()
+            if self._daily_bitget is not None:
+                self._daily_bitget.start()
+            if self._backup_reminder is not None:
+                self._backup_reminder.start()
             self.logger.info("Live runner started")
             if sys.stdin is not None and sys.stdin.isatty() and os.name != "nt":
                 terminal_thread = threading.Thread(
@@ -2235,6 +2267,12 @@ class LiveRunner:
         if self._closed:
             return
         self._closed = True
+        reminder = getattr(self, "_backup_reminder", None)
+        if reminder is not None:
+            reminder.close()
+        daily_bitget = getattr(self, "_daily_bitget", None)
+        if daily_bitget is not None:
+            daily_bitget.close()
         if self.data_check_timer is not None:
             self.data_check_timer.cancel()
             self.data_check_timer = None
