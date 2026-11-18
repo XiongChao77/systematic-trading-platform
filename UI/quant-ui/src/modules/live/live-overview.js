@@ -1,40 +1,45 @@
 import { createChart, LineSeries } from "lightweight-charts";
-import { escapeHtml } from "../../shared/formatters.js";
-import { loadLiveOverview } from "./live-api.js";
+import { escapeHtml, formatMoney, pnlTone } from "../../shared/formatters.js";
+import { loadLiveOverview, loadLiveStrategies, releaseLiveViewer } from "./live-api.js";
 
-const money = new Intl.NumberFormat("zh-CN", {
+const STRATEGY_START_DATE = "2026-09-07";
+const INITIAL_CAPITAL = 1_700;
+const money = new Intl.NumberFormat("en-US", {
   minimumFractionDigits: 2, maximumFractionDigits: 2,
 });
-const ratio = new Intl.NumberFormat("zh-CN", { style: "percent", maximumFractionDigits: 2 });
+const ratio = new Intl.NumberFormat("en-US", { style: "percent", maximumFractionDigits: 2 });
 const format = (value, formatter) => Number.isFinite(value) ? formatter.format(value) : "—";
 const amount = value => format(value, money);
 const percent = value => format(value, ratio);
 
 export function mountOverview(container, context) {
   const controller = new AbortController();
+  const viewerId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+  const release = () => { releaseLiveViewer(viewerId).catch(() => {}); };
   const charts = [];
   let disposed = false;
   let loading = false;
+  let liveLoading = false;
   let updatedAt;
   container.innerHTML = `
     <section class="module-page scroll-page live-page">
       <header class="page-header live-portfolio-header">
         <div>
-          <h1>实盘资金总览</h1>
+          <h1>Live Portfolio Overview</h1>
           <p class="page-subtitle" data-role="coverage">Bitget · USDT</p>
         </div>
-        <button type="button" class="back-button" data-action="strategies">策略详情 →</button>
+        <button type="button" class="back-button" data-action="strategies">Strategies →</button>
       </header>
-      <p data-role="notice" role="status">正在读取日度资金报告…</p>
+      <p role="status"><span data-role="notice">Loading the daily portfolio report…</span><span data-role="live-status"></span></p>
+      <dl class="live-portfolio-metrics" data-role="metrics"></dl>
       <div data-role="portfolio" hidden>
-        <dl class="live-portfolio-metrics" data-role="metrics"></dl>
         <section class="panel live-portfolio-chart-panel">
-          <h2>日度资金曲线</h2>
-          <p class="live-portfolio-legend"><span>● Balance（日末）</span><span>● Equity（采样）</span></p>
+          <h2>Daily Balance and Equity</h2>
+          <p class="live-portfolio-legend"><span>● End-of-day balance</span><span>● Sampled equity</span></p>
           <div class="live-portfolio-chart" data-role="funds"></div>
         </section>
         <section class="panel live-portfolio-chart-panel">
-          <h2>日末回撤</h2>
+          <h2>End-of-day Drawdown</h2>
           <div class="live-portfolio-chart live-portfolio-drawdown" data-role="drawdown"></div>
         </section>
       </div>
@@ -44,34 +49,72 @@ export function mountOverview(container, context) {
     context.navigate("live", { view: "strategies" });
   });
 
+  const cards = [
+    ["Strategy Start Date", "start-date", STRATEGY_START_DATE],
+    ["Initial Capital", "initial-capital", amount(INITIAL_CAPITAL)],
+    ["Total Balance", "balance"],
+    ["Unrealized PnL", "pnl"],
+    ["Return", "return"],
+    ["Sharpe", "sharpe"],
+    ["Calmar", "calmar"],
+    ["Max Drawdown", "max-drawdown"],
+    ["Longest Drawdown", "drawdown-duration"],
+  ];
+  find("metrics").innerHTML = cards.map(([label, role, value = "—"]) =>
+    `<div class="panel"${role === "balance" || role === "pnl" ? ' title="Live crypto strategies"' : ""}>
+      <dt data-role="${role}-label">${label}</dt><dd data-role="${role}">${escapeHtml(value)}</dd></div>`
+  ).join("");
+
   function chart(role) {
-    const result = createChart(find(role), { autoSize: true });
+    const result = createChart(find(role), { autoSize: true, localization: { locale: "en-US" } });
     charts.push(result);
     return result;
   }
 
+  function renderLive(summary, status = "") {
+    const balance = find("balance");
+    const pnl = find("pnl");
+    balance.textContent = amount(summary?.balance?.value);
+    pnl.textContent = formatMoney(summary?.unrealized_pnl?.value, true);
+    pnl.className = pnlTone(summary?.unrealized_pnl?.value);
+
+    const coverage = [
+      [summary?.balance, "accounts"],
+      [summary?.unrealized_pnl, "strategies"],
+    ].filter(([metric]) => metric?.included < metric?.total)
+      .map(([metric, unit]) => `${metric.included}/${metric.total} ${unit}`);
+    const message = status || coverage.join(", ");
+    find("live-status").textContent = message ? ` · Live crypto data: ${message}` : "";
+  }
+
+  async function refreshLive() {
+    if (liveLoading || disposed || document.hidden) return;
+    liveLoading = true;
+    try {
+      const payload = await loadLiveStrategies({ viewerId, signal: controller.signal });
+      const summary = payload.pnl_summary.crypto;
+      if (!disposed) renderLive(summary, summary.unrealized_pnl.total === 0 ? "Waiting for strategies" : "");
+    } catch {
+      if (!disposed) renderLive(null, "Live data unavailable");
+    } finally {
+      liveLoading = false;
+    }
+  }
+
   function render(payload) {
-    const { metrics, snapshot, balance_series: balances, equity_series: equities } = payload;
+    const { metrics, snapshot, balance_series, equity_series } = payload;
+    const balances = balance_series.filter(row => row.date >= STRATEGY_START_DATE);
+    const equities = equity_series.filter(row => row.date >= STRATEGY_START_DATE);
     const duration = metrics.longest_drawdown;
-    const cards = [
-      ["初始金额", amount(metrics.opening_balance)],
-      ["净划入", amount(metrics.net_transfers)],
-      ["Total Balance", amount(snapshot.balance)],
-      ["Total Equity", amount(snapshot.equity)],
-      ["未实现 PnL", amount(snapshot.unrealized_pnl)],
-      ["累计收益", percent(metrics.total_return)],
-      ["年化收益", percent(metrics.annualized_return)],
-      ["Sharpe", amount(metrics.sharpe_zero_risk_free)],
-      ["Calmar", amount(metrics.calmar)],
-      ["最大回撤（日末）", percent(metrics.daily_max_drawdown)],
-      ["最大回撤（逐笔）", percent(metrics.bill_event_max_drawdown)],
-      ["最长回撤持续时间", duration ? `${duration.days} 天${duration.recovered ? "" : "（未恢复）"}` : "0 天"],
-    ];
-    find("metrics").innerHTML = cards.map(([label, value]) =>
-      `<div class="panel"><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`
-    ).join("");
-    find("coverage").textContent = `Bitget · ${metrics.accounts} 个账户 · USDT · ${payload.runner_id}`;
-    find("notice").textContent = `权益采样 ${snapshot.as_of} · 风险指标基于截至 ${metrics.end} 的已实现净值`;
+    find("return-label").textContent = metrics.funded_days < 365 ? "Return (Estimated Annualized)" : "Return (Annualized)";
+    find("return").textContent = `${percent(metrics.total_return)} (${percent(metrics.annualized_return)})`;
+    find("sharpe").textContent = amount(metrics.sharpe_zero_risk_free);
+    find("calmar").textContent = amount(metrics.calmar);
+    find("max-drawdown").textContent = percent(metrics.bill_event_max_drawdown);
+    find("drawdown-duration").textContent = duration
+      ? `${duration.days} days${duration.recovered ? "" : " (unrecovered)"}` : "0 days";
+    find("coverage").textContent = `Bitget · ${metrics.accounts} accounts · USDT · ${payload.runner_id}`;
+    find("notice").textContent = `Historical equity sampled at ${snapshot.as_of} · Risk metrics use realized NAV through ${metrics.end}`;
     find("portfolio").hidden = false;
     charts.splice(0).forEach(item => item.remove());
 
@@ -99,7 +142,7 @@ export function mountOverview(container, context) {
     try {
       const payload = await loadLiveOverview({ signal: controller.signal });
       if (disposed) return;
-      if (!payload.available) find("notice").textContent = "等待 Runner 发布第一份日度资金报告。";
+      if (!payload.available) find("notice").textContent = "Waiting for the runner to publish its first daily portfolio report.";
       else if (payload.updated_at !== updatedAt) {
         render(payload);
         updatedAt = payload.updated_at;
@@ -107,8 +150,8 @@ export function mountOverview(container, context) {
     } catch {
       if (!disposed) {
         find("notice").textContent = updatedAt
-          ? `刷新失败，正在显示 ${updatedAt} 的报告。`
-          : "暂时无法读取日度资金报告。";
+          ? `Refresh failed. Showing the report from ${updatedAt}.`
+          : "The daily portfolio report is temporarily unavailable.";
         updatedAt = undefined;
       }
     } finally {
@@ -117,11 +160,20 @@ export function mountOverview(container, context) {
   }
 
   const timer = setInterval(refresh, 60_000);
+  const liveTimer = setInterval(refreshLive, 1_000);
+  document.addEventListener("visibilitychange", refreshLive);
+  window.addEventListener("pagehide", release);
+  renderLive(null, "Waiting for live data");
+  refreshLive();
   refresh();
   return () => {
     disposed = true;
     controller.abort();
     clearInterval(timer);
+    clearInterval(liveTimer);
+    document.removeEventListener("visibilitychange", refreshLive);
+    window.removeEventListener("pagehide", release);
+    release();
     charts.forEach(item => item.remove());
   };
 }

@@ -1,6 +1,6 @@
 import "./live.css";
 
-import { escapeHtml, formatPrice } from "../../shared/formatters.js";
+import { escapeHtml, formatMoney, formatPrice, pnlTone } from "../../shared/formatters.js";
 import { loadLiveStrategies, loadLiveStrategy, releaseLiveViewer } from "./live-api.js";
 import { mountOverview } from "./live-overview.js";
 
@@ -30,7 +30,7 @@ function mountList(container, context) {
     <section class="module-page scroll-page live-page">
       <header class="page-header live-list-header">
         <div>
-          <button type="button" class="back-button" data-action="back-overview">← 返回资金总览</button>
+          <button type="button" class="back-button" data-action="back-overview">← Back to Portfolio Overview</button>
           <p class="page-eyebrow">Live monitoring</p>
           <h1>Strategy List</h1>
           <p class="page-subtitle">Current state reported by live runners</p>
@@ -464,12 +464,6 @@ function statusValueTone(value, available) {
   return value === "running" ? "positive" : value === "paused" ? "" : "negative";
 }
 
-function pnlTone(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number) || number === 0) return "";
-  return number > 0 ? "positive" : "negative";
-}
-
 function shortModelType(value) {
   const names = {
     conv_lstm: "ConvLSTM",
@@ -486,17 +480,6 @@ function shortModelType(value) {
   if (value === null || value === undefined) return "-";
   const modelType = String(value);
   return Object.hasOwn(names, modelType) ? names[modelType] : modelType.slice(0, 8);
-}
-
-function formatMoney(value, signed = false) {
-  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
-  const number = Number(value);
-  const sign = signed && number > 0 ? "+" : "";
-  const negative = number < 0 ? "-" : "";
-  return `${negative}${sign}$${Math.abs(number).toLocaleString(undefined, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
 }
 
 function formatProbability(value) {
