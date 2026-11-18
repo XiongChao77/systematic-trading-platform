@@ -37,6 +37,10 @@ class CusAnalyzer(bt.Analyzer):
     def start(self):
         # --- 1. position exposure state ---
         self._ratios = []
+        self.account_history = []
+        self.closed_trades = []
+        self._previous_equity = float(self.strategy.broker.getvalue())
+        self._previous_position = 0.0
         self._max_exposure = 0.0
 
         # --- 2. intraday drawdown state ---
@@ -67,6 +71,26 @@ class CusAnalyzer(bt.Analyzer):
 
         # --- FLAT DIST: flat distribution tracking (added) ---
         self._track_flat_distribution()
+        position = float(self.strategy.getposition(self.strategy.data).size)
+        equity = float(self.strategy.broker.getvalue())
+        self.account_history.append((
+            self.strategy.data.datetime.datetime(0).isoformat(),
+            self._previous_equity, equity, self._previous_position, position,
+            abs(position * float(self.strategy.data.close[0])) / equity if equity > 0 else 0.0,
+        ))
+        self._previous_equity = equity
+        self._previous_position = position
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.closed_trades.append({
+                "entry_time": bt.num2date(trade.dtopen).isoformat(),
+                "exit_time": self.strategy.data.datetime.datetime(0).isoformat(),
+                "execution_exit_time": bt.num2date(trade.dtclose).isoformat(),
+                "pnl": float(trade.pnl), "pnl_net": float(trade.pnlcomm),
+                "commission": float(trade.commission), "long": bool(trade.long),
+                "hold_bars": int(trade.barlen),
+            })
 
     def stop(self):
         """Backtest finished, run the final aggregation"""

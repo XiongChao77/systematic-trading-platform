@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import copy
+from contextlib import contextmanager
 import fcntl
 import importlib
 import json
@@ -44,6 +45,9 @@ essential_files_list = [
     "data_process/config.py",
     "data_process/analyse/volatility_prediction_heatmap.py",
     "experiment/task_constructors.py",
+    "model/artifact_identity.py",
+    "trade/runner/stage_accounting.py",
+    "trade/runner/account_equity_plot.py",
 ]
 
 
@@ -231,6 +235,7 @@ from trade.runner.config import ExperimentContext
 TASKS_SPEC_FILE = "tasks_spec.json"
 REPORTS_FILE = "reports.jsonl"
 TRAIN_REPORTS_FILE = "train_reports.jsonl"
+RESUME_PLAN_FILE = "resume_plan.json"
 SELECTED_FILE = "selected_configs.jsonl"
 PRE_OUTPUT_DIR = "pre_output"
 TRAIN_OUTPUT_DIR = "train_output"
@@ -301,6 +306,109 @@ def _cleanup_ephemeral_outputs(exp_dir: str, logger: logging.Logger) -> None:
         if os.path.isdir(path):
             shutil.rmtree(path)
             logger.info("Removed ephemeral output directory: %s", path)
+
+
+@contextmanager
+def _resume_plan_lock(path):
+    with open(path + ".lock", "a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _read_resume_records(path, logger):
+    """Recover a torn final append while refusing corruption inside the log."""
+    if not os.path.isfile(path):
+        return []
+    with open(path, "rb") as handle:
+        lines = handle.readlines()
+    records, offset = [], 0
+    for index, line in enumerate(lines):
+        if line.strip():
+            try:
+                records.append(json.loads(line))
+            except (ValueError, UnicodeDecodeError):
+                if index != len(lines) - 1 or line.endswith(b"\n"):
+                    raise ValueError(f"Resume report log is corrupt at line {index + 1}: {path}")
+                with open(path + ".interrupted-tail", "wb") as handle:
+                    handle.write(line)
+                with open(path, "r+b") as handle:
+                    handle.truncate(offset)
+                logger.warning("Archived incomplete final report record: %s", path)
+                return records
+        offset += len(line)
+    if lines and not lines[-1].endswith(b"\n"):
+        with open(path, "ab") as handle:
+            handle.write(b"\n")
+    return records
+
+
+def load_combo_resume_tasks(exp_dir, logger):
+    """Recover the frozen task plan, retaining preparation nodes for fusion."""
+    with open(os.path.join(exp_dir, RESUME_PLAN_FILE), encoding="utf-8") as handle:
+        plan = json.load(handle)
+    if plan["train_mode"] != TRAIN_MODE:
+        raise ValueError("Resume train mode differs from the frozen experiment")
+    backtest_path = os.path.join(exp_dir, REPORTS_FILE)
+    backtests = _read_resume_records(backtest_path, logger)
+    legacy = [record for record in backtests if record.get("backtest_contract") != "continuous_account_v1"]
+    if legacy:
+        archive = backtest_path + f".before-continuous-account-{time.time_ns()}"
+        shutil.copyfile(backtest_path, archive)
+        with open(backtest_path + ".tmp", "w", encoding="utf-8") as handle:
+            for record in backtests:
+                if record.get("backtest_contract") == "continuous_account_v1":
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        os.replace(backtest_path + ".tmp", backtest_path)
+        logger.warning("Archived %d legacy backtests with mixed-period accounting; saved models will be reused: %s",
+                       len(legacy), archive)
+    with open(os.path.join(exp_dir, TASKS_SPEC_FILE), encoding="utf-8") as handle:
+        spec = json.load(handle)
+    pending = copy.deepcopy(spec)
+    records = {}
+    reports_path = os.path.join(exp_dir, TRAIN_REPORTS_FILE)
+    for record in _read_resume_records(reports_path, logger):
+        records[(record["pre_h"], record["tr_h"])] = record
+    completed = 0
+    for pre_h, node in spec.items():
+        for tr_h, task in node["train"].items():
+            directory = _train_output_dir(exp_dir, pre_h, tr_h)
+            path = os.path.join(directory, "rolling_manifest.json")
+            if not os.path.isfile(path):
+                continue
+            with open(path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            if manifest["configs"] != [task["params"]] or manifest["rolling_config"] != plan["rolling_config"]:
+                raise ValueError(f"Saved training configuration differs from resume plan: {directory}")
+            if manifest["data_id"] != plan["preparation_data_ids"][pre_h]:
+                raise ValueError(f"Saved training data differs from resume plan: {directory}")
+            if manifest["status"] != "complete":
+                continue
+            if len(manifest["folds"]) != len(manifest["planned_windows"]):
+                raise ValueError(f"Complete training has missing windows: {directory}")
+            for key in ("predictions", "window_predictions", "development_predictions"):
+                if not os.path.isfile(os.path.join(directory, manifest[key])):
+                    raise FileNotFoundError(f"Complete training is missing {key}: {directory}")
+            for fold in manifest["folds"]:
+                role = os.path.join(directory, fold["fold_id"], task["params"]["train_task"])
+                for name in ("model.pt", "meta.json", "task_description.json"):
+                    if not os.path.isfile(os.path.join(role, name)):
+                        raise FileNotFoundError(f"Complete training checkpoint is missing: {role}/{name}")
+            if (pre_h, tr_h) not in records:
+                record = dict(pre_h=pre_h, tr_h=tr_h, task_type=task["params"]["train_task"],
+                              model_type=task["params"]["model_cfg"]["model_type"],
+                              model_version=task["params"]["model_cfg"]["model_version"],
+                              train_compatibility=task["params"]["train_compatibility"], metrics=manifest,
+                              pre_params=node["params"], train_params=task["params"], save_dir=directory)
+                common.append_jsonl(reports_path, record)
+            del pending[pre_h]["train"][tr_h]
+            completed += 1
+    logger.info("Resume training | completed=%d | remaining=%d | preparation will be regenerated and verified",
+                completed, sum(len(node["train"]) for node in pending.values()))
+    from trade.runner.backtest_entry import strategy_config_from_dict
+    return pending, [strategy_config_from_dict(params) for params in plan["simulation_configs"]]
 
 
 # -----------------------------------------------------------------------------
@@ -619,6 +727,13 @@ def create_task_spec(logger, exp_dir, done_set: set[str]):
     tasks_spec_path = os.path.join(exp_dir, TASKS_SPEC_FILE)
     with open(tasks_spec_path, "w", encoding="utf-8") as f:
         json.dump(task_spec, f, indent=2, ensure_ascii=False, default=str)
+    with open(os.path.join(exp_dir, RESUME_PLAN_FILE), "w", encoding="utf-8") as handle:
+        from trade.runner.backtest_entry import strategy_config_to_dict
+        json.dump({"train_mode": TRAIN_MODE,
+                   "rolling_config": asdict(train_config.RollingConfig(
+                       train_months=12, validation_months=4, oos_months=1, mode="expanding")),
+                   "preparation_data_ids": {},
+                   "simulation_configs": [strategy_config_to_dict(value) for value in simulation_task]}, handle, indent=2)
     logger.info(f"📄 Tasks spec saved: {tasks_spec_path}")
 
     n_prep_total, n_train_total, n_sim_total = _count_spec_tasks(task_spec)
@@ -652,6 +767,18 @@ def _worker_prep(worker_log_file: str, task_queue: mp.Queue, train_queue: mp.Que
             try:
                 prep_dir = _prep_output_dir(exp_dir, pre_h)
                 preparation.main(logger, para=para, prep_output_dir=prep_dir)
+                plan_path = os.path.join(exp_dir, RESUME_PLAN_FILE)
+                with _resume_plan_lock(plan_path):
+                    with open(plan_path, encoding="utf-8") as handle:
+                        resume_plan = json.load(handle)
+                    data_id = common.load_data_manifest_from_dir(prep_dir)["data_id"]
+                    expected = resume_plan["preparation_data_ids"].get(pre_h)
+                    if expected is not None and expected != data_id:
+                        raise ValueError(f"Regenerated preparation data_id changed for {pre_h}")
+                    resume_plan["preparation_data_ids"][pre_h] = data_id
+                    with open(plan_path + ".tmp", "w", encoding="utf-8") as handle:
+                        json.dump(resume_plan, handle, indent=2)
+                    os.replace(plan_path + ".tmp", plan_path)
             except Exception:
                 logger.exception(f"Prep failed: {pre_h}")
                 train_queue.put(("prep_failed", pre_h, time.time() - t0, traceback.format_exc()))
@@ -677,6 +804,7 @@ def _worker_prep(worker_log_file: str, task_queue: mp.Queue, train_queue: mp.Que
                             pre_h,
                             tr_h,
                         ),
+                        "rolling_config": resume_plan["rolling_config"],
                     }
                 )
 
@@ -741,12 +869,8 @@ def _train_task(
         result = train.train_windows(
             logger=logger,
             configs=[t_cfg],
-            rolling_config=train_config.RollingConfig(
-                train_months=12,
-                validation_months=4,
-                oos_months=1,
-                mode="expanding",
-            ),
+            rolling_config=train_config.RollingConfig(**item["rolling_config"]),
+            resume=True,
             prep_output_dir=prep_output_dir,
             save_dir=save_dir,
         )
@@ -910,9 +1034,10 @@ def _worker_sim(
 
         t0 = time.time()
         try:
+            from model.artifact_identity import training_identity
             identity = TaskIdentity.from_params(
                 prep=pre_params,
-                train=train_params,
+                train=training_identity(train_output_dir, train_params),
                 sim=sim_params,
             )
             if identity.prep_hash != pre_h or identity.sim_hash != sim_h:
@@ -943,6 +1068,9 @@ def _worker_sim(
 
             period_results = {}
             period_details = {}
+            stages_by_period = {}
+            stage_details_by_period = {}
+            stage_metrics_by_period = {}
             shared_params = None
             for period in ("development",):
                 period_output = run_period(period)
@@ -958,16 +1086,22 @@ def _worker_sim(
                     raise ValueError("Long and forward report parameters differ")
                 period_results[period] = period_report["results"][period]
                 period_details[period] = period_detail["results"][period]
+                stages_by_period[period] = period_report.get("stage_results", {})
+                stage_details_by_period[period] = period_detail.get("stage_results", {})
+                stage_metrics_by_period[period] = period_report.get("stage_model_metrics", {})
 
             report = {
                 **(extra_report_fields or {}),
                 "params": shared_params,
+                "backtest_contract": "continuous_account_v1",
                 "results": period_results,
+                "stage_results": stages_by_period,
+                "stage_model_metrics": stage_metrics_by_period,
             }
             _write_report_details(
                 reports_path,
                 identity,
-                {"results": period_details},
+                {"identity": identity.as_dict(), "results": period_details, "stage_results": stage_details_by_period},
             )
             report_stat = report
         except Exception:
@@ -1323,12 +1457,8 @@ def run_combo_fusion_and_backtest(
         logger.warning(f"No train reports found at {train_reports_path}, nothing to fuse.")
         return
 
-    records = []
-    with open(train_reports_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
+    records = list({(r["pre_h"], r["tr_h"]): r
+                    for r in _read_resume_records(train_reports_path, logger)}.values())
 
     groups: Dict[Tuple[str, str], Dict[str, List[dict]]] = defaultdict(lambda: defaultdict(list))
     for r in records:
@@ -1349,23 +1479,20 @@ def run_combo_fusion_and_backtest(
 
     logger.info(f"[combo fuse] total fusion pairs: {len(fusion_pairs)}")
 
-    # Coarse grained resume safety: skip when the whole fusion_hash (not per sim_task) already appears
-    # in reports_path -- not full --resume support, just a guard so an accidentally repeated script run
-    # does not write the same batch of backtests twice.
-    done_fusion_hashes = set()
-    if os.path.exists(reports_path):
-        with open(reports_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                fh = d.get("fusion_hash")
-                if fh:
-                    done_fusion_hashes.add(fh)
+    # Each hold-period variant is recovered independently within a fusion pair.
+    done_fusion_sims = set()
+    for record in _read_resume_records(reports_path, logger):
+        stages = record.get("stage_results", {}).get("development", {})
+        report_hash = record.get("params", {}).get("hash")
+        detail_root = _sim_output_dir(exp_dir, report_hash) if report_hash else None
+        complete_details = detail_root is not None and all(os.path.isfile(os.path.join(detail_root, name)) for name in (
+            "report_details.json", "development/account_history.csv.gz", "development/stage_summary.json",
+            "development/equity_curve_absolute.png", "development/equity_curve_log.png",
+        ))
+        if (record.get("fusion_hash") and record.get("backtest_contract") == "continuous_account_v1"
+                and complete_details and "oos" in stages
+                and stages["oos"].get("accounting", {}).get("version") == "continuous_account_v1"):
+            done_fusion_sims.add((record["fusion_hash"], record["params"]["identity"]["sim_hash"]))
 
     pending_sim_hashes: Dict[Tuple[str, str], Set[str]] = {}
     n_sim_total = 0
@@ -1379,18 +1506,39 @@ def run_combo_fusion_and_backtest(
         }
         fusion_hash = TaskIdentity.train_hash_for({"fusion": payload})
 
-        if fusion_hash in done_fusion_hashes:
-            logger.info(f"[combo fuse] skip fusion_hash={fusion_hash} (already in reports)")
+        pre_para = common.preparation_config_from_dict(r1["pre_params"])
+        pending_strategies = []
+        for strategy in simulation_task:
+            effective = backtest_entry.strategy_config_for_preparation(strategy, pre_para)
+            sim_hash = TaskIdentity.sim_hash_for(json_safe(_simulation_params(effective)))
+            if (fusion_hash, sim_hash) not in done_fusion_sims:
+                pending_strategies.append(strategy)
+        if not pending_strategies:
+            logger.info("[combo fuse] all backtests complete: %s", fusion_hash)
             continue
 
         fusion_dir = _train_output_dir(exp_dir, pre_h, fusion_hash)
         os.makedirs(fusion_dir, exist_ok=True)
 
         logger.info(f"[combo fuse] fusing {role_1}={r1['tr_h']} + {role_2}={r2['tr_h']} -> {fusion_hash}")
-        if TRAIN_MODE == train_config.TrainTask.TRIGGER_DIRECTION:
-            train.fusion_trigger_dir(logger, r1["save_dir"], r2["save_dir"], fusion_dir)
-        else:
-            train.fusion_long_short_ovr(logger, r1["save_dir"], r2["save_dir"], fusion_dir)
+        fusion_manifest_path = os.path.join(fusion_dir, "rolling_manifest.json")
+        fusion_complete = False
+        if os.path.isfile(fusion_manifest_path):
+            with open(fusion_manifest_path, encoding="utf-8") as handle:
+                saved_fusion = json.load(handle)
+            expected_sources = {role_1.lower(): os.path.realpath(r1["save_dir"]),
+                                role_2.lower(): os.path.realpath(r2["save_dir"])}
+            fusion_complete = saved_fusion.get("status") == "complete"
+            saved_sources = {role: os.path.realpath(path) for role, path in saved_fusion.get("sources", {}).items()}
+            if fusion_complete and saved_sources != expected_sources:
+                raise ValueError("Resume fusion sources differ from the requested pair")
+            if not fusion_complete:
+                os.replace(fusion_manifest_path, fusion_manifest_path + ".interrupted")
+        if not fusion_complete:
+            if TRAIN_MODE == train_config.TrainTask.TRIGGER_DIRECTION:
+                train.fusion_trigger_dir(logger, r1["save_dir"], r2["save_dir"], fusion_dir)
+            else:
+                train.fusion_long_short_ovr(logger, r1["save_dir"], r2["save_dir"], fusion_dir)
 
         # A fused model only exists after both training processes finish. Build
         # its cache here on CPU before any sim worker can observe the task.
@@ -1418,16 +1566,17 @@ def run_combo_fusion_and_backtest(
             role_1: {"tr_h": r1["tr_h"], "metrics": r1["metrics"], "train_params": r1["train_params"]},
             role_2: {"tr_h": r2["tr_h"], "metrics": r2["metrics"], "train_params": r2["train_params"]},
         }
-        for strategy_config in simulation_task:
+        for strategy_config in pending_strategies:
             pre_para = common.preparation_config_from_dict(r1["pre_params"])
             effective_strategy_config = backtest_entry.strategy_config_for_preparation(
                 strategy_config,
                 pre_para,
             )
             sim_d = json_safe(_simulation_params(effective_strategy_config))
+            from model.artifact_identity import training_identity
             identity = TaskIdentity.from_params(
                 prep=r1["pre_params"],
-                train=r1["train_params"],
+                train=training_identity(fusion_dir, r1["train_params"]),
                 sim=sim_d,
             )
             sim_h = identity.sim_hash
@@ -1496,10 +1645,10 @@ def main():
         git_commit=common.git_revision(require_clean=args.check_git_clean),
     )
 
-    if TRAIN_MODE in train_config.COMBO_SUB_TASKS and (args.resume or args.add or args.valid or args.load):
+    if TRAIN_MODE in train_config.COMBO_SUB_TASKS and (args.add or args.valid or args.load):
         raise ValueError(
             "combo_model 模式 (TRAIN_MODE=TRIGGER_DIRECTION/LONG_SHORT_OVR) 暂不支持 "
-            "--resume/--add/--valid/--load，这些流程假设的是单模型模式下 "
+            "--add/--valid/--load，这些流程假设的是单模型模式下 "
             "sim_tasks 直接挂在训练节点上的 spec 形状。请用不带这些参数的全新实验跑一遍。"
         )
 
@@ -1644,7 +1793,9 @@ def main():
     combo_simulation_task = None
 
     # ---------------- build/load spec ----------------
-    if args.resume:
+    if args.resume and TRAIN_MODE in train_config.COMBO_SUB_TASKS:
+        task_spec, combo_simulation_task = load_combo_resume_tasks(exp_dir, logger)
+    elif args.resume:
         done_set = load_done_set(reports_path)
         task_spec, (n_prep_total, n_train_total, n_sim_total) = load_pending_tasks(exp_dir, done_set)
         n_prep, n_train, n_sim = _count_spec_tasks(task_spec)

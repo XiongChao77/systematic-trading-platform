@@ -150,8 +150,10 @@ def fuse_window_runs(*, task_type, role_directories, fusion_dir, logger):
                        ("development_predictions", window.loc[window.fold_id.isin(development_ids)])):
         frame.to_pickle(os.path.join(fusion_dir, manifest[key]))
     manifest.update(status="complete", prediction_columns=list(window.columns))
-    with open(os.path.join(fusion_dir, "rolling_manifest.json"), "w", encoding="utf-8") as handle:
+    manifest_path = os.path.join(fusion_dir, "rolling_manifest.json")
+    with open(manifest_path + ".tmp", "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
+    os.replace(manifest_path + ".tmp", manifest_path)
     logger.info("Fused window predictions | folds=%d | OOS rows=%d | diagnostic rows=%d | output=%s",
                 len(parts), len(oos), len(window) - len(oos), fusion_dir)
     return manifest

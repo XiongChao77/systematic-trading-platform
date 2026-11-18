@@ -203,7 +203,7 @@ def _resolve_device(device_name):
     return torch.device(device_name) if isinstance(device_name, str) else device_name
 
 
-_PREDICTION_CACHE_SCHEMA = 7
+_PREDICTION_CACHE_SCHEMA = 8
 _PREDICTION_COLUMNS = (
     "pred",
     "direction_pred",
@@ -485,6 +485,7 @@ def _infer_prediction_payload(
                 "end": max(
                     pd.Timestamp(fold["oos_end"]) for fold in development_folds
                 ).isoformat(),
+                "exclusive_end": True,
             }
         else:
             if period == "all":
@@ -809,8 +810,10 @@ def write_stage_predictions(save_dir: Optional[str], stage: str, stage_frame: pd
 
     output_dir = os.path.join(save_dir, "stage_predictions")
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, f"{stage}_predictions.csv")
-    stage_frame.loc[:, columns].to_csv(output_path, index=False)
+    output_path = os.path.join(output_dir, f"{stage}_predictions.csv.gz")
+    temporary = output_path + f".{os.getpid()}.tmp"
+    stage_frame.loc[:, columns].to_csv(temporary, index=False, compression="gzip")
+    os.replace(temporary, output_path)
     return output_path
 
 
@@ -910,11 +913,11 @@ def _sub_model_stage_summary(stats: dict) -> dict:
     }
 
 
-_STAGE_STRATEGY_KEYS = ("time", "performance", "drawdown", "exposure", "trades", "strategy")
+_STAGE_STRATEGY_KEYS = ("accounting", "time", "performance", "drawdown", "exposure", "trades", "strategy")
 
 
 def _strategy_stage_summary(stage_result: dict) -> dict:
-    """Keep the standalone trading performance blocks of one stage."""
+    """Keep continuous-account stage performance and its attribution rules."""
     return {key: stage_result.get(key) for key in _STAGE_STRATEGY_KEYS}
 
 
@@ -1004,6 +1007,14 @@ def _artifact_task_type(train_output_dir: Optional[str]) -> Optional[str]:
         if os.path.isabs(train_output_dir)
         else os.path.join(PROJECT_DIR, train_output_dir)
     )
+    window_path = os.path.join(artifact_dir, "rolling_manifest.json")
+    if os.path.isfile(window_path):
+        with open(window_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        tasks = tuple(config["train_task"] for config in manifest["configs"])
+        if len(tasks) == 1:
+            return tasks[0]
+        return next((name for name, roles in train_config.COMBO_SUB_TASKS.items() if tuple(roles) == tasks), None)
     task_desc_path = os.path.join(artifact_dir, model_loader.TASK_DESCRIPTION_FILENAME)
     if not os.path.isfile(task_desc_path):
         return None
@@ -1223,7 +1234,7 @@ def _md_stage_time_range(stage: dict) -> tuple[str, str]:
 
 def _md_stage_region(stage_name: str, overall: dict) -> dict:
     regions = (overall.get("time") or {}).get("regions") or {}
-    region_key = _STAGE_REGION_KEYS.get(stage_name, stage_name)
+    region_key = "test" if stage_name == "oos" and regions.get("test") else _STAGE_REGION_KEYS.get(stage_name, stage_name)
     return regions.get(region_key) or {}
 
 
@@ -1261,7 +1272,7 @@ def build_stage_summary_markdown(summary: dict) -> str:
     lines.append(
         "Human-readable companion of `stage_summary.json` in the same directory. "
         "Machine-readable values live in that JSON file; per-bar predictions live "
-        "in `stage_predictions/<stage>_predictions.csv`."
+        "in `stage_predictions/<stage>_predictions.csv.gz`."
     )
     lines.append("")
 
@@ -1439,12 +1450,9 @@ def build_stage_summary_markdown(summary: dict) -> str:
     )
     lines.append("")
     lines.append(
-        "`backtest bars` is the number of bars actually replayed for that stage "
-        "(after dropping rows without usable model input). `split samples` comes "
-        "from the training split manifest and is available for train/valid/test "
-        "only; for the forward stage use `predicted bars` as the reference. Each "
-        "stage runs its own broker, so the trading numbers below are standalone "
-        "stage runs."
+        "Stage metrics slice one continuous account; no stage replays orders or resets cash. "
+        "Train/validation are first-model diagnostics; OOS uses only chronological OOS predictions. "
+        "Prediction counts exclude unavailable labels, while account metrics include every market bar."
     )
     lines.append("")
 
@@ -1842,10 +1850,10 @@ def build_stage_summary_markdown(summary: dict) -> str:
     lines.append("## 5. Trading performance per stage")
     lines.append("")
     lines.append(
-        "Each stage runs its own broker, so these numbers are the standalone "
-        "performance of that stage, not a slice of the combined run. `equity return` "
-        "is the final equity change (already net of commission); the gross PnL table "
-        "below reconstructs pre-cost totals as `avg gross x trades`."
+        "Each stage inherits equity and positions from the full-period account. Equity return "
+        "uses equity immediately before the first included bar and is net of fees. Closed trades "
+        "are attributed by exit notification time; their lifetime PnL can include earlier stages "
+        "and must not be equated with segment mark-to-market PnL. Daily Sharpe uses rf=0 and 365 days/year."
     )
     lines.append("")
 
@@ -2257,12 +2265,12 @@ def build_stage_summary_markdown(summary: dict) -> str:
         "`avg gross x trades`."
     )
     lines.append(
-        "- Stage backtests are independent runs (own broker/cash); FTMO statistics "
-        "exist only for the whole-period report."
+        "- Stages are continuous-account slices, not independent broker runs. Boundary positions "
+        "remain open; FTMO statistics exist only for the whole-period report."
     )
     lines.append(
         "- Per-bar model output (including sub-model probabilities) is saved in "
-        "`stage_predictions/<stage>_predictions.csv`."
+        "`stage_predictions/<stage>_predictions.csv.gz`."
     )
     lines.append(
         "- Long/short precision is not comparable to 50%: compare it with the "
@@ -2398,143 +2406,33 @@ def _run_backtest(
 
 
 def _evaluate_stages(
-    *,
-    logger,
-    frame: pd.DataFrame,
-    config: RunnerConfig,
-    strategy_config,
-    venue_cls,
-    pre_para,
-    period: str,
-    analysis_mode: str,
-    saved_train_config,
-    data_manifest,
-    time_regions: dict,
-    stage_model_stats: dict,
-    stage_regions: Optional[list[tuple[str, str]]] = None,
-) -> tuple[dict, dict, dict]:
-    """Run one independent backtest per model stage and collect its results.
-
-    Each stage gets its own broker, so equity, drawdown and trade statistics are
-    that stage's standalone performance instead of a slice of the combined run.
-    """
-    stage_results = {}
-    stage_details = {}
-    stage_prediction_files = {}
-
-    for stage, region_key in (stage_regions or model_loader.ModelHandler.STAGE_REGIONS):
-        region = time_regions.get(region_key)
+    *, logger, frame, config, pre_para, strat, time_regions, stage_model_stats,
+    stage_regions=None,
+):
+    """Compute stage metrics from one executed account, with no order replay."""
+    from trade.runner.stage_accounting import slice_account
+    analyzer = strat.analyzers.customize
+    results, details, prediction_files = {}, {}, {}
+    interval_ms = common.get_interval_ms(pre_para.interval)
+    for stage, key in (stage_regions or model_loader.ModelHandler.STAGE_REGIONS):
+        region = time_regions.get(key)
         if not region:
-            logger.info("Stage %s has no model time region; skipping", stage)
             continue
-        stage_frame = slice_stage_frame(frame, region)
-        if stage_frame.empty:
-            logger.info("Stage %s has no bars in the backtest frame; skipping", stage)
+        result, detail = slice_account(analyzer.account_history, analyzer.closed_trades, region, interval_ms)
+        if result is None:
             continue
-
-        stage_strat = _run_backtest(
-            logger,
-            stage_frame,
-            config,
-            strategy_config,
-            venue_cls,
-            pre_para,
-            stage=stage,
-        )
-        stage_metrics = stage_model_stats.get(stage, {})
-        stage_report, stage_detail = generate_backtest_report(
-            logger,
-            stage_strat,
-            period=period,
-            model_stats=stage_metrics.get("fused", {}),
-            strategy_config=strategy_config,
-            broker_config=config.broker_config,
-            pre_para=pre_para,
-            train_cfg=saved_train_config,
-            sub_model_stats=stage_metrics.get("sub_models", {}),
-            data_config=config.data_config,
-            time_regions={stage: region},
-            data_manifest=data_manifest,
-            experiment_context=config.experiment_context,
-            analysis_mode=analysis_mode,
-            stage=stage,
-        )
-        stage_results[stage] = stage_report["results"][stage]
-        stage_details[stage] = stage_detail["results"][stage]
-
-        prediction_path = write_stage_predictions(config.save_dir, stage, stage_frame)
-        if prediction_path:
-            stage_prediction_files[stage] = prediction_path
-            logger.info("Stage %s predictions saved: %s", stage, prediction_path)
-
-        fused = stage_metrics.get("fused") or {}
-        if fused:
-            signal = fused.get("signal") or {}
-            baseline, baseline_class = _baseline_from_stats(fused)
-            logger.info(
-                "STAGE %s MODEL | accuracy=%.4f | baseline=%.4f (class %s) | "
-                "macro_f1=%.4f | coverage=%.4f | long_precision=%.4f | "
-                "short_precision=%.4f | directional_accuracy=%.4f",
-                stage.upper(),
-                _number(fused.get("accuracy")),
-                _number(baseline),
-                baseline_class,
-                _number(fused.get("f1_macro")),
-                _number(signal.get("coverage")),
-                _number(signal.get("long_win_rate")),
-                _number(signal.get("short_win_rate")),
-                _number(signal.get("directional_accuracy")),
-            )
-        for name, sub_stats in (stage_metrics.get("sub_models") or {}).items():
-            sub_report = sub_stats.get("classification_report") or {}
-            logger.info(
-                "STAGE %s SUB %-9s | acc=%.4f | macro_f1=%.4f | "
-                "p(pos)=%.4f | r(pos)=%.4f | p(neg)=%.4f | r(neg)=%.4f | n=%s",
-                stage.upper(),
-                name,
-                _number(sub_stats.get("accuracy")),
-                _number(sub_stats.get("f1_macro")),
-                _number((sub_report.get("1") or {}).get("precision")),
-                _number((sub_report.get("1") or {}).get("recall")),
-                _number((sub_report.get("0") or {}).get("precision")),
-                _number((sub_report.get("0") or {}).get("recall")),
-                sub_stats.get("sample_count"),
-            )
-            for scope, scoped in (sub_stats.get("prediction_scopes") or {}).items():
-                report = scoped.get("classification_report") or {}
-                logger.info(
-                    "STAGE %s SUB %s scope=%s | acc=%.4f | macro_f1=%.4f | "
-                    "p(long)=%.4f | r(long)=%.4f | p(short)=%.4f | r(short)=%.4f | "
-                    "n=%s | neutral_n=%s",
-                    stage.upper(), name, scope,
-                    _number(scoped.get("accuracy")),
-                    _number(scoped.get("f1_macro")),
-                    _number((report.get("1") or {}).get("precision")),
-                    _number((report.get("1") or {}).get("recall")),
-                    _number((report.get("-1") or {}).get("precision")),
-                    _number((report.get("-1") or {}).get("recall")),
-                    scoped.get("sample_count"), scoped.get("neutral_count"),
-                )
-
-    if stage_results:
-        logger.info(
-            "Stage summary | stage   | bars    | trades | gross_ret | win_rate | accuracy | macro_f1"
-        )
-        for stage, stage_result in stage_results.items():
-            stage_metrics = stage_model_stats.get(stage, {})
-            fused = stage_metrics.get("fused") or {}
-            logger.info(
-                "Stage summary | %-7s | %7d | %6d | %9.4f | %8.4f | %8.4f | %8.4f",
-                stage,
-                stage_metrics.get("bar_count", 0),
-                stage_result["trades"]["total"],
-                stage_result["performance"]["gross_return"],
-                stage_result["trades"]["win_rate"],
-                fused.get("accuracy", 0.0),
-                fused.get("f1_macro", 0.0),
-            )
-
-    return stage_results, stage_details, stage_prediction_files
+        metrics = stage_model_stats.get(stage, {})
+        result["exposure"]["risk_per_trade_pct"] = getattr(config.strategy_config, "risk_per_trade_pct", None)
+        result["model_metrics"] = metrics.get("fused", {})
+        result["sub_model_metrics"] = metrics.get("sub_models", {})
+        results[stage], details[stage] = result, detail
+        path = write_stage_predictions(config.save_dir, stage, slice_stage_frame(frame, region))
+        if path:
+            prediction_files[stage] = path
+        logger.info("Continuous account stage %s | return=%.4f | MaxDD=%.2f%% | closed trades=%d | carry-in=%s",
+                    stage, result["performance"]["gross_return"], result["drawdown"]["max_dd_pct"],
+                    result["trades"]["total"], result["accounting"]["carry_in_position"])
+    return results, details, prediction_files
 
 
 def main(
@@ -2625,11 +2523,12 @@ def main(
     stage_results = {}
     stage_details = {}
     stage_prediction_files = {}
-    stage_regions = [("train", "train"), ("oos", "oos")] if period == "development" else None
+    stage_regions = [("train", "train"), ("valid", "valid"), ("oos", "test")] if period == "development" else None
     if stage_regions and isinstance(config.data_config, ModelDataConfig):
         evaluate_stages = True
         stage_model_stats = {
             "train": (stage_model_stats or {}).get("train", {}),
+            "valid": (stage_model_stats or {}).get("valid", {}),
             "oos": (stage_model_stats or {}).get("test", {}),
         }
     if evaluate_stages and isinstance(config.data_config, ModelDataConfig):
@@ -2640,13 +2539,8 @@ def main(
                 logger=logger,
                 frame=frame,
                 config=config,
-                strategy_config=strategy_config,
-                venue_cls=venue_cls,
                 pre_para=pre_para,
-                period=period,
-                analysis_mode=analysis_mode,
-                saved_train_config=saved_train_config,
-                data_manifest=data_manifest,
+                strat=strat,
                 time_regions=time_regions,
                 stage_model_stats=stage_model_stats or {},
                 stage_regions=stage_regions,
@@ -2680,6 +2574,27 @@ def main(
                 if markdown_path:
                     report["stage_summary_markdown"] = markdown_path
                     logger.info("Stage summary markdown saved: %s", markdown_path)
+
+    if config.save_dir:
+        from trade.runner.stage_accounting import ACCOUNT_COLUMNS
+        os.makedirs(config.save_dir, exist_ok=True)
+        history_path = os.path.join(config.save_dir, "account_history.csv.gz")
+        temporary_history = history_path + f".{os.getpid()}.tmp"
+        pd.DataFrame(strat.analyzers.customize.account_history, columns=ACCOUNT_COLUMNS).to_csv(
+            temporary_history, index=False, compression="gzip",
+        )
+        os.replace(temporary_history, history_path)
+        full_details = report_details["results"][period]
+        full_details.pop("account_history", None)
+        full_details["account_history_file"] = os.path.abspath(history_path)
+        from trade.runner.account_equity_plot import save_account_equity_curves
+        curve_paths = save_account_equity_curves(
+            history_path, regions=time_regions,
+            title=f"{period} | run {report['params']['hash']} | hold={getattr(strategy_config, 'fixed_hold_bars', None)} bars",
+        )
+        full_details["equity_curve_files"] = curve_paths
+        report["results"][period]["equity_curve_files"] = curve_paths
+        logger.info("Account equity curves saved: %s", curve_paths)
 
     candle_columns = ["open_time_date_utc", "open", "high", "low", "close", "volume"]
     candle_columns.extend(name for name in ("pred", "label") if name in frame.columns)
@@ -3171,11 +3086,13 @@ def generate_backtest_report(
         params_snapshot["data_manifest"] = data_manifest
 
     if pre_para is not None and train_cfg is not None:
-        task_identity = TaskIdentity.from_configs(
-            strategy_config=strategy_config,
-            broker_config=broker_config,
-            common=pre_para,
-            train=train_cfg,
+        from model.artifact_identity import training_identity
+        identity_train = (training_identity(data_config.train_output_dir, asdict(train_cfg))
+                          if isinstance(data_config, ModelDataConfig) else asdict(train_cfg))
+        params_snapshot["training_identity"] = identity_train
+        task_identity = TaskIdentity.from_params(
+            prep=asdict(pre_para), train=identity_train,
+            sim={"strategy_config": strategy_config_to_dict(strategy_config), "broker_config": asdict(broker_config)},
         )
         params_hash = (
             task_identity.full_hash
@@ -3271,6 +3188,10 @@ def generate_backtest_report(
         },
         f"strategy_detail": strategy_details,
         f"trade_logs": list(getattr(strat, "trade_logs", [])),
+        "account_history_columns": ["time", "previous_equity", "equity", "previous_position", "position", "exposure"],
+        "account_history": strat.analyzers.customize.account_history,
+        "closed_trades": strat.analyzers.customize.closed_trades,
+        "identity": task_identity.as_dict() if pre_para is not None and train_cfg is not None else None,
     }
 
     # common.dump_params_json(train_cfg,logger)
@@ -3355,6 +3276,7 @@ def generate_backtest_report(
 
     report = {
         "params": params_snapshot,
+        "backtest_contract": "continuous_account_v1",
         "results": {period: period_report},
     }
     report_details = {
@@ -3378,7 +3300,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--skip-stages",
         action="store_true",
-        help="Skip the standalone train/valid/test/forward stage backtests.",
+        help="Skip train/valid/test/forward account summaries outside Development.",
     )
     parser.add_argument(
         "--symbol",

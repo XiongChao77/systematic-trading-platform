@@ -440,7 +440,25 @@ def _execute_windows(
     window_predictions = []
     development_predictions = []
     evaluations = {config.train_task: [] for config in configs}
-    for fold in folds:
+    task_strategies = {config.train_task: build_task(config.train_task, config, device) for config in configs}
+    completed_folds = list(manifest["folds"])
+    for index, fold in enumerate(folds):
+        if index < len(completed_folds):
+            saved = completed_folds[index]
+            window = pd.read_pickle(os.path.join(save_dir, saved["window_predictions"]))
+            segment = pd.read_pickle(os.path.join(save_dir, saved["predictions"]))
+            validate_predictions(window, manifest, allow_in_sample=True)
+            validate_predictions(segment, manifest)
+            window_predictions.append(window)
+            predictions.append(segment)
+            if saved["phase"] == "development":
+                development_predictions.append(window)
+            for config in configs:
+                if config.train_task in saved.get("oos_metrics", {}):
+                    path = os.path.join(save_dir, saved["fold_id"], config.train_task, "oos_evaluation.pt")
+                    evaluations[config.train_task].append(torch.load(path, map_location="cpu", weights_only=False))
+            logger.info("Reusing completed window %s (%d/%d)", saved["fold_id"], index + 1, len(folds))
+            continue
         logger.info("Rolling fold %s | %s | OOS %s -> %s", fold["fold_id"],
                     fold["phase"], fold["oos_start"], fold["oos_end"])
         train_start, valid_start, oos_start, oos_end = (
@@ -677,7 +695,7 @@ def _execute_windows(
 def train_windows(
     *, configs=None, windows=None, rolling_config=None,
     prep_output_dir=common.DATA_OUT_DIR, save_dir=None, logger=None,
-    include_forward=True,
+    include_forward=True, resume=False,
 ) -> dict:
     """Train fresh models on one explicit window or a sequence of windows.
 
@@ -743,9 +761,6 @@ def train_windows(
     if save_dir is None:
         stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%dT%H%M%S%fZ")
         save_dir = os.path.join(common.TRAIN_OUT_DIR, f"{mode}_{stamp}")
-    if os.path.exists(os.path.join(save_dir, "rolling_manifest.json")):
-        raise FileExistsError("Training output already exists; select a new save_dir")
-    copy_data_config_meta(prep_output_dir, save_dir)
     manifest = {
         "status": "running", "data_id": provenance["data_id"],
         "prediction_contract": 1,
@@ -756,6 +771,43 @@ def train_windows(
         "planned_windows": [dict(fold) for fold in folds],
         "folds": [], "predictions": "oos_predictions.pkl",
     }
+    manifest_path = os.path.join(save_dir, "rolling_manifest.json")
+    if os.path.exists(manifest_path):
+        if not resume:
+            raise FileExistsError("Training output already exists; pass resume=True to continue")
+        with open(manifest_path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        for key in ("data_id", "prediction_contract", "include_forward", "window_mode", "forward_start",
+                    "rolling_config", "configs", "planned_windows"):
+            if saved.get(key) != json.loads(json.dumps(manifest[key])):
+                raise ValueError(f"Resume training configuration differs: {key}")
+        if len(saved["folds"]) > len(folds):
+            raise ValueError("Resume manifest has more completed windows than planned")
+        for planned, completed in zip(folds, saved["folds"]):
+            if any(completed.get(key) != value for key, value in planned.items()):
+                raise ValueError("Resume completed windows are not a prefix of the plan")
+            for key in ("window_predictions", "predictions"):
+                if not os.path.isfile(os.path.join(save_dir, completed[key])):
+                    raise FileNotFoundError(f"Resume window artifact is missing: {completed[key]}")
+            for config in configs:
+                role = os.path.join(save_dir, completed["fold_id"], config.train_task)
+                required_files = ["task_description.json", "model.pt", "meta.json"]
+                if config.train_task in completed.get("oos_metrics", {}):
+                    required_files.append("oos_evaluation.pt")
+                for name in required_files:
+                    if not os.path.isfile(os.path.join(role, name)):
+                        raise FileNotFoundError(f"Resume checkpoint is missing: {role}/{name}")
+        if saved["status"] == "complete":
+            for key in ("predictions", "window_predictions", "development_predictions"):
+                if not os.path.isfile(os.path.join(save_dir, saved[key])):
+                    raise FileNotFoundError(f"Complete training export is missing: {saved[key]}")
+            logger.info("Reusing complete training run: %s", save_dir)
+            return saved
+        manifest = saved
+        manifest.update(status="running")
+        manifest.pop("error", None)
+        logger.info("Resuming %s | completed windows=%d/%d", save_dir, len(saved["folds"]), len(folds))
+    copy_data_config_meta(prep_output_dir, save_dir)
 
     def write_manifest():
         temporary = os.path.join(save_dir, "rolling_manifest.json.tmp")
@@ -798,6 +850,7 @@ if __name__ == "__main__":
                         help="Training window mode used with --rolling")
     parser.add_argument("--prep-output-dir", default=common.DATA_OUT_DIR)
     parser.add_argument("--save-dir")
+    parser.add_argument("--resume", action="store_true", help="Resume completed windows in --save-dir")
     parser.add_argument("--train-months", type=int, default=12)
     parser.add_argument("--validation-months", type=int, default=2)
     parser.add_argument("--oos-months", type=int, default=3)
@@ -815,6 +868,7 @@ if __name__ == "__main__":
     session_logger, _ = common.setup_session_logger(sub_folder="train", file_level=logging.DEBUG)
     try:
         train_windows(
+            resume=args.resume,
             configs=[SingleModelConfig],
             windows=windows,
             rolling_config=RollingConfig(
