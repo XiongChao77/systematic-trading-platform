@@ -15,7 +15,9 @@ export function loadLiveStrategy(instanceId, { viewerId, ...options } = {}) {
   );
 }
 
-
+export function loadLiveStrategyCurve(instanceId, options) {
+  return apiRequest(`/api/live/strategies/${encodeURIComponent(instanceId)}/curve`, options);
+}
 
 export function releaseLiveViewer(viewerId) {
   return apiRequest(`/api/live/viewers/${encodeURIComponent(viewerId)}`, {

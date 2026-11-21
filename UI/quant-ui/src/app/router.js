@@ -1,33 +1,68 @@
+const ROUTE_PATHS = new Map([
+  ["live", "/"],
+  ["experiments", "/experiments"],
+  ["backtests", "/backtest"],
+  ["labels", "/labels"],
+]);
+const PATH_ROUTES = new Map([
+  ...Array.from(ROUTE_PATHS, ([route, path]) => [path, route]),
+  ["/live", "live"],
+  ["/backtests", "backtests"],
+]);
+
 export function createRouter({ outlet, navItems, routes, defaultRoute }) {
   let disposeCurrent = null;
   let navigationVersion = 0;
 
   function parseLocation() {
-    const raw = window.location.hash.startsWith("#/")
-      ? window.location.hash.slice(2)
-      : "";
-    const [routeName, queryString = ""] = raw.split("?", 2);
-    const route = routes[routeName] ? routeName : defaultRoute;
-    return { route, params: new URLSearchParams(queryString) };
+    const { pathname, search, hash } = window.location;
+    if (hash.startsWith("#/")) {
+      const legacy = hash.slice(1);
+      const queryIndex = legacy.indexOf("?");
+      const path = queryIndex === -1 ? legacy : legacy.slice(0, queryIndex);
+      const route = PATH_ROUTES.get(path) ?? defaultRoute;
+      const params = new URLSearchParams(search);
+      if (queryIndex !== -1) {
+        const legacyParams = new URLSearchParams(legacy.slice(queryIndex));
+        for (const key of new Set(legacyParams.keys())) {
+          params.delete(key);
+          for (const value of legacyParams.getAll(key)) params.append(key, value);
+        }
+      }
+      window.history.replaceState(null, "", routeUrl(route, params));
+      return { route, params };
+    }
+
+    const path = pathname.replace(/\/+$/, "") || "/";
+    const route = PATH_ROUTES.get(path) ?? defaultRoute;
+    if (PATH_ROUTES.has(path) && pathname !== ROUTE_PATHS.get(route)) {
+      window.history.replaceState(null, "", ROUTE_PATHS.get(route) + search + hash);
+    }
+    return { route, params: new URLSearchParams(search) };
+  }
+
+  function routeUrl(route, params) {
+    const query = params.toString();
+    return ROUTE_PATHS.get(route) + (query ? `?${query}` : "");
   }
 
   function navigate(route, params = {}) {
+    if (!ROUTE_PATHS.has(route)) return;
     const search = new URLSearchParams();
     Object.entries(params).forEach(([key, value]) => {
       if (value !== null && value !== undefined && value !== "") {
         search.set(key, String(value));
       }
     });
-    const suffix = search.size ? `?${search.toString()}` : "";
-    window.location.hash = `#/${route}${suffix}`;
+    const url = routeUrl(route, search);
+    const current = window.location.pathname + window.location.search + window.location.hash;
+    if (url === current) return;
+    window.history.pushState(null, "", url);
+    render();
   }
 
   async function render() {
     const location = parseLocation();
-    const expectedHash = `#/${location.route}${location.params.size ? `?${location.params}` : ""}`;
-    if (!window.location.hash.startsWith(`#/${location.route}`)) {
-      window.history.replaceState(null, "", expectedHash);
-    }
 
     navigationVersion += 1;
     const version = navigationVersion;
@@ -66,10 +101,19 @@ export function createRouter({ outlet, navItems, routes, defaultRoute }) {
   }
 
   function start() {
-    if (!window.location.hash || window.location.hash === "#/") {
-      window.history.replaceState(null, "", `#/${defaultRoute}`);
-    }
-    window.addEventListener("hashchange", render);
+    navItems.forEach((element, route) => {
+      element.href = ROUTE_PATHS.get(route);
+      element.addEventListener("click", event => {
+        if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey
+            || event.shiftKey || event.altKey) return;
+        event.preventDefault();
+        navigate(route);
+      });
+    });
+    window.addEventListener("popstate", render);
+    window.addEventListener("hashchange", () => {
+      if (window.location.hash.startsWith("#/")) render();
+    });
     render();
   }
 

@@ -15,6 +15,7 @@ import pyarrow as pa
 
 from experiment.report_service import (
     ReportRecord,
+    combine_daily_account,
     json_safe_value,
     load_report_details,
     materialize_period_report,
@@ -236,7 +237,7 @@ def _combine_reports(
     if len(returns) > 1 and float(returns.std(ddof=1)) > 0:
         sharpe = float(returns.mean() / returns.std(ddof=1) * np.sqrt(365.0))
 
-    daily_account = _combine_daily_account(long_report, forward_report)
+    daily_account = combine_daily_account(long_report, forward_report)
 
     combined.setdefault("time", {})["start"] = long_report.get("time", {}).get("start")
     combined["time"]["end"] = forward_report.get("time", {}).get("end")
@@ -299,62 +300,6 @@ def _combine_reports(
         }
     )
     combined["ftmo_challenge"] = simulate_ftmo_challenges(combined, "all")
-    return combined
-
-
-def _combine_daily_account(
-    *reports: Mapping[str, Any],
-) -> list[dict[str, Any]]:
-    """Chain period-relative daily account values into one equity scale."""
-
-    combined = []
-    current_equity = None
-    for report in reports:
-        rows = (
-            report.get("raw_analyzer", {})
-            .get("customize", {})
-            .get("daily_account")
-        )
-        if not isinstance(rows, list) or not rows:
-            continue
-        start_value = report.get("performance", {}).get("start_value")
-        if not _is_number(start_value) or float(start_value) <= 0:
-            continue
-        if current_equity is None:
-            current_equity = float(start_value)
-        scale = current_equity / float(start_value)
-        last_end_equity = None
-        for row in rows:
-            if not isinstance(row, Mapping):
-                continue
-            date = row.get("date")
-            if date is None:
-                continue
-            values = {
-                name: row.get(name)
-                for name in ("start_equity", "minimum_equity", "end_equity")
-            }
-            if not all(_is_number(value) for value in values.values()):
-                continue
-            start_equity = float(values["start_equity"]) * scale
-            minimum_equity = float(values["minimum_equity"]) * scale
-            end_equity = float(values["end_equity"]) * scale
-            combined.append(
-                {
-                    "date": str(date),
-                    "start_equity": start_equity,
-                    "minimum_equity": minimum_equity,
-                    "end_equity": end_equity,
-                    "intraday_drawdown_pct": (
-                        minimum_equity / start_equity - 1.0
-                        if start_equity > 0
-                        else 0.0
-                    ),
-                }
-            )
-            last_end_equity = end_equity
-        if last_end_equity is not None:
-            current_equity = last_end_equity
     return combined
 
 

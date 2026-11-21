@@ -243,6 +243,8 @@ class LiveSnapshotStore:
                         "interval": item["interval"],
                         "initial_balance": item["initial_balance"],
                         "balance": self._balance(item),
+                        "equity": item["account"]["equity"] if self._balance(item) is not None else None,
+                        "account_updated_at": item["account_updated_at"],
                         "margin_utilization": self._margin_utilization(item),
                         "unrealized_pnl": self._unrealized_pnl(item),
                         "status": item["status"],

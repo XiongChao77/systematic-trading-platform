@@ -54,7 +54,6 @@ export function createAppShell(root) {
       link.disabled = true;
       link.setAttribute("aria-disabled", "true");
     } else {
-      link.href = `#/${item.id}`;
       navItems.set(item.id, link);
     }
     navigation.appendChild(link);

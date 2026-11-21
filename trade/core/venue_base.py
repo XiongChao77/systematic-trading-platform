@@ -28,7 +28,7 @@ from trade.core.execution import (
 
 
 class VenueBase:
-    MAX_ENTRY_SPREAD_PCT = 0.0015
+    MAX_ENTRY_SPREAD_PCT = 0.002
     FIRM_DAILY_RESET_TIMEZONES = {
         Firm.FTMO: ZoneInfo("Europe/Prague"),
         # The5ers defines its reset as a fixed UTC+3 boundary without DST.

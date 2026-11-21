@@ -128,6 +128,7 @@ def load_report_dataset(
     *,
     allowed_root: str | Path,
     deduplicate: bool = True,
+    allow_named_jsonl: bool = False,
 ) -> ReportDataset:
     """Load reports from files/directories selected below ``allowed_root``."""
     if not paths:
@@ -137,7 +138,11 @@ def load_report_dataset(
     seen_files: set[Path] = set()
     for selected in paths:
         resolved = resolve_under_root(allowed_root, selected)
-        for report_file in find_report_files(resolved):
+        report_files = (
+            [resolved] if allow_named_jsonl and resolved.is_file() and resolved.suffix == ".jsonl"
+            else find_report_files(resolved)
+        )
+        for report_file in report_files:
             resolved_file = report_file.resolve()
             if resolved_file not in seen_files:
                 files.append(resolved_file)
@@ -220,6 +225,62 @@ def materialize_period_report(
             raise ValueError(f"report_details has no {period!r} result")
         materialized.update(dict(period_details))
     return materialized
+
+
+def combine_daily_account(
+    *reports: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Chain period-relative daily account values into one equity scale."""
+
+    combined = []
+    current_equity = None
+    for report in reports:
+        rows = (
+            report.get("raw_analyzer", {})
+            .get("customize", {})
+            .get("daily_account")
+        )
+        if not isinstance(rows, list) or not rows:
+            continue
+        start_value = report.get("performance", {}).get("start_value")
+        if not _is_number(start_value) or float(start_value) <= 0:
+            continue
+        if current_equity is None:
+            current_equity = float(start_value)
+        scale = current_equity / float(start_value)
+        last_end_equity = None
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            date = row.get("date")
+            if date is None:
+                continue
+            values = {
+                name: row.get(name)
+                for name in ("start_equity", "minimum_equity", "end_equity")
+            }
+            if not all(_is_number(value) for value in values.values()):
+                continue
+            start_equity = float(values["start_equity"]) * scale
+            minimum_equity = float(values["minimum_equity"]) * scale
+            end_equity = float(values["end_equity"]) * scale
+            combined.append(
+                {
+                    "date": str(date),
+                    "start_equity": start_equity,
+                    "minimum_equity": minimum_equity,
+                    "end_equity": end_equity,
+                    "intraday_drawdown_pct": (
+                        minimum_equity / start_equity - 1.0
+                        if start_equity > 0
+                        else 0.0
+                    ),
+                }
+            )
+            last_end_equity = end_equity
+        if last_end_equity is not None:
+            current_equity = last_end_equity
+    return combined
 
 
 def report_details_path(record: ReportRecord, reports_root: str | Path) -> Path:

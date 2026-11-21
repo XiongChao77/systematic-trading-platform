@@ -29,7 +29,7 @@ def bill_amount(row):
     return Decimal(row.get("amount") or "0") + Decimal(row.get("fee") or "0")
 
 
-def report(db, accounts, zone, requested_start, requested_end):
+def bill_checkpoints(db, accounts):
     if not accounts:
         accounts = [
             row[0] for row in db.execute("SELECT account_id FROM configured_accounts")
@@ -44,22 +44,31 @@ def report(db, accounts, zone, requested_start, requested_end):
     if not coverage or (accounts and set(coverage) != set(accounts)):
         raise ValueError("Missing bill coverage for selected accounts")
 
-    def stamp(day):
-        return int(datetime.combine(day, time.min, zone).timestamp() * 1000)
+    return coverage
 
-    def local_day(milliseconds):
-        return datetime.fromtimestamp(milliseconds / 1000, zone).date()
 
+def day_stamp(day, zone):
+    return int(datetime.combine(day, time.min, zone).timestamp() * 1000)
+
+
+def complete_bill_dates(coverage, zone):
     first_ms = max(row[0] for row in coverage.values())
-    first = local_day(first_ms)
-    if stamp(first) < first_ms:
+    first = datetime.fromtimestamp(first_ms / 1000, zone).date()
+    if day_stamp(first, zone) < first_ms:
         first += DAY
-    last = local_day(min(row[1] for row in coverage.values())) - DAY
+    last_ms = min(row[1] for row in coverage.values())
+    last = datetime.fromtimestamp(last_ms / 1000, zone).date() - DAY
+    return first, last
+
+
+def report(db, accounts, zone, requested_start, requested_end):
+    coverage = bill_checkpoints(db, accounts)
+    first, last = complete_bill_dates(coverage, zone)
     start, end = requested_start or first, requested_end or last
     if start < first or end > last or start > end:
         raise ValueError(f"Use complete dates within {first} through {last}")
 
-    left, right = stamp(start), stamp(end + DAY)
+    left, right = day_stamp(start, zone), day_stamp(end + DAY, zone)
     opening = ZERO
     events = defaultdict(lambda: [ZERO, ZERO])
     for account in coverage:
@@ -142,7 +151,7 @@ def report(db, accounts, zone, requested_start, requested_end):
         flows += flow
         event_peak = max(event_peak, nav)
         event_drawdown = max(event_drawdown, 1 - nav / event_peak)
-        daily[local_day(created)] = (balance, nav)
+        daily[datetime.fromtimestamp(created / 1000, zone).date()] = (balance, nav)
 
     rows = []
     returns = []

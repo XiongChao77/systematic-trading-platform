@@ -1,9 +1,9 @@
-import { createChart, LineSeries } from "lightweight-charts";
-import { escapeHtml, formatMoney, pnlTone } from "../../shared/formatters.js";
+import { createChart, createSeriesMarkers, LineSeries } from "lightweight-charts";
+import { formatMoney, pnlTone } from "../../shared/formatters.js";
 import { loadLiveOverview, loadLiveStrategies, releaseLiveViewer } from "./live-api.js";
 
-const STRATEGY_START_DATE = "2026-09-07";
 const INITIAL_CAPITAL = 1_700;
+const DAY_MS = 86_400_000;
 const money = new Intl.NumberFormat("en-US", {
   minimumFractionDigits: 2, maximumFractionDigits: 2,
 });
@@ -11,16 +11,37 @@ const ratio = new Intl.NumberFormat("en-US", { style: "percent", maximumFraction
 const format = (value, formatter) => Number.isFinite(value) ? formatter.format(value) : "—";
 const amount = value => format(value, money);
 const percent = value => format(value, ratio);
+const utcDate = value => new Date(value).toISOString().slice(0, 10);
+
+function chartPoints(rows, field) {
+  const points = [];
+  for (const row of rows) {
+    const previous = points.at(-1);
+    if (previous && Date.parse(row.date) - Date.parse(previous.time) > DAY_MS) {
+      points.push({ time: utcDate(Date.parse(previous.time) + DAY_MS) });
+    }
+    points.push({ time: row.date, value: row[field] });
+  }
+  return points;
+}
 
 export function mountOverview(container, context) {
   const controller = new AbortController();
   const viewerId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
   const release = () => { releaseLiveViewer(viewerId).catch(() => {}); };
-  const charts = [];
   let disposed = false;
   let loading = false;
   let liveLoading = false;
-  let updatedAt;
+  let report;
+  let liveItems = [];
+  let funds;
+  let equityLine;
+  let markers;
+  let drawdown;
+  let drawdownLine;
+  let settledPoints = [];
+  let displayedDay;
+
   container.innerHTML = `
     <section class="module-page scroll-page live-page">
       <header class="page-header live-portfolio-header">
@@ -30,61 +51,107 @@ export function mountOverview(container, context) {
         </div>
         <button type="button" class="back-button" data-action="strategies">Strategies →</button>
       </header>
-      <p role="status"><span data-role="notice">Loading the daily portfolio report…</span><span data-role="live-status"></span></p>
-      <dl class="live-portfolio-metrics" data-role="metrics"></dl>
-      <div data-role="portfolio" hidden>
-        <section class="panel live-portfolio-chart-panel">
-          <h2>Daily Balance and Equity</h2>
-          <p class="live-portfolio-legend"><span>● End-of-day balance</span><span>● Sampled equity</span></p>
-          <div class="live-portfolio-chart" data-role="funds"></div>
-        </section>
-        <section class="panel live-portfolio-chart-panel">
-          <h2>End-of-day Drawdown</h2>
-          <div class="live-portfolio-chart live-portfolio-drawdown" data-role="drawdown"></div>
-        </section>
-      </div>
+      <section aria-label="Live assets">
+        <h2>Live Assets</h2>
+        <p role="status" data-role="live-status">Waiting for live data</p>
+        <dl class="live-portfolio-metrics" data-role="live-metrics"></dl>
+      </section>
+      <section aria-label="Settled strategy performance">
+        <h2>Settled Strategy Performance</h2>
+        <p role="status" data-role="notice">Loading the daily portfolio report…</p>
+        <dl class="live-portfolio-metrics" data-role="metrics"></dl>
+        <div data-role="portfolio" hidden>
+          <section class="panel live-portfolio-chart-panel">
+            <h2>Portfolio Value</h2>
+            <p>Daily close at 00:00 UTC. The green marker shows today's live equity.</p>
+            <div class="live-portfolio-chart" data-role="funds"></div>
+          </section>
+          <section class="panel live-portfolio-chart-panel">
+            <h2>Daily Drawdown</h2>
+            <div class="live-portfolio-chart live-portfolio-drawdown" data-role="drawdown"></div>
+          </section>
+        </div>
+      </section>
     </section>`;
   const find = role => container.querySelector(`[data-role="${role}"]`);
   container.querySelector('[data-action="strategies"]').addEventListener("click", () => {
     context.navigate("live", { view: "strategies" });
   });
 
-  const cards = [
-    ["Strategy Start Date", "start-date", STRATEGY_START_DATE],
-    ["Initial Capital", "initial-capital", amount(INITIAL_CAPITAL)],
+  function renderCards(role, cards) {
+    find(role).innerHTML = cards.map(([label, key]) =>
+      `<div class="panel"><dt data-role="${key}-label">${label}</dt><dd data-role="${key}">—</dd></div>`,
+    ).join("");
+  }
+
+  renderCards("live-metrics", [
+    ["Initial Capital", "initial-capital"],
     ["Total Balance", "balance"],
     ["Unrealized PnL", "pnl"],
+    ["Total Equity", "equity"],
+  ]);
+  renderCards("metrics", [
+    ["Strategy Start Date", "start-date"],
     ["Return", "return"],
     ["Sharpe", "sharpe"],
     ["Calmar", "calmar"],
-    ["Max Drawdown", "max-drawdown"],
+    ["Daily Max Drawdown", "max-drawdown"],
     ["Longest Drawdown", "drawdown-duration"],
-  ];
-  find("metrics").innerHTML = cards.map(([label, role, value = "—"]) =>
-    `<div class="panel"${role === "balance" || role === "pnl" ? ' title="Live crypto strategies"' : ""}>
-      <dt data-role="${role}-label">${label}</dt><dd data-role="${role}">${escapeHtml(value)}</dd></div>`
-  ).join("");
+  ]);
 
-  function chart(role) {
-    const result = createChart(find(role), { autoSize: true, localization: { locale: "en-US" } });
-    charts.push(result);
-    return result;
-  }
+  find("initial-capital").textContent = amount(INITIAL_CAPITAL);
 
-  function renderLive(summary, status = "") {
-    const balance = find("balance");
-    const pnl = find("pnl");
-    balance.textContent = amount(summary?.balance?.value);
-    pnl.textContent = formatMoney(summary?.unrealized_pnl?.value, true);
-    pnl.className = pnlTone(summary?.unrealized_pnl?.value);
+  function renderLive() {
+    if (!report) return;
+    const today = utcDate(Date.now());
+    const expected = new Set(report.account_ids);
+    const accounts = new Map();
+    for (const item of liveItems) {
+      const observed = Date.parse(item.account_updated_at);
+      if (item.runner_id !== report.runner_id || item.venue.toLowerCase() !== "bitget"
+          || !expected.has(item.account_id) || item.status === "stopped"
+          || !Number.isFinite(item.equity) || !Number.isFinite(observed)
+          || utcDate(observed) !== today) continue;
+      const previous = accounts.get(item.account_id);
+      if (!previous || observed > previous.observed) {
+        accounts.set(item.account_id, { observed, equity: item.equity, balance: item.balance });
+      }
+    }
 
-    const coverage = [
-      [summary?.balance, "accounts"],
-      [summary?.unrealized_pnl, "strategies"],
-    ].filter(([metric]) => metric?.included < metric?.total)
-      .map(([metric, unit]) => `${metric.included}/${metric.total} ${unit}`);
-    const message = status || coverage.join(", ");
-    find("live-status").textContent = message ? ` · Live crypto data: ${message}` : "";
+    let balance = null;
+    let equity = null;
+    if (expected.size && accounts.size === expected.size) {
+      balance = 0;
+      equity = 0;
+      for (const account of accounts.values()) {
+        balance += account.balance;
+        equity += account.equity;
+      }
+    }
+    const pnl = equity === null ? null : equity - balance;
+    find("balance").textContent = amount(balance);
+    find("equity").textContent = amount(equity);
+    find("pnl").textContent = formatMoney(pnl, true);
+    find("pnl").className = pnlTone(pnl);
+    find("live-status").textContent = equity === null
+      ? `Waiting for live equity · ${accounts.size}/${expected.size} accounts`
+      : "";
+
+    const points = [...settledPoints];
+    if (equity !== null) {
+      const last = points.at(-1);
+      if (last && Date.parse(today) - Date.parse(last.time) > DAY_MS) {
+        points.push({ time: utcDate(Date.parse(last.time) + DAY_MS) });
+      }
+      points.push({ time: today, value: equity });
+    }
+    equityLine.setData(points);
+    markers.setMarkers(equity === null ? [] : [
+      { time: today, position: "inBar", shape: "circle", color: "#008476" },
+    ]);
+    const liveDay = equity === null ? null : today;
+    if (liveDay !== displayedDay) funds.timeScale().fitContent();
+    displayedDay = liveDay;
   }
 
   async function refreshLive() {
@@ -92,48 +159,53 @@ export function mountOverview(container, context) {
     liveLoading = true;
     try {
       const payload = await loadLiveStrategies({ viewerId, signal: controller.signal });
-      const summary = payload.pnl_summary.crypto;
-      if (!disposed) renderLive(summary, summary.unrealized_pnl.total === 0 ? "Waiting for strategies" : "");
+      if (disposed) return;
+      liveItems = payload.items;
     } catch {
-      if (!disposed) renderLive(null, "Live data unavailable");
+      if (disposed) return;
+      liveItems = [];
     } finally {
       liveLoading = false;
     }
+    renderLive();
   }
 
   function render(payload) {
-    const { metrics, snapshot, balance_series, equity_series } = payload;
-    const balances = balance_series.filter(row => row.date >= STRATEGY_START_DATE);
-    const equities = equity_series.filter(row => row.date >= STRATEGY_START_DATE);
-    const duration = metrics.longest_drawdown;
-    find("return-label").textContent = metrics.funded_days < 365 ? "Return (Estimated Annualized)" : "Return (Annualized)";
-    find("return").textContent = `${percent(metrics.total_return)} (${percent(metrics.annualized_return)})`;
-    find("sharpe").textContent = amount(metrics.sharpe_zero_risk_free);
-    find("calmar").textContent = amount(metrics.calmar);
-    find("max-drawdown").textContent = percent(metrics.bill_event_max_drawdown);
+    const { metrics, funds_series: rows } = payload;
+    report = payload;
+    find("coverage").textContent = `Bitget · ${payload.account_ids.length} accounts · USDT · ${payload.runner_id}`;
+    find("start-date").textContent = payload.strategy_start;
+    find("notice").textContent = metrics
+      ? `UTC valuation dates ${metrics.start} to ${metrics.end}`
+        + (metrics.missing_days ? ` · ${metrics.missing_days} missing daily valuations` : "")
+        + (rows.length === 1 ? " · Return needs at least two daily valuations" : "")
+      : "Waiting for daily portfolio valuations.";
+    find("return-label").textContent = metrics?.days >= 365 ? "Return (Annualized)" : "Return (Estimated Annualized)";
+    find("return").textContent = Number.isFinite(metrics?.total_return)
+      ? `${percent(metrics.total_return)} (${percent(metrics.annualized_return)})` : "—";
+    find("sharpe").textContent = amount(metrics?.sharpe_zero_risk_free);
+    find("calmar").textContent = amount(metrics?.calmar);
+    find("max-drawdown").textContent = percent(metrics?.daily_max_drawdown);
+    const duration = metrics?.longest_drawdown;
     find("drawdown-duration").textContent = duration
-      ? `${duration.days} days${duration.recovered ? "" : " (unrecovered)"}` : "0 days";
-    find("coverage").textContent = `Bitget · ${metrics.accounts} accounts · USDT · ${payload.runner_id}`;
-    find("notice").textContent = `Historical equity sampled at ${snapshot.as_of} · Risk metrics use realized NAV through ${metrics.end}`;
+      ? `${duration.days} days${duration.recovered ? "" : " (unrecovered)"}` : metrics ? "0 days" : "—";
     find("portfolio").hidden = false;
-    charts.splice(0).forEach(item => item.remove());
 
-    const funds = chart("funds");
-    funds.addSeries(LineSeries, { color: "#246ca0" }).setData(
-      balances.map(row => ({ time: row.date, value: row.balance })),
-    );
-    const equityByDate = new Map(equities.map(row => [row.date, row.equity]));
-    const dates = [...new Set([...balances.map(row => row.date), ...equityByDate.keys()])].sort();
-    funds.addSeries(LineSeries, { color: "#008476", pointMarkersVisible: true }).setData(
-      dates.map(time => equityByDate.has(time) ? { time, value: equityByDate.get(time) } : { time }),
-    );
-    funds.timeScale().fitContent();
-
-    const drawdown = chart("drawdown");
-    drawdown.addSeries(LineSeries, {
-      color: "#b84d49", priceFormat: { type: "custom", formatter: percent },
-    }).setData(balances.map(row => ({ time: row.date, value: row.drawdown })));
+    if (!funds) {
+      const options = { autoSize: true, localization: { locale: "en-US" } };
+      funds = createChart(find("funds"), options);
+      equityLine = funds.addSeries(LineSeries, { color: "#246ca0", pointMarkersVisible: true });
+      markers = createSeriesMarkers(equityLine);
+      drawdown = createChart(find("drawdown"), options);
+      drawdownLine = drawdown.addSeries(LineSeries, {
+        color: "#b84d49", priceFormat: { type: "custom", formatter: percent },
+      });
+    }
+    settledPoints = chartPoints(rows, "value");
+    drawdownLine.setData(chartPoints(rows, "drawdown"));
     drawdown.timeScale().fitContent();
+    renderLive();
+    funds.timeScale().fitContent();
   }
 
   async function refresh() {
@@ -142,18 +214,15 @@ export function mountOverview(container, context) {
     try {
       const payload = await loadLiveOverview({ signal: controller.signal });
       if (disposed) return;
-      if (!payload.available) find("notice").textContent = "Waiting for the runner to publish its first daily portfolio report.";
-      else if (payload.updated_at !== updatedAt) {
+      if (!payload.available) {
+        find("notice").textContent = "Waiting for the runner to publish its portfolio report.";
+      } else if (payload.updated_at !== report?.updated_at || payload.runner_id !== report?.runner_id) {
         render(payload);
-        updatedAt = payload.updated_at;
       }
     } catch {
-      if (!disposed) {
-        find("notice").textContent = updatedAt
-          ? `Refresh failed. Showing the report from ${updatedAt}.`
-          : "The daily portfolio report is temporarily unavailable.";
-        updatedAt = undefined;
-      }
+      if (!disposed) find("notice").textContent = report
+        ? `Refresh failed. Showing the report from ${report.updated_at}.`
+        : "The daily portfolio report is temporarily unavailable.";
     } finally {
       loading = false;
     }
@@ -163,7 +232,6 @@ export function mountOverview(container, context) {
   const liveTimer = setInterval(refreshLive, 1_000);
   document.addEventListener("visibilitychange", refreshLive);
   window.addEventListener("pagehide", release);
-  renderLive(null, "Waiting for live data");
   refreshLive();
   refresh();
   return () => {
@@ -174,6 +242,7 @@ export function mountOverview(container, context) {
     document.removeEventListener("visibilitychange", refreshLive);
     window.removeEventListener("pagehide", release);
     release();
-    charts.forEach(item => item.remove());
+    funds?.remove();
+    drawdown?.remove();
   };
 }
