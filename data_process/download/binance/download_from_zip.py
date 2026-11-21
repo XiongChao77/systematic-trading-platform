@@ -15,12 +15,12 @@ Main behavior:
       Explicit date ranges use local archives first without listing remote files.
     - If --end is not specified, default to the latest completed UTC day.
     - Treat local ZIP files and confirmed HTTP 404 statuses as the download cache.
-      download_info.json records both source status and run audit details.
+      download_info.json is an audit report and is never used as downloader input.
     - Resume automatically from valid cached archives, downloading only missing
       sources. Invalid cached archives are downloaded again.
     - Skip a series when its final CSV already exists, unless --force is used.
-    - Infer --start from the first daily ZIP in the sorted S3 XML listing,
-      without scanning the full history; gaps remain eligible for monthly recovery.
+    - Infer availability boundaries from paginated S3 XML listings; gaps remain
+      eligible for monthly recovery.
     - Skip dates whose daily archives return HTTP 404 and have no monthly data.
       Keep later available data and report gaps; download failures remain fatal.
     - Log download and conversion progress per archive, with per-month payload
@@ -106,6 +106,7 @@ DOWNLOAD_DELAY_SECONDS = 0.3
 FUNDING_API_MIN_INTERVAL_SECONDS = 1.0
 FUNDING_API_RATE_LIMIT_FALLBACK_SECONDS = 300.0
 INFO_FILENAME = "download_info.json"
+MISSING_SOURCES_FILENAME = "missing_sources.json"
 EARLIEST_DATES_FILENAME = "earliest_dates.json"
 ZIP_DIRNAME = "zips"
 MONTHLY_ZIP_DIRNAME = "monthly_zips"
@@ -529,18 +530,18 @@ def write_download_info(info_path: Path, info: dict[str, Any]) -> None:
 
 
 def load_known_missing_sources(
-    info_path: Path,
+    cache_path: Path,
     market: str,
     symbol: str,
     interval: str,
 ) -> set[str]:
-    if not info_path.is_file():
+    if not cache_path.is_file():
         return set()
     try:
-        with info_path.open("r", encoding="utf-8") as file:
+        with cache_path.open("r", encoding="utf-8") as file:
             payload = json.load(file)
     except (OSError, json.JSONDecodeError) as exc:
-        LOGGER.warning("Could not read source status cache %s: %s", info_path, exc)
+        LOGGER.warning("Could not read source status cache %s: %s", cache_path, exc)
         return set()
 
     if not isinstance(payload, dict):
@@ -549,16 +550,34 @@ def load_known_missing_sources(
         ("market", market), ("symbol", symbol), ("interval", interval)
     )):
         return set()
-    source_files = payload.get("source_files")
-    if not isinstance(source_files, dict):
+    sources = payload.get("sources")
+    if not isinstance(sources, list) or not all(isinstance(key, str) for key in sources):
         return set()
-    return {
-        key for key, entry in source_files.items()
-        if isinstance(entry, dict) and (
-            entry.get("status") == "missing"
-            or entry.get("daily_archive_status") == "missing"
+    return set(sources)
+
+
+def write_known_missing_sources(
+    cache_path: Path,
+    market: str,
+    symbol: str,
+    interval: str,
+    sources: set[str],
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = cache_path.with_suffix(cache_path.suffix + ".temp")
+    with temporary_path.open("w", encoding="utf-8") as file:
+        json.dump(
+            {
+                "market": market,
+                "symbol": symbol,
+                "interval": interval,
+                "sources": sorted(sources),
+            },
+            file,
+            indent=2,
         )
-    }
+        file.write("\n")
+    os.replace(temporary_path, cache_path)
 
 
 def make_download_info(
@@ -1060,9 +1079,10 @@ def download_symbol_agg_trades(
     daily_zip_dir = output_dir / ZIP_DIRNAME
     monthly_zip_dir = output_dir / MONTHLY_ZIP_DIRNAME
     info_path = build_info_path(output_dir)
+    missing_sources_path = output_dir / MISSING_SOURCES_FILENAME
     known_missing_sources = (
         set() if args.force
-        else load_known_missing_sources(info_path, market, symbol, interval)
+        else load_known_missing_sources(missing_sources_path, market, symbol, interval)
     )
     start, end = resolve_agg_trades_start_end(
         session,
@@ -1206,6 +1226,14 @@ def download_symbol_agg_trades(
             entry["bytes"] = path.stat().st_size
         if error:
             entry["error"] = error
+        if status == "missing":
+            known_missing_sources.add(key)
+        elif status in {"cached", "downloaded"}:
+            known_missing_sources.discard(key)
+        if status in {"missing", "cached", "downloaded"}:
+            write_known_missing_sources(
+                missing_sources_path, market, symbol, interval, known_missing_sources
+            )
         info["source_files"][key] = entry
         info["last_updated_utc"] = utc_now_iso()
         write_download_info(info_path, info)
@@ -1852,28 +1880,45 @@ def build_monthly_zip_path(
 
 
 def list_s3_keys(session: requests.Session, prefix: str) -> list[str]:
-    """Read object keys from a single S3 XML listing response."""
-    for attempt in range(HTTP_RETRIES + 1):
-        try:
-            response = session.get(
-                S3_LIST_URL,
-                params={"prefix": prefix},
-                timeout=HTTP_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
-            break
-        except requests.RequestException as exc:
-            if attempt == HTTP_RETRIES:
-                raise RuntimeError(
-                    f"S3 listing failed after {HTTP_RETRIES} retries: {exc}"
-                ) from exc
-            time.sleep(RETRY_DELAY_SECONDS)
-    root = ET.fromstring(response.content)
-    return [
-        element.text
-        for element in root.iter()
-        if element.tag.rsplit("}", 1)[-1] == "Key" and element.text
-    ]
+    """Read all object keys from the paginated S3 XML listing."""
+    keys: list[str] = []
+    marker: Optional[str] = None
+    while True:
+        params = {"prefix": prefix, "max-keys": "1000"}
+        if marker is not None:
+            params["marker"] = marker
+        for attempt in range(HTTP_RETRIES + 1):
+            try:
+                response = session.get(
+                    S3_LIST_URL,
+                    params=params,
+                    timeout=HTTP_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                break
+            except requests.RequestException as exc:
+                if attempt == HTTP_RETRIES:
+                    raise RuntimeError(
+                        f"S3 listing failed after {HTTP_RETRIES} retries: {exc}"
+                    ) from exc
+                time.sleep(RETRY_DELAY_SECONDS)
+        root = ET.fromstring(response.content)
+        page_keys = [
+            element.text
+            for element in root.iter()
+            if element.tag.rsplit("}", 1)[-1] == "Key" and element.text
+        ]
+        keys.extend(page_keys)
+        truncated = any(
+            (element.text or "").lower() == "true"
+            for element in root.iter()
+            if element.tag.rsplit("}", 1)[-1] == "IsTruncated"
+        )
+        if not truncated:
+            return keys
+        if not page_keys or page_keys[-1] == marker:
+            raise RuntimeError(f"S3 listing cannot advance: prefix={prefix}")
+        marker = page_keys[-1]
 
 
 def infer_available_dates_from_listing(
@@ -1882,7 +1927,7 @@ def infer_available_dates_from_listing(
     symbol: str,
     interval: str,
 ) -> list[date]:
-    """Find the earliest daily ZIP from the lexicographically sorted S3 XML keys."""
+    """Find the first and last available daily ZIPs in the S3 XML listing."""
     prefix = build_archive_prefix(market, "daily", symbol, interval)
     LOGGER.info("Querying Binance Vision S3 listing for the earliest daily ZIP:")
     LOGGER.info(f"   {S3_LIST_URL}?prefix={prefix}")
@@ -1890,13 +1935,16 @@ def infer_available_dates_from_listing(
         rf"{re.escape(prefix)}{re.escape(symbol)}-{re.escape(interval)}-"
         rf"(\d{{4}}-\d{{2}}-\d{{2}})\.zip",
     )
-    # ISO dates sort chronologically; checksum objects and directory keys are ignored.
+    dates: list[date] = []
     for key in list_s3_keys(session, prefix):
         match = pattern.fullmatch(key)
         if match is not None:
-            earliest = datetime.strptime(match.group(1), "%Y-%m-%d").date()
-            LOGGER.info(f"Earliest daily ZIP: {earliest}")
-            return [earliest]
+            dates.append(datetime.strptime(match.group(1), "%Y-%m-%d").date())
+
+    if dates:
+        bounds = [min(dates), max(dates)]
+        LOGGER.info(f"Daily ZIP availability: {bounds[0]} through {bounds[-1]}")
+        return bounds
 
     LOGGER.warning("S3 listing contains no daily ZIP filename.")
     return []
@@ -1933,7 +1981,7 @@ def resolve_start_end(
     dates = infer_available_dates_from_listing(session, market, symbol, interval)
 
     if dates:
-        effective_end = requested_end
+        effective_end = min(requested_end, dates[-1])
         effective_start = dates[0]
         if effective_start > effective_end:
             raise ValueError(
@@ -1947,6 +1995,13 @@ def resolve_start_end(
             )
         else:
             LOGGER.info(f"Using earliest available file date: {effective_start}")
+        if effective_end < requested_end:
+            LOGGER.warning(
+                "Requested end date is later than the last listed daily ZIP; "
+                "requested_end=%s, using_end=%s",
+                requested_end,
+                effective_end,
+            )
         return effective_start, effective_end, True
 
     symbol_hint = (
@@ -2140,6 +2195,7 @@ def download_symbol_interval(
     monthly_zip_dir = output_dir / MONTHLY_ZIP_DIRNAME
     out_path = build_csv_path(output_dir, symbol, interval)
     info_path = build_info_path(output_dir)
+    missing_sources_path = output_dir / MISSING_SOURCES_FILENAME
     earliest_dates_path = build_earliest_dates_path(
         Path(args.out_dir).expanduser().resolve()
     )
@@ -2148,7 +2204,7 @@ def download_symbol_interval(
     )
     known_missing_sources = (
         set() if args.force
-        else load_known_missing_sources(info_path, market, symbol, interval)
+        else load_known_missing_sources(missing_sources_path, market, symbol, interval)
     )
 
     start, end, earliest_date_confirmed = resolve_start_end(
@@ -2217,6 +2273,14 @@ def download_symbol_interval(
             entry["bytes"] = path.stat().st_size
         if error:
             entry["error"] = error
+        if status == "missing":
+            known_missing_sources.add(key)
+        elif status in {"cached", "downloaded"}:
+            known_missing_sources.discard(key)
+        if status in {"missing", "cached", "downloaded"}:
+            write_known_missing_sources(
+                missing_sources_path, market, symbol, interval, known_missing_sources
+            )
         info["source_files"][key] = entry
         info["last_updated_utc"] = utc_now_iso()
         write_download_info(info_path, info)
@@ -2624,13 +2688,19 @@ def download_funding_rate(
         trading_type=market,
     )
     target = Path(common.market_data_path(para)).expanduser().resolve()
-    if target.is_file() and not args.force:
-        LOGGER.info(f"[{symbol} fundingRate] Skipping entire task because final CSV exists: {target}")
-        return target
-
     today = datetime.now(timezone.utc).date()
     end = parse_date(args.end) or (today - timedelta(days=1))
     start = parse_date(args.start) or FALLBACK_START[market]
+    if target.is_file() and not args.force:
+        try:
+            last_ms = int(pd.read_csv(target, usecols=[0]).iloc[-1, 0])
+            last_date = datetime.fromtimestamp(last_ms / 1000, tz=timezone.utc).date()
+        except (OSError, ValueError, IndexError, KeyError):
+            last_date = None
+        if last_date is not None and last_date >= end - timedelta(days=1):
+            LOGGER.info(f"[{symbol} fundingRate] Skipping up-to-date CSV: {target}")
+            return target
+
     zip_dir = Path(args.out_dir).expanduser().resolve() / market / symbol / "fundingRate"
     base = f"{BASE_URL}/{MARKET_ROOTS[market]}/monthly/fundingRate/{symbol}"
 

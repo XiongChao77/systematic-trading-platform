@@ -55,3 +55,116 @@
   .live-pnl-group { padding: 12px; }
   .live-pnl-group dl { grid-template-columns: 1fr; gap: 12px; }
 }
+
+.live-portfolio-header {
+  align-items: center;
+  justify-content: space-between;
+}
+
+.live-page button[data-action="strategies"],
+.live-page button[data-action="back-overview"] {
+  width: auto;
+  padding: 0 12px;
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.live-portfolio-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.live-portfolio-metrics > div,
+.live-portfolio-chart-panel {
+  padding: 16px;
+}
+
+.live-portfolio-metrics dd {
+  margin: 6px 0 0;
+  font-size: 1.25rem;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.live-portfolio-chart-panel + .live-portfolio-chart-panel {
+  margin-top: 16px;
+}
+
+.live-portfolio-chart {
+  height: 320px;
+  min-width: 0;
+}
+
+.live-portfolio-drawdown {
+  height: 180px;
+}
+
+.live-strategy-curve {
+  margin-bottom: 16px;
+  min-width: 0;
+}
+
+.live-curve-heading,
+.live-curve-ranges:not([hidden]),
+.live-curve-legend:not([hidden]) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.live-curve-heading {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.live-curve-heading h2 {
+  margin: 0;
+}
+
+.live-curve-ranges:not([hidden]) {
+  gap: 6px;
+}
+
+.live-curve-ranges [aria-pressed="true"] {
+  border-color: #a5bed6;
+  background: #eaf2fa;
+  color: #194e76;
+}
+
+.live-curve-ranges button:disabled {
+  opacity: 0.45;
+}
+
+.live-curve-legend:not([hidden]) {
+  gap: 8px 18px;
+  margin: 12px 0 16px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.live-curve-legend span:not([hidden]) {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.live-curve-swatch {
+  display: inline-block;
+  width: 15px;
+  height: 3px;
+  border-radius: 2px;
+}
+
+.live-curve-swatch.backtest {
+  background: #246ca0;
+}
+
+.live-curve-swatch.live {
+  background: #008476;
+}
+
+.live-strategy-curve .live-portfolio-chart {
+  height: clamp(280px, 45vh, 460px);
+}

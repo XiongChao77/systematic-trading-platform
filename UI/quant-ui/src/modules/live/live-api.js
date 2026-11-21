@@ -1,5 +1,9 @@
 import { apiRequest } from "../../shared/api-client.js";
 
+export function loadLiveOverview(options) {
+  return apiRequest("/api/live/overview", options);
+}
+
 export function loadLiveStrategies({ viewerId, ...options } = {}) {
   return apiRequest(`/api/live/strategies?viewer_id=${encodeURIComponent(viewerId || "")}`, options);
 }
@@ -11,7 +15,9 @@ export function loadLiveStrategy(instanceId, { viewerId, ...options } = {}) {
   );
 }
 
-
+export function loadLiveStrategyCurve(instanceId, options) {
+  return apiRequest(`/api/live/strategies/${encodeURIComponent(instanceId)}/curve`, options);
+}
 
 export function releaseLiveViewer(viewerId) {
   return apiRequest(`/api/live/viewers/${encodeURIComponent(viewerId)}`, {

@@ -62,3 +62,20 @@ export function formatDuration(seconds) {
   if (hours) return `${hours}h ${minutes}m`;
   return `${minutes}m`;
 }
+
+export function pnlTone(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number === 0) return "";
+  return number > 0 ? "positive" : "negative";
+}
+
+export function formatMoney(value, signed = false) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
+  const number = Number(value);
+  const sign = signed && number > 0 ? "+" : "";
+  const negative = number < 0 ? "-" : "";
+  return `${negative}${sign}$${Math.abs(number).toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
